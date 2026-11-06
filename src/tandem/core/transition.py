@@ -735,6 +735,11 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
         return _ignore(task, "审核结论针对的不是当前提交编号，作废")
     if review.standard_version != task.standard_version:
         return _ignore(task, "审核结论用的是旧的审核标准版本，作废")
+    if review.verdict is Verdict.FAIL and not usable_findings(review.findings):
+        return _ignore(
+            task,
+            "不通过的结论必须带至少一条有编号、有正文的意见，否则拒收",
+        )
 
     if any(existing.provider == review.provider for existing in _current_reviews(task)):
         return _ignore(task, f"{review.provider} 已经出过结论，同一提供方不能算两家")
@@ -1104,13 +1109,18 @@ def _on_retry(task: TaskRecord, event: Event) -> Decision:
             assert_never(check)
 
 
+def usable_findings(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
+    """可追踪的审核意见：编号和正文都不能是空的。"""
+    return tuple(finding for finding in findings if finding.id.strip() and finding.text.strip())
+
+
 def _merge_findings(
     existing: tuple[Finding, ...], incoming: tuple[Finding, ...]
 ) -> tuple[Finding, ...]:
     """按编号合并意见：同一编号只留一条，后来者不覆盖先前的正文。"""
     merged = list(existing)
     known = {finding.id for finding in existing}
-    for finding in incoming:
+    for finding in usable_findings(incoming):
         if finding.id not in known:
             merged.append(finding)
             known.add(finding.id)
@@ -1124,6 +1134,14 @@ def _missing_veto_reasons(task: TaskRecord, event: Event) -> tuple[str, ...]:
     }
     if task.open_findings:
         return tuple(finding.id for finding in task.open_findings if not answers.get(finding.id))
+    # 兼容旧记录：历史上如果有"没带具体意见的不通过"，不能当成没有反对意见
+    unnumbered = [
+        item
+        for item in task.review_history
+        if item.verdict is Verdict.FAIL and not usable_findings(item.findings)
+    ]
+    if unnumbered and not answers and not (event.reason or "").strip():
+        return tuple(f"{item.provider}（没有写具体意见）" for item in unnumbered)
     failing = [item for item in _current_reviews(task) if item.verdict is Verdict.FAIL]
     if failing and not answers and not (event.reason or "").strip():
         return tuple(item.provider for item in failing)

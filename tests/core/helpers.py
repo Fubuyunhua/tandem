@@ -33,6 +33,9 @@ SHA_1 = "1" * 40
 SHA_2 = "2" * 40
 
 CODE_CHANGES = ChangeSet(paths=("src/tandem/shell/cli.py",))
+
+# 不通过（FAIL）的结论至少要带一条有编号、有正文的意见，测试里统一用这一条
+SOME_FINDINGS = (Finding(id="F1", text="这里有一个具体问题"),)
 DOC_CHANGES = ChangeSet(paths=("docs/design/note.md",))
 CORE_CHANGES = ChangeSet(paths=("src/tandem/core/model.py",))
 
@@ -235,8 +238,13 @@ class Walker:
     def ci_red(self, reason: str = "测试没过") -> Decision:
         return self.step(ev(EventKind.CI_RED, sha=self.record.latest_sha, reason=reason))
 
-    def review(self, reviewer: str, verdict: Verdict = Verdict.PASS) -> Decision:
-        return self.step(review_event(self.record, reviewer, verdict))
+    def review(
+        self,
+        reviewer: str,
+        verdict: Verdict = Verdict.PASS,
+        findings: tuple[Finding, ...] = (),
+    ) -> Decision:
+        return self.step(review_event(self.record, reviewer, verdict, findings=findings))
 
     def pass_all(self) -> None:
         for reviewer in self.record.designated_reviewers:

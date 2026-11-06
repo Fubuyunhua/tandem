@@ -27,6 +27,7 @@ from tests.core.helpers import (
     DOC_CHANGES,
     SHA_1,
     SHA_2,
+    SOME_FINDINGS,
     Walker,
     actions_of,
     ev,
@@ -173,7 +174,7 @@ def test_row_05b_recomputed_d_level_needs_plan_approval() -> None:
 
 def test_row_06_writer_refuses_to_fix_goes_to_you() -> None:
     record = to_ai_review()
-    record = run(record, review_event(record, "codex", Verdict.FAIL)).task
+    record = run(record, review_event(record, "codex", Verdict.FAIL, findings=SOME_FINDINGS)).task
     assert record.returned_from_review
     record = to_working(record)
     decision = run(record, ev(EventKind.REFUSED_TO_FIX, reason="标准不对，我不改"))
@@ -310,7 +311,9 @@ def test_row_14_review_failure_returns_to_pending_and_voids_conclusions() -> Non
     record = to_ai_review()
     record = run(record, review_event(record, "codex")).task
     assert len(record.reviews) == 1
-    decision = run(record, review_event(record, "opencode-go", Verdict.FAIL))
+    decision = run(
+        record, review_event(record, "opencode-go", Verdict.FAIL, findings=SOME_FINDINGS)
+    )
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.reviews == ()
     assert decision.task.returned_from_review
@@ -327,7 +330,7 @@ def test_row_14b_ai_rejects_your_own_code() -> None:
     record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
     assert record.status is TaskStatus.AWAITING_AI_REVIEW
     assert record.writer_is_human
-    decision = run(record, review_event(record, "codex", Verdict.FAIL))
+    decision = run(record, review_event(record, "codex", Verdict.FAIL, findings=SOME_FINDINGS))
     assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
     assert "写手是你" in decision.task.reason
 
@@ -335,13 +338,15 @@ def test_row_14b_ai_rejects_your_own_code() -> None:
 def test_row_15_third_revision_goes_to_you() -> None:
     record = to_ai_review()
     for expected_revision in (1, 2):
-        record = run(record, review_event(record, "codex", Verdict.FAIL)).task
+        record = run(
+            record, review_event(record, "codex", Verdict.FAIL, findings=SOME_FINDINGS)
+        ).task
         assert record.status is TaskStatus.PENDING
         assert record.revision_count(record.standard_version) == expected_revision
         record = to_working(record)
         record = to_acceptance(record, sha=SHA_2)
         record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
-    decision = run(record, review_event(record, "codex", Verdict.FAIL))
+    decision = run(record, review_event(record, "codex", Verdict.FAIL, findings=SOME_FINDINGS))
     assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
     assert decision.task.error_code == "R02"
     assert decision.task.revision_count(decision.task.standard_version) == 3
@@ -424,16 +429,27 @@ def test_row_20_vetoing_ai_needs_reasons() -> None:
         ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CODE_CHANGES),
     ).task
     record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
-    record = run(record, review_event(record, "codex", Verdict.FAIL)).task
+    record = run(record, review_event(record, "codex", Verdict.FAIL, findings=SOME_FINDINGS)).task
     assert record.status is TaskStatus.NEEDS_INTERVENTION
     without_reason = run(record, ev(EventKind.INTERVENTION_APPROVED, sha=record.latest_sha))
     assert without_reason.task.status is TaskStatus.NEEDS_INTERVENTION
-    with_reason = run(
+    # 一句笼统的话不够：要按意见编号逐条写（F13）
+    generic = run(
         record,
         ev(
             EventKind.INTERVENTION_APPROVED,
             sha=record.latest_sha,
             reason="这条意见我不同意，理由如下",
+        ),
+    )
+    assert generic.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert "F1" in generic.reason
+    with_reason = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            veto_reasons=(VetoReason(finding_id="F1", reason="这条我补了测试"),),
         ),
     )
     assert with_reason.task.status is TaskStatus.AWAITING_MERGE
@@ -586,7 +602,9 @@ def test_new_commit_voids_reviews_and_approval() -> None:
     record = run(record, review_event(record, "codex")).task
     assert len(record.reviews) == 1
     # 退回修改后重新交代码，旧的审核结论、批准必须作废
-    record = run(record, review_event(record, "opencode-go", Verdict.FAIL)).task
+    record = run(
+        record, review_event(record, "opencode-go", Verdict.FAIL, findings=SOME_FINDINGS)
+    ).task
     record = to_working(record)
     decision = run(
         record,
@@ -1221,3 +1239,67 @@ def test_merge_guard_still_rejects_writer_votes_on_the_ai_entry() -> None:
         tampered = decision.task
     assert tampered.status is TaskStatus.AWAITING_AI_REVIEW
     assert not any(action.kind is ActionKind.MERGE for action in tampered.actions)
+
+
+# ------------------------------------------------- H4：不通过必须有具体意见
+
+
+def test_row_14_fail_without_findings_is_rejected() -> None:
+    """不通过的结论必须带至少一条有编号、有正文的意见，否则拒收。"""
+    record = to_ai_review()
+    decision = run(record, review_event(record, "codex", Verdict.FAIL))
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert not decision.changed
+    assert decision.task.reviews == ()
+    assert "意见" in decision.reason
+
+
+def test_row_14_fail_with_blank_finding_is_rejected() -> None:
+    record = to_ai_review()
+    decision = run(
+        record,
+        review_event(
+            record,
+            "codex",
+            Verdict.FAIL,
+            findings=(Finding(id="F1", text="   "),),
+        ),
+    )
+    assert not decision.changed
+    assert decision.task.reviews == ()
+    unnamed = run(
+        record,
+        review_event(record, "codex", Verdict.FAIL, findings=(Finding(id=" ", text="没问题"),)),
+    )
+    assert not unnamed.changed
+
+
+def test_row_20_legacy_fail_without_findings_cannot_be_approved_silently() -> None:
+    """旧记录里那种"没有具体意见的 FAIL"不能被当成没有反对意见。"""
+    from dataclasses import replace
+
+    record = to_needs_intervention_by_reviewers()
+    legacy = replace(
+        record,
+        review_history=(
+            Review(
+                reviewer="codex",
+                provider="codex",
+                verdict=Verdict.FAIL,
+                sha=record.latest_sha or SHA_1,
+                standard_version=record.standard_version,
+            ),
+        ),
+    )
+    silent = run(legacy, ev(EventKind.INTERVENTION_APPROVED, sha=legacy.latest_sha))
+    assert silent.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert not silent.changed
+    explained = run(
+        legacy,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=legacy.latest_sha,
+            reason="这条意见我不同意，理由是……",
+        ),
+    )
+    assert explained.task.status is TaskStatus.AWAITING_MERGE

@@ -16,6 +16,7 @@ from tandem.core.model import (
     RunMode,
     TaskStatus,
     Verdict,
+    VetoReason,
 )
 from tests.core.helpers import (
     CODE_CHANGES,
@@ -28,6 +29,9 @@ from tests.core.helpers import (
     policy,
     quota,
     run,
+)
+from tests.core.helpers import (
+    SOME_FINDINGS as FINDINGS,
 )
 
 
@@ -250,7 +254,7 @@ def test_scenario_9_you_change_core_and_ai_disagrees() -> None:
     assert walker.record.writer_is_human
 
     walker.review("codex", Verdict.PASS)
-    walker.review("opencode-go", Verdict.FAIL)
+    walker.review("opencode-go", Verdict.FAIL, FINDINGS)
     assert walker.record.status is TaskStatus.NEEDS_INTERVENTION
     assert "写手是你" in walker.record.reason
 
@@ -258,7 +262,7 @@ def test_scenario_9_you_change_core_and_ai_disagrees() -> None:
         ev(
             EventKind.INTERVENTION_APPROVED,
             sha=walker.record.latest_sha,
-            reason="这条反对意见我不同意：保留了重放",
+            veto_reasons=(VetoReason(finding_id="F1", reason="这条我补了重放测试"),),
         )
     )
     assert walker.record.status is TaskStatus.AWAITING_MERGE
