@@ -19,6 +19,7 @@ from tandem.core.model import (
     CheckResult,
     Event,
     EventKind,
+    Finding,
     Level,
     Review,
     RevisionCount,
@@ -26,6 +27,7 @@ from tandem.core.model import (
     TaskRecord,
     TaskStatus,
     Verdict,
+    VetoReason,
 )
 
 
@@ -115,6 +117,30 @@ def changes_from_dict(data: object) -> ChangeSet:
     )
 
 
+def finding_to_dict(finding: Finding) -> dict[str, object]:
+    return {"id": finding.id, "text": finding.text}
+
+
+def finding_from_dict(data: object) -> Finding:
+    mapping = _mapping(data, "finding")
+    return Finding(
+        id=_str(mapping.get("id"), "finding.id"),
+        text=_str(mapping.get("text", ""), "finding.text"),
+    )
+
+
+def veto_reason_to_dict(reason: VetoReason) -> dict[str, object]:
+    return {"finding_id": reason.finding_id, "reason": reason.reason}
+
+
+def veto_reason_from_dict(data: object) -> VetoReason:
+    mapping = _mapping(data, "veto_reason")
+    return VetoReason(
+        finding_id=_str(mapping.get("finding_id"), "veto_reason.finding_id"),
+        reason=_str(mapping.get("reason"), "veto_reason.reason"),
+    )
+
+
 def review_to_dict(review: Review) -> dict[str, object]:
     return {
         "reviewer": review.reviewer,
@@ -122,6 +148,7 @@ def review_to_dict(review: Review) -> dict[str, object]:
         "verdict": review.verdict.name,
         "sha": review.sha,
         "standard_version": review.standard_version,
+        "findings": [finding_to_dict(finding) for finding in review.findings],
     }
 
 
@@ -133,6 +160,10 @@ def review_from_dict(data: object) -> Review:
         verdict=_enum_value(Verdict, mapping.get("verdict"), "review.verdict"),
         sha=_str(mapping.get("sha"), "review.sha"),
         standard_version=_int(mapping.get("standard_version"), "review.standard_version"),
+        findings=tuple(
+            finding_from_dict(entry)
+            for entry in _list(mapping.get("findings", []), "review.findings")
+        ),
     )
 
 
@@ -184,6 +215,8 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "providers_involved": sorted(task.providers_involved),
         "designated_reviewers": list(task.designated_reviewers),
         "reviews": [review_to_dict(review) for review in task.reviews],
+        "review_history": [review_to_dict(review) for review in task.review_history],
+        "open_findings": [finding_to_dict(finding) for finding in task.open_findings],
         "standard_version": task.standard_version,
         "accept_failures": task.accept_failures,
         "revision_counts": [
@@ -252,6 +285,14 @@ def task_from_dict(data: object) -> TaskRecord:
         reviews=tuple(
             review_from_dict(entry) for entry in _list(mapping.get("reviews", []), "reviews")
         ),
+        review_history=tuple(
+            review_from_dict(entry)
+            for entry in _list(mapping.get("review_history", []), "review_history")
+        ),
+        open_findings=tuple(
+            finding_from_dict(entry)
+            for entry in _list(mapping.get("open_findings", []), "open_findings")
+        ),
         standard_version=_int(mapping.get("standard_version"), "standard_version"),
         accept_failures=_int(mapping.get("accept_failures"), "accept_failures"),
         revision_counts=tuple(revision_counts),
@@ -289,6 +330,7 @@ def event_to_dict(event: Event) -> dict[str, object]:
         "reason": event.reason,
         "provider": event.provider,
         "providers": list(event.providers),
+        "veto_reasons": [veto_reason_to_dict(item) for item in event.veto_reasons],
         "model_suggestion": None if event.model_suggestion is None else event.model_suggestion.name,
         "check_result": None if event.check_result is None else event.check_result.name,
         "standard_version": event.standard_version,
@@ -316,6 +358,10 @@ def event_from_dict(data: object) -> Event:
         providers=tuple(
             _str(item, "event.providers[]")
             for item in _list(mapping.get("providers", []), "event.providers")
+        ),
+        veto_reasons=tuple(
+            veto_reason_from_dict(entry)
+            for entry in _list(mapping.get("veto_reasons", []), "event.veto_reasons")
         ),
         model_suggestion=(
             None if suggestion is None else _enum_value(Level, suggestion, "model_suggestion")

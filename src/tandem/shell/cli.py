@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from tandem.core.level import compute_level
 from tandem.core.model import (
@@ -29,6 +30,7 @@ from tandem.core.model import (
     TaskRecord,
     TaskStatus,
     Verdict,
+    VetoReason,
 )
 from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.config import load_policy
@@ -56,6 +58,19 @@ def _event(kind: EventKind, task: TaskRecord, **fields: object) -> Event:
         state_version=task.state_version,
         **fields,  # type: ignore[arg-type]
     )
+
+
+def _veto_reasons(args: argparse.Namespace) -> tuple[VetoReason, ...]:
+    """把 ``--veto F1=理由`` 解析成逐条理由。"""
+    raw = getattr(args, "veto", None)
+    if not isinstance(raw, list):
+        return ()
+    reasons: list[VetoReason] = []
+    for item in cast("list[object]", raw):
+        text = str(item)
+        finding_id, _, reason = text.partition("=")
+        reasons.append(VetoReason(finding_id=finding_id.strip(), reason=reason.strip()))
+    return tuple(reasons)
 
 
 def _db_path(args: argparse.Namespace) -> Path:
@@ -161,7 +176,13 @@ def cmd_approve(args: argparse.Namespace) -> int:
                 event = _event(EventKind.PLAN_APPROVED, task, sha=args.sha)
             case TaskStatus.AWAITING_YOUR_REVIEW:
                 # "待你审核"是你批准 AI 写完的代码，走第 17 条
-                event = _event(EventKind.YOUR_APPROVAL, task, sha=args.sha, reason=args.reason)
+                event = _event(
+                    EventKind.YOUR_APPROVAL,
+                    task,
+                    sha=args.sha,
+                    reason=args.reason,
+                    veto_reasons=_veto_reasons(args),
+                )
             case TaskStatus.NEEDS_INTERVENTION:
                 # "待你介入"是人工审核通过 / 批准你自己的代码，走第 20 条
                 event = _event(
@@ -169,6 +190,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
                     task,
                     sha=args.sha,
                     reason=args.reason,
+                    veto_reasons=_veto_reasons(args),
                 )
             case _:
                 print(f"{task.task_id} 在{task.status.value}，现在不需要你批准")
@@ -413,7 +435,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="你看到的那个提交编号：和你现在看到的不一致时，批准不生效",
     )
-    approve.add_argument("--reason", default=None, help="否决 AI 意见时要逐条写理由")
+    approve.add_argument("--reason", default=None, help="补充说明")
+    approve.add_argument(
+        "--veto",
+        action="append",
+        default=None,
+        metavar="F1=理由",
+        help="否决某一条 AI 意见的理由，可以写多次；有待回应意见时必须逐条给",
+    )
 
     reject = subparsers.add_parser("reject", parents=[common], help="打回方案或代码")
     reject.add_argument("--task-id", required=True, help="任务编号")

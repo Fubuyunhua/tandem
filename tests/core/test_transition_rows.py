@@ -11,12 +11,14 @@ from tandem.core.model import (
     ActionKind,
     CheckResult,
     EventKind,
+    Finding,
     Level,
     QuotaState,
     RunMode,
     TaskRecord,
     TaskStatus,
     Verdict,
+    VetoReason,
 )
 from tests.core.helpers import (
     CODE_CHANGES,
@@ -1001,3 +1003,92 @@ def test_row_26_retry_after_acceptance_goes_back_to_acceptance() -> None:
     record = run(record, ev(EventKind.INCIDENT, reason="CI 服务断了")).task
     decision = run(record, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
     assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+
+
+# ------------------------------------------------- F13：反对意见要留内容，会审要逐条答
+
+
+def _findings() -> tuple[Finding, ...]:
+    return (
+        Finding(id="F1", text="异常分支没有测试"),
+        Finding(id="F2", text="这里的时间没从参数传进来"),
+    )
+
+
+def _to_you_deciding_with_findings() -> TaskRecord:
+    """你自己写的代码被 AI 打回（14b），停在"待你介入"，带着两条反对意见。"""
+    record = run(to_needs_intervention_by_ci(), ev(EventKind.TAKE_OVER)).task
+    record = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CODE_CHANGES)).task
+    record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
+    return run(record, review_event(record, "codex", Verdict.FAIL, findings=_findings())).task
+
+
+def test_row_14_returning_for_fix_keeps_the_findings() -> None:
+    """退回修改只清"通过资格"，不能把要回应的问题一起删掉。"""
+    record = to_ai_review()
+    decision = run(record, review_event(record, "codex", Verdict.FAIL, findings=_findings()))
+    assert decision.task.status is TaskStatus.PENDING
+    assert decision.task.reviews == ()  # 这一轮的通过资格作废
+    assert len(decision.task.review_history) == 1  # 历史意见留着
+    assert [finding.id for finding in decision.task.open_findings] == ["F1", "F2"]
+    assert decision.task.review_history[0].findings[0].text == "异常分支没有测试"
+
+
+def test_row_20_veto_needs_a_reason_for_every_finding() -> None:
+    record = _to_you_deciding_with_findings()
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    assert [finding.id for finding in record.open_findings] == ["F1", "F2"]
+
+    # 一条理由都不给 → 拒绝
+    without = run(record, ev(EventKind.INTERVENTION_APPROVED, sha=SHA_2, reason="我觉得可以"))
+    assert without.task.status is TaskStatus.NEEDS_INTERVENTION
+    # 只答一条 → 也拒绝，并指出还缺哪一条
+    partial = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=SHA_2,
+            veto_reasons=(VetoReason(finding_id="F1", reason="这条我补测试了"),),
+        ),
+    )
+    assert partial.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert "F2" in partial.reason
+
+    complete = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=SHA_2,
+            veto_reasons=(
+                VetoReason(finding_id="F1", reason="这条我补测试了"),
+                VetoReason(finding_id="F2", reason="时间是从参数传的"),
+            ),
+        ),
+    )
+    assert complete.task.status is TaskStatus.AWAITING_MERGE
+
+
+def test_row_20_veto_after_refusing_to_fix_still_needs_reasons() -> None:
+    """退回修改 → 写手拒绝修改 → 待你介入：批准时同样要逐条答。"""
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex", Verdict.FAIL, findings=_findings())).task
+    record = to_working(record)
+    record = run(record, ev(EventKind.REFUSED_TO_FIX, reason="标准不对")).task
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    decision = run(record, ev(EventKind.INTERVENTION_APPROVED, sha=record.latest_sha))
+    assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert "F1" in decision.reason and "F2" in decision.reason
+
+
+def test_row_13_passing_reviews_clear_open_findings() -> None:
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex", Verdict.FAIL, findings=_findings())).task
+    record = to_working(record)
+    record = to_acceptance(record, sha=SHA_2)
+    record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
+    for reviewer in record.designated_reviewers:
+        record = run(record, review_event(record, reviewer)).task
+    assert record.status is TaskStatus.AWAITING_MERGE
+    assert record.open_findings == ()
+    # 历史意见不会被删掉
+    assert record.review_history

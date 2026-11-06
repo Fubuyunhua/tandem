@@ -289,3 +289,88 @@ def test_approve_requires_sha_argument(tmp_path: Path) -> None:
     """F4：approve 必须带 --sha，漏了就由 argparse 直接报错。"""
     with pytest.raises(SystemExit):
         main(["approve", "--db", str(tmp_path / "x.sqlite3"), "--task-id", "t1"])
+
+
+def test_approve_with_veto_requires_every_finding(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F13：人工否决 AI 意见时要按意见编号逐条给理由，缺一条就不生效。"""
+    from tandem.core.model import Event, EventKind, Finding, TaskStatus, Verdict
+    from tests.core.helpers import CODE_CHANGES, review_event
+    from tests.shell.shell_helpers import (
+        advance_to_needs_intervention,
+        code_receipt,
+        make_runner,
+    )
+
+    db = tmp_path / "tandem.sqlite3"
+    runner = make_runner(db, [code_receipt("t1", attempt=i, sha=f"{i}" * 40) for i in (1, 2, 3)])
+    record = advance_to_needs_intervention(runner)
+    # 你接手，提交代码，CI 绿，AI 打回并给了两条意见
+    record = runner.handle(Event(kind=EventKind.TAKE_OVER, task_id="t1")).decision.task
+    record = runner.handle(
+        Event(
+            kind=EventKind.YOU_SUBMITTED_CODE,
+            task_id="t1",
+            sha="f" * 40,
+            changes=CODE_CHANGES,
+        )
+    ).decision.task
+    record = runner.handle(Event(kind=EventKind.CI_GREEN, task_id="t1", sha="f" * 40)).decision.task
+    record = runner.handle(
+        Event(
+            kind=EventKind.REVIEW,
+            task_id="t1",
+            review=review_event(
+                record,
+                "codex",
+                Verdict.FAIL,
+                findings=(Finding(id="F1", text="缺测试"), Finding(id="F2", text="没用参数")),
+            ).review,
+        )
+    ).decision.task
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    sha = record.latest_sha or ""
+    runner.store.close()
+
+    # 只答一条 → 不生效
+    assert (
+        main(
+            [
+                "approve",
+                "--db",
+                str(db),
+                "--task-id",
+                "t1",
+                "--sha",
+                sha,
+                "--veto",
+                "F1=这条补了测试",
+            ]
+        )
+        != 0
+    )
+    out = capsys.readouterr().out
+    assert "F2" in out
+    assert "没有生效" in out
+
+    # 两条都答 → 生效
+    assert (
+        main(
+            [
+                "approve",
+                "--db",
+                str(db),
+                "--task-id",
+                "t1",
+                "--sha",
+                sha,
+                "--veto",
+                "F1=这条补了测试",
+                "--veto",
+                "F2=时间是从参数传的",
+            ]
+        )
+        == 0
+    )
+    assert "待合并" in capsys.readouterr().out

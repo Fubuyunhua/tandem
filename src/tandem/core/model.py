@@ -218,6 +218,22 @@ class ChangeSet:
 
 
 @dataclass(frozen=True)
+class Finding:
+    """一条具体的审核意见。你否决 AI 意见时要按编号逐条写理由。"""
+
+    id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class VetoReason:
+    """你对某一条意见的否决理由（按意见编号）。"""
+
+    finding_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Review:
     """一条审核结论。审核结论绑定提交编号和审核标准版本。"""
 
@@ -226,6 +242,7 @@ class Review:
     verdict: Verdict
     sha: str
     standard_version: int
+    findings: tuple[Finding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -279,7 +296,12 @@ class TaskRecord:
 
     # 审核结论表与本次指定的审核者（第 12–16、22 条）
     designated_reviewers: tuple[str, ...] = ()
+    # reviews：这一轮还有效的结论（决定能不能放行）
     reviews: tuple[Review, ...] = ()
+    # review_history：所有历史审核意见，只追加，退回修改也不删
+    review_history: tuple[Review, ...] = ()
+    # open_findings：还要你回应或写手修改的意见（否决时必须逐条给理由）
+    open_findings: tuple[Finding, ...] = ()
     standard_version: int = 1
 
     # 次数
@@ -470,6 +492,8 @@ class Event:
     provider: str | None = None
     # 这次有哪些 AI 参与过（人工提交时要补记进"参与过的提供方"集合）
     providers: tuple[str, ...] = ()
+    # 你否决 AI 意见时，按意见编号给出的理由
+    veto_reasons: tuple[VetoReason, ...] = ()
     model_suggestion: Level | None = None
     check_result: CheckResult | None = None
     standard_version: int | None = None

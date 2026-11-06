@@ -24,6 +24,7 @@ from tandem.core.model import (
     Decision,
     Event,
     EventKind,
+    Finding,
     Level,
     Policy,
     QuotaSnapshot,
@@ -721,7 +722,11 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     if any(existing.provider == review.provider for existing in _current_reviews(task)):
         return _ignore(task, f"{review.provider} 已经出过结论，同一提供方不能算两家")
 
-    recorded = replace(task, reviews=task.reviews + (review,))
+    recorded = replace(
+        task,
+        reviews=task.reviews + (review,),
+        review_history=task.review_history + (review,),
+    )
     by_provider = _reviews_by_provider(_current_reviews(recorded))
     rule = policy.rule_for(task.level)
     actions = _Actions(task, task.state_version + 1)
@@ -729,6 +734,14 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     failing = tuple(item for item in by_provider.values() if item.verdict is Verdict.FAIL)
     failing_names = "；".join(item.reviewer for item in failing)
     if failing:
+        # 反对意见要留着：退回修改只清"通过资格"，不删待回应的问题
+        recorded = replace(
+            recorded,
+            open_findings=_merge_findings(
+                task.open_findings,
+                tuple(finding for item in failing for finding in item.findings),
+            ),
+        )
         if task.writer_is_human:
             # 14b：写手是你，带 AI 的反对意见交给你选择
             actions.add(ActionKind.NOTIFY, detail="AI 不通过你自己写的代码，等你决定")
@@ -780,14 +793,16 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
                 TaskStatus.AWAITING_YOUR_REVIEW,
                 "所有指定的审核者都通过，D 级等你看",
                 actions.items,
+                open_findings=(),
             )
         # 12：全过就合并（dry-run），守卫会再核对一次 CI 和提交编号
+        passed_round = replace(recorded, open_findings=())
         return _merge(
-            recorded,
+            passed_round,
             policy,
             f"所有指定的审核者都通过，准备合并 {task.latest_sha}",
             actions,
-            recorded,
+            passed_round,
             approved_sha=task.latest_sha,
         )
 
@@ -858,9 +873,12 @@ def _on_intervention_approved(task: TaskRecord, event: Event, policy: Policy) ->
         return _ignore(task, "任务没有提交编号，不能批准")
     if event.sha is None or event.sha != task.latest_sha:
         return _ignore(task, "人工审核通过要绑定当前提交编号，和当前不一致就不生效")
-    failing = [item for item in _current_reviews(task) if item.verdict is Verdict.FAIL]
-    if failing and not (event.reason or "").strip():
-        return _ignore(task, "否决 AI 的审核意见要对每一条写理由")
+    missing = _missing_veto_reasons(task, event)
+    if missing:
+        return _ignore(
+            task,
+            f"否决 AI 的审核意见要对每一条写理由，还缺：{'、'.join(missing)}",
+        )
     actions = _Actions(task, task.state_version + 1)
     return _merge(
         task,
@@ -1064,6 +1082,32 @@ def _on_retry(task: TaskRecord, event: Event) -> Decision:
             )
         case _:  # pragma: no cover
             assert_never(check)
+
+
+def _merge_findings(
+    existing: tuple[Finding, ...], incoming: tuple[Finding, ...]
+) -> tuple[Finding, ...]:
+    """按编号合并意见：同一编号只留一条，后来者不覆盖先前的正文。"""
+    merged = list(existing)
+    known = {finding.id for finding in existing}
+    for finding in incoming:
+        if finding.id not in known:
+            merged.append(finding)
+            known.add(finding.id)
+    return tuple(merged)
+
+
+def _missing_veto_reasons(task: TaskRecord, event: Event) -> tuple[str, ...]:
+    """人工否决时，每条待回应意见都必须有一条非空理由。"""
+    answers = {
+        item.finding_id: item.reason.strip() for item in event.veto_reasons if item.reason.strip()
+    }
+    if task.open_findings:
+        return tuple(finding.id for finding in task.open_findings if not answers.get(finding.id))
+    failing = [item for item in _current_reviews(task) if item.verdict is Verdict.FAIL]
+    if failing and not answers and not (event.reason or "").strip():
+        return tuple(item.provider for item in failing)
+    return ()
 
 
 def _reviewers_without_conclusion(task: TaskRecord) -> tuple[str, ...]:

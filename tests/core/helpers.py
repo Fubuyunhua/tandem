@@ -13,6 +13,7 @@ from tandem.core.model import (
     Decision,
     Event,
     EventKind,
+    Finding,
     Level,
     Policy,
     QuotaSnapshot,
@@ -131,6 +132,7 @@ def review_event(
     sha: str | None = None,
     standard_version: int | None = None,
     provider: str | None = None,
+    findings: tuple[Finding, ...] = (),
 ) -> Event:
     return ev(
         EventKind.REVIEW,
@@ -142,6 +144,7 @@ def review_event(
             standard_version=(
                 standard_version if standard_version is not None else record.standard_version
             ),
+            findings=findings,
         ),
     )
 
