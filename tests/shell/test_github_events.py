@@ -179,3 +179,62 @@ def test_reconcile_refuses_wrong_sha_and_missing_pr(tmp_path: Path) -> None:
         assert required(runner.store.load_task("gh-7")).status is TaskStatus.ERROR
     finally:
         runner.store.close()
+
+
+def test_reconcile_merge_succeeded_before_timeout(tmp_path: Path) -> None:
+    class LostReplyGitHub(FakeGitHub):
+        def _write(self, resource: str, payload: dict[str, object], method: str) -> object:
+            super()._write(resource, payload, method)
+            raise GitHubError("写入后连接中断")
+
+    runner = make_runner(tmp_path, dry_run=False)
+    github = LostReplyGitHub(prs={8: PullRequest(8, SHA)}, checks={SHA: CIState.GREEN})
+    try:
+        runner.store.commit(
+            task=TaskRecord(
+                "gh-7",
+                status=TaskStatus.AWAITING_YOUR_REVIEW,
+                latest_sha=SHA,
+                ci_green=True,
+                pr_opened=True,
+            )
+        )
+        runner.store.save_github_source(GitHubSource("gh-7", REPO, 7, "", "", 8))
+        runner.executor.github = github
+        runner.executor.github_store = runner.store
+        runner.executor.github_repo = REPO
+        runner.handle(Event(EventKind.YOUR_APPROVAL, "gh-7", sha=SHA))
+        assert required(runner.store.load_task("gh-7")).status is TaskStatus.ERROR
+        assert github.prs[8].merged
+        assert GitHubEvents(runner, github, REPO).reconcile("gh-7") is CheckResult.MERGE_SUCCEEDED
+        assert required(runner.store.load_task("gh-7")).status is TaskStatus.MERGED
+        assert len(github.writes) == 1
+        assert all(
+            a.status is ActionStatus.DONE
+            for a in runner.store.list_actions("gh-7")
+            if a.kind is ActionKind.MERGE
+        )
+    finally:
+        runner.store.close()
+
+
+def test_cancel_cleanup_failure_is_recorded(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, dry_run=False)
+    github = FakeGitHub(fail=True)
+    try:
+        runner.store.commit(
+            task=TaskRecord("gh-7", status=TaskStatus.AWAITING_ACCEPTANCE, pr_opened=True)
+        )
+        runner.store.save_github_source(GitHubSource("gh-7", REPO, 7, "", "", 8))
+        runner.executor.github = github
+        runner.executor.github_store = runner.store
+        runner.executor.github_repo = REPO
+        runner.handle(Event(EventKind.CANCEL, "gh-7"))
+        assert required(runner.store.load_task("gh-7")).status is TaskStatus.CANCELLED
+        assert any(e.kind is EventKind.INCIDENT for e in runner.store.list_events())
+        assert any(
+            a.kind is ActionKind.CLOSE_PR and a.status is ActionStatus.UNKNOWN
+            for a in runner.store.list_actions("gh-7")
+        )
+    finally:
+        runner.store.close()

@@ -300,11 +300,15 @@ class FakeGitHub(GitHubWrites):
 
     def _write(self, resource: str, payload: dict[str, object], method: str) -> object:
         self._check()
-        self.writes.append((resource, payload))
         number = int(resource.split("/")[1])
         if resource.endswith("/merge"):
+            # 模拟服务端的原子 SHA 条件，覆盖读后、写前出现新提交的竞争。
+            if self.prs[number].head_sha != payload.get("sha"):
+                raise GitHubError("PR 的 head SHA 与预期不一致，拒绝合并")
+            self.writes.append((resource, payload))
             self.prs[number] = replace(self.prs[number], state="closed", merged=True)
             return {"merged": True}
+        self.writes.append((resource, payload))
         if method == "PATCH":
             self.prs[number] = replace(self.prs[number], state="closed")
         return {}

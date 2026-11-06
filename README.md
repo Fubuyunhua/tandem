@@ -10,6 +10,7 @@
 - 需求：[`docs/PRD.md`](docs/PRD.md)
 - 架构决策：[`docs/adr/`](docs/adr/)
 - 任务状态流转：[`docs/design/task-lifecycle.md`](docs/design/task-lifecycle.md)
+- GitHub 适配器：[`docs/github-adapter.md`](docs/github-adapter.md)
 
 ## 代码结构
 - `src/tandem/core/`：内核，只做判断的纯函数（不读时钟、不联网、不读写文件）

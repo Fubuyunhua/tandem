@@ -1,5 +1,7 @@
 """GitHub 适配器离线测试。"""
 
+from dataclasses import replace
+
 import pytest
 
 from tandem.shell.github import CIState, FakeGitHub, GitHubError, Issue, PullRequest
@@ -47,4 +49,17 @@ def test_failure_is_not_success() -> None:
     github = FakeGitHub(fail=True)
     with pytest.raises(GitHubError):
         github.close_pr(1, live=True)
+    assert github.writes == []
+
+
+def test_sha_race_is_rejected_at_write() -> None:
+    class RacingGitHub(FakeGitHub):
+        def _write(self, resource: str, payload: dict[str, object], method: str) -> object:
+            self.prs[1] = replace(self.prs[1], head_sha="b" * 40)
+            return super()._write(resource, payload, method)
+
+    github = RacingGitHub(prs={1: PullRequest(1, SHA)}, checks={SHA: CIState.GREEN})
+    with pytest.raises(GitHubError, match="SHA"):
+        github.merge_pr(1, SHA, live=True)
+    assert not github.prs[1].merged
     assert github.writes == []

@@ -196,7 +196,7 @@ class Runner:
         return RunResult(decision=decision, executed=tuple(executed))
 
     def _incident_from(self, executed: list[ExecutedAction], now: datetime) -> Event | None:
-        """把"Agent 没跑起来"翻译成一条带错误码的异常事件。"""
+        """把 Agent 或 GitHub 动作失败翻译成带错误码的异常事件。"""
         for outcome in executed:
             if outcome.action.kind not in {
                 ActionKind.START_AGENT,
