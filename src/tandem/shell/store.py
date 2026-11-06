@@ -189,7 +189,7 @@ class Store:
                     ),
                 )
         except sqlite3.IntegrityError:
-            raise ConflictError("GitHub ??? PR ?????????") from None
+            raise ConflictError("GitHub Issue 或 PR 已关联其他任务，拒绝重复关联") from None
 
     # ------------------------------------------------------------ 事件
 
