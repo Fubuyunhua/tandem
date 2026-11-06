@@ -91,11 +91,16 @@ class ConflictError(StoreError):
 
 @dataclass(frozen=True)
 class CommitResult:
-    """一次事务写进去的东西。"""
+    """一次事务写进去的东西。
+
+    ``claimed_action_ids`` 只包含**这次真正新写进去**的动作；
+    已经存在的动作说明别的处理者（或上一次重放）已经领走，不要重复执行。
+    """
 
     events: int = 0
     task_written: bool = False
     actions: int = 0
+    claimed_action_ids: tuple[str, ...] = ()
 
 
 def _now() -> datetime:
@@ -166,9 +171,16 @@ class Store:
             if task is not None:
                 self._write_task(task, expected_version, stamp)
                 written = True
+            claimed: list[str] = []
             for action in actions:
-                self._insert_action(action, stamp)
-        return CommitResult(events=len(events), task_written=written, actions=len(actions))
+                if self._insert_action(action, stamp):
+                    claimed.append(action.action_id)
+        return CommitResult(
+            events=len(events),
+            task_written=written,
+            actions=len(actions),
+            claimed_action_ids=tuple(claimed),
+        )
 
     def _insert_event(self, event: Event, stamp: str) -> None:
         self._connection.execute(
@@ -183,13 +195,17 @@ class Store:
             ),
         )
 
-    def _insert_action(self, action: Action, stamp: str) -> None:
-        self._connection.execute(
+    def _insert_action(self, action: Action, stamp: str) -> bool:
+        """写入一个动作。返回 True 表示这次真的抢到了执行权。
+
+        动作编号已经存在时：核对不可变字段是否一致，并**保留**原来的执行状态
+        （已经完成的动作不能因为重放又变回"已发出"）。
+        """
+        cursor = self._connection.execute(
             "INSERT INTO actions"
             " (action_id, task_id, kind, provider, detail, status, created_at, updated_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(action_id) DO UPDATE SET status = excluded.status,"
-            "   updated_at = excluded.updated_at",
+            " ON CONFLICT(action_id) DO NOTHING",
             (
                 action.action_id,
                 action.task_id,
@@ -201,6 +217,23 @@ class Store:
                 stamp,
             ),
         )
+        if cursor.rowcount == 1:
+            return True
+        row = self._connection.execute(
+            "SELECT task_id, kind, provider, detail FROM actions WHERE action_id = ?",
+            (action.action_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover - 冲突却查不到，说明数据库出问题了
+            raise StoreError(f"动作 {action.action_id} 写不进去")
+        existing = (
+            str(row["task_id"]),
+            str(row["kind"]),
+            None if row["provider"] is None else str(row["provider"]),
+            str(row["detail"]),
+        )
+        if existing != (action.task_id, action.kind.name, action.provider, action.detail):
+            raise ConflictError(f"动作编号 {action.action_id} 已经属于另一份内容，拒绝覆盖")
+        return False
 
     def _write_task(self, task: TaskRecord, expected_version: int | None, stamp: str) -> None:
         payload = serde.dumps(serde.task_to_dict(task))

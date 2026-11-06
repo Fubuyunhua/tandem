@@ -356,3 +356,30 @@ def test_code_event_rejects_a_receipt_from_another_task(tmp_path: Path) -> None:
     assert counting.calls == []  # 采集器没有被调用
     assert len(runner.store.list_events("t1")) == events_before
     assert runner.store.load_task("t1") == task1
+
+
+def test_replaying_an_identical_decision_does_not_run_the_agent_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H6：重放完全相同的决定时，假 Agent 只应该被调用一次。"""
+    from tandem.shell.agents.fake import FakeAgent
+
+    agent = FakeAgent(provider="claude", script=[code_receipt()])
+    runner = make_runner(tmp_path, agents={"claude": agent})
+    runner.submit("t1", Level.C)
+    stale = runner.store.load_task("t1")
+    assert stale is not None
+
+    event = Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude")
+    runner.handle(event)
+    assert agent.prompts, "第一次派活应该真的跑到假 Agent"
+    actions = runner.store.list_actions("t1")
+    assert [item.status for item in actions] == [ActionStatus.DONE]
+
+    # 另一个处理者拿着同一份旧快照重放同一份决定
+    monkeypatch.setattr(runner.store, "load_task", lambda task_id: stale)
+    replay = runner.handle(event)
+
+    assert len(agent.prompts) == 1  # 假 Agent 没有被再调用一次
+    assert replay.receipts == ()
+    assert [item.status for item in runner.store.list_actions("t1")] == [ActionStatus.DONE]

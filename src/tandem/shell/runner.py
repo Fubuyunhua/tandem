@@ -147,7 +147,7 @@ class Runner:
 
         # 一个事务：事件 + 带预期旧版本的任务快照 + 待执行动作。
         # 事务提交以后才去动外部世界，崩在中途也能从日志和动作表看出来。
-        self.store.commit(
+        committed = self.store.commit(
             events=[event],
             task=decision.task if decision.changed else None,
             expected_version=task.state_version,
@@ -155,8 +155,12 @@ class Runner:
             now=now,
         )
 
+        # 只执行这次真正抢到执行权的动作：重放同一个决定时不会把 Agent 再启动一次
+        claimed = set(committed.claimed_action_ids)
         executed: list[ExecutedAction] = []
         for action in decision.actions:
+            if action.action_id not in claimed:
+                continue
             outcome = self.executor.execute(action, decision.task)
             if action.provider is not None and action.kind is ActionKind.SET_QUOTA_EXHAUSTED:
                 self.quota.mark_exhausted(action.provider)

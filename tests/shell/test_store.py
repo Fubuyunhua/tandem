@@ -221,3 +221,34 @@ def test_task_snapshot_keeps_state_version(store: Store) -> None:
     updated = replace(loaded, state_version=4, status=TaskStatus.WORKING)
     store.commit(task=updated, expected_version=3)
     assert store.load_task("t1") == updated
+
+
+def test_replaying_the_same_actions_keeps_their_status(store: Store) -> None:
+    """H6：动作编号相同、内容相同 → 保留原来的执行状态，不重置成"已发出"。"""
+    action = Action(
+        action_id="t1:1:0", kind=ActionKind.START_AGENT, task_id="t1", provider="claude"
+    )
+    task = _task(0, status=TaskStatus.WORKING)
+    first = store.commit(
+        events=[Event(kind=EventKind.ASSIGN, task_id="t1")], task=task, actions=[action]
+    )
+    assert first.claimed_action_ids == ("t1:1:0",)
+    store.update_action_status("t1:1:0", ActionStatus.DONE)
+
+    replay = store.commit(
+        events=[Event(kind=EventKind.ASSIGN, task_id="t1")], task=task, actions=[action]
+    )
+    assert replay.claimed_action_ids == ()  # 这次没有抢到执行权
+    stored = store.list_actions("t1")
+    assert [item.status for item in stored] == [ActionStatus.DONE]
+
+
+def test_action_id_reuse_with_different_content_is_rejected(store: Store) -> None:
+    action = Action(
+        action_id="t1:1:0", kind=ActionKind.START_AGENT, task_id="t1", provider="claude"
+    )
+    store.commit(actions=[action])
+    other = Action(action_id="t1:1:0", kind=ActionKind.MERGE, task_id="t1", provider="github")
+    with pytest.raises(ConflictError):
+        store.commit(actions=[other])
+    assert [item.kind for item in store.list_actions("t1")] == [ActionKind.START_AGENT]
