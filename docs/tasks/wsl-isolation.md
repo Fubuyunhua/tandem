@@ -1,6 +1,6 @@
 # 任务书：WSL 隔离环境与诱饵测试工具（task-002）
 
-- 写手：agy（Antigravity）
+- 写手：pi（模型 opencode-go/deepseek-v4.1-flash；原定 agy，用户认为 Gemini 3.8 写代码不可信，改派）
 - 审核：Codex、Claude
 - 闸门：CI 必须全部通过
 - 用户的决定：本次所有代码都由 AI 生成，测试完成后用户再人工审核。
