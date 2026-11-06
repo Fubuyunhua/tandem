@@ -26,3 +26,5 @@ jobs:
         run: uv run pyright
       - name: 测试（含内核纯度检查）
         run: uv run pytest
+      - name: 冒烟测试（跑一遍 demo）
+        run: uv run tandem demo
