@@ -26,6 +26,7 @@ from tandem.core.model import (
     EventKind,
     Finding,
     Level,
+    OpenFinding,
     Policy,
     QuotaSnapshot,
     Review,
@@ -759,10 +760,7 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
         # 反对意见要留着：退回修改只清"通过资格"，不删待回应的问题
         recorded = replace(
             recorded,
-            open_findings=_merge_findings(
-                task.open_findings,
-                tuple(finding for item in failing for finding in item.findings),
-            ),
+            open_findings=_merge_findings(task.open_findings, open_findings_from(failing)),
         )
         if task.writer_is_human:
             # 14b：写手是你，带 AI 的反对意见交给你选择
@@ -1114,16 +1112,41 @@ def usable_findings(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
     return tuple(finding for finding in findings if finding.id.strip() and finding.text.strip())
 
 
+def finding_key(review: Review, finding: Finding) -> str:
+    """意见的复合键：提供方 + 提交编号 + 标准版本 + 本地编号。"""
+    return f"{review.provider}:{finding.id.strip()}@{review.sha[:8]}:v{review.standard_version}"
+
+
+def open_findings_from(recorded: tuple[Review, ...]) -> tuple[OpenFinding, ...]:
+    """把不通过结论里的意见变成"待回应项"，带上来源上下文。"""
+    opened: list[OpenFinding] = []
+    for review in recorded:
+        if review.verdict is not Verdict.FAIL:
+            continue
+        for finding in usable_findings(review.findings):
+            opened.append(
+                OpenFinding(
+                    key=finding_key(review, finding),
+                    provider=review.provider,
+                    sha=review.sha,
+                    standard_version=review.standard_version,
+                    local_id=finding.id.strip(),
+                    text=finding.text.strip(),
+                )
+            )
+    return tuple(opened)
+
+
 def _merge_findings(
-    existing: tuple[Finding, ...], incoming: tuple[Finding, ...]
-) -> tuple[Finding, ...]:
-    """按编号合并意见：同一编号只留一条，后来者不覆盖先前的正文。"""
+    existing: tuple[OpenFinding, ...], incoming: tuple[OpenFinding, ...]
+) -> tuple[OpenFinding, ...]:
+    """按复合键合并：不同来源的同号意见互不覆盖。"""
     merged = list(existing)
-    known = {finding.id for finding in existing}
-    for finding in usable_findings(incoming):
-        if finding.id not in known:
+    known = {finding.key for finding in existing}
+    for finding in incoming:
+        if finding.key not in known:
             merged.append(finding)
-            known.add(finding.id)
+            known.add(finding.key)
     return tuple(merged)
 
 
@@ -1133,7 +1156,7 @@ def _missing_veto_reasons(task: TaskRecord, event: Event) -> tuple[str, ...]:
         item.finding_id: item.reason.strip() for item in event.veto_reasons if item.reason.strip()
     }
     if task.open_findings:
-        return tuple(finding.id for finding in task.open_findings if not answers.get(finding.id))
+        return tuple(finding.key for finding in task.open_findings if not answers.get(finding.key))
     # 兼容旧记录：历史上如果有"没带具体意见的不通过"，不能当成没有反对意见
     unnumbered = [
         item

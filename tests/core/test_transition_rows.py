@@ -449,7 +449,7 @@ def test_row_20_vetoing_ai_needs_reasons() -> None:
         ev(
             EventKind.INTERVENTION_APPROVED,
             sha=record.latest_sha,
-            veto_reasons=(VetoReason(finding_id="F1", reason="这条我补了测试"),),
+            veto_reasons=_veto(record, "F1", "这条我补了测试"),
         ),
     )
     assert with_reason.task.status is TaskStatus.AWAITING_MERGE
@@ -1057,6 +1057,12 @@ def test_row_26_retry_after_acceptance_goes_back_to_acceptance() -> None:
 # ------------------------------------------------- F13：反对意见要留内容，会审要逐条答
 
 
+def _veto(record: TaskRecord, local_id: str, reason: str) -> tuple[VetoReason, ...]:
+    """按本地编号找到复合键，写一条否决理由。"""
+    key = next(finding.key for finding in record.open_findings if finding.local_id == local_id)
+    return (VetoReason(finding_id=key, reason=reason),)
+
+
 def _findings() -> tuple[Finding, ...]:
     return (
         Finding(id="F1", text="异常分支没有测试"),
@@ -1079,14 +1085,14 @@ def test_row_14_returning_for_fix_keeps_the_findings() -> None:
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.reviews == ()  # 这一轮的通过资格作废
     assert len(decision.task.review_history) == 1  # 历史意见留着
-    assert [finding.id for finding in decision.task.open_findings] == ["F1", "F2"]
+    assert [finding.local_id for finding in decision.task.open_findings] == ["F1", "F2"]
     assert decision.task.review_history[0].findings[0].text == "异常分支没有测试"
 
 
 def test_row_20_veto_needs_a_reason_for_every_finding() -> None:
     record = _to_you_deciding_with_findings()
     assert record.status is TaskStatus.NEEDS_INTERVENTION
-    assert [finding.id for finding in record.open_findings] == ["F1", "F2"]
+    assert [finding.local_id for finding in record.open_findings] == ["F1", "F2"]
 
     # 一条理由都不给 → 拒绝
     without = run(record, ev(EventKind.INTERVENTION_APPROVED, sha=SHA_2, reason="我觉得可以"))
@@ -1097,7 +1103,7 @@ def test_row_20_veto_needs_a_reason_for_every_finding() -> None:
         ev(
             EventKind.INTERVENTION_APPROVED,
             sha=SHA_2,
-            veto_reasons=(VetoReason(finding_id="F1", reason="这条我补测试了"),),
+            veto_reasons=_veto(record, "F1", "这条我补测试了"),
         ),
     )
     assert partial.task.status is TaskStatus.NEEDS_INTERVENTION
@@ -1109,8 +1115,8 @@ def test_row_20_veto_needs_a_reason_for_every_finding() -> None:
             EventKind.INTERVENTION_APPROVED,
             sha=SHA_2,
             veto_reasons=(
-                VetoReason(finding_id="F1", reason="这条我补测试了"),
-                VetoReason(finding_id="F2", reason="时间是从参数传的"),
+                *_veto(record, "F1", "这条我补测试了"),
+                *_veto(record, "F2", "时间是从参数传的"),
             ),
         ),
     )
@@ -1206,8 +1212,8 @@ def test_row_20_human_approval_survives_stale_seats() -> None:
             EventKind.INTERVENTION_APPROVED,
             sha=SHA_2,
             veto_reasons=(
-                VetoReason(finding_id="F1", reason="这条我补了测试"),
-                VetoReason(finding_id="F2", reason="时间从参数传"),
+                *_veto(record, "F1", "这条我补了测试"),
+                *_veto(record, "F2", "时间从参数传"),
             ),
         ),
     )
@@ -1303,3 +1309,63 @@ def test_row_20_legacy_fail_without_findings_cannot_be_approved_silently() -> No
         ),
     )
     assert explained.task.status is TaskStatus.AWAITING_MERGE
+
+
+# ------------------------------------------------- H5：意见要带来源，不能靠裸编号互相覆盖
+
+
+def _two_rounds_same_local_id() -> TaskRecord:
+    """第一轮 codex 提 F1，新提交后第二轮 opencode-go 也提 F1（正文不同）。"""
+    record = to_ai_review()
+    record = run(
+        record,
+        review_event(record, "codex", Verdict.FAIL, findings=(Finding(id="F1", text="旧意见"),)),
+    ).task
+    record = to_working(record)
+    record = to_acceptance(record, sha=SHA_2)
+    record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
+    record = run(
+        record,
+        review_event(
+            record, "opencode-go", Verdict.FAIL, findings=(Finding(id="F1", text="新意见"),)
+        ),
+    ).task
+    record = to_working(record)
+    return run(record, ev(EventKind.REFUSED_TO_FIX, reason="标准不对")).task
+
+
+def test_row_20_same_local_id_from_another_round_is_not_swallowed() -> None:
+    record = _two_rounds_same_local_id()
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    texts = {finding.text for finding in record.open_findings}
+    assert texts == {"旧意见", "新意见"}
+    keys = [finding.key for finding in record.open_findings]
+    assert len(set(keys)) == 2  # 复合键：提供方 + 提交编号 + 标准版本 + 本地编号
+
+
+def test_row_20_veto_answers_are_per_composite_key() -> None:
+    record = _two_rounds_same_local_id()
+    old_key, new_key = (finding.key for finding in record.open_findings)
+    partial = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            veto_reasons=(VetoReason(finding_id=old_key, reason="旧的那条已改"),),
+        ),
+    )
+    assert partial.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert new_key in partial.reason
+
+    complete = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            veto_reasons=(
+                VetoReason(finding_id=old_key, reason="旧的那条已改"),
+                VetoReason(finding_id=new_key, reason="新的那条我不同意"),
+            ),
+        ),
+    )
+    assert complete.task.status is TaskStatus.AWAITING_MERGE

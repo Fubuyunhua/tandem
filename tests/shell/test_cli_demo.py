@@ -333,9 +333,12 @@ def test_approve_with_veto_requires_every_finding(
     ).decision.task
     assert record.status is TaskStatus.NEEDS_INTERVENTION
     sha = record.latest_sha or ""
+    # 意见的键是复合键：提供方 + 提交编号 + 标准版本 + 本地编号
+    keys = {finding.local_id: finding.key for finding in record.open_findings}
+    assert set(keys) == {"F1", "F2"}
     runner.store.close()
 
-    # 只答一条 → 不生效
+    # 只答一条 → 不生效，并打印还缺哪一条
     assert (
         main(
             [
@@ -347,13 +350,13 @@ def test_approve_with_veto_requires_every_finding(
                 "--sha",
                 sha,
                 "--veto",
-                "F1=这条补了测试",
+                f"{keys['F1']}=这条补了测试",
             ]
         )
         != 0
     )
     out = capsys.readouterr().out
-    assert "F2" in out
+    assert keys["F2"] in out
     assert "没有生效" in out
 
     # 两条都答 → 生效
@@ -368,9 +371,9 @@ def test_approve_with_veto_requires_every_finding(
                 "--sha",
                 sha,
                 "--veto",
-                "F1=这条补了测试",
+                f"{keys['F1']}=这条补了测试",
                 "--veto",
-                "F2=时间是从参数传的",
+                f"{keys['F2']}=时间是从参数传的",
             ]
         )
         == 0

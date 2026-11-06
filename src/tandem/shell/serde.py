@@ -21,6 +21,7 @@ from tandem.core.model import (
     EventKind,
     Finding,
     Level,
+    OpenFinding,
     Review,
     RevisionCount,
     RunMode,
@@ -129,6 +130,29 @@ def finding_from_dict(data: object) -> Finding:
     )
 
 
+def open_finding_to_dict(finding: OpenFinding) -> dict[str, object]:
+    return {
+        "key": finding.key,
+        "provider": finding.provider,
+        "sha": finding.sha,
+        "standard_version": finding.standard_version,
+        "local_id": finding.local_id,
+        "text": finding.text,
+    }
+
+
+def open_finding_from_dict(data: object) -> OpenFinding:
+    mapping = _mapping(data, "open_finding")
+    return OpenFinding(
+        key=_str(mapping.get("key"), "open_finding.key"),
+        provider=_str(mapping.get("provider"), "open_finding.provider"),
+        sha=_str(mapping.get("sha"), "open_finding.sha"),
+        standard_version=_int(mapping.get("standard_version"), "open_finding.standard_version"),
+        local_id=_str(mapping.get("local_id"), "open_finding.local_id"),
+        text=_str(mapping.get("text"), "open_finding.text"),
+    )
+
+
 def veto_reason_to_dict(reason: VetoReason) -> dict[str, object]:
     return {"finding_id": reason.finding_id, "reason": reason.reason}
 
@@ -216,7 +240,7 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "designated_reviewers": list(task.designated_reviewers),
         "reviews": [review_to_dict(review) for review in task.reviews],
         "review_history": [review_to_dict(review) for review in task.review_history],
-        "open_findings": [finding_to_dict(finding) for finding in task.open_findings],
+        "open_findings": [open_finding_to_dict(finding) for finding in task.open_findings],
         "standard_version": task.standard_version,
         "accept_failures": task.accept_failures,
         "revision_counts": [
@@ -290,7 +314,7 @@ def task_from_dict(data: object) -> TaskRecord:
             for entry in _list(mapping.get("review_history", []), "review_history")
         ),
         open_findings=tuple(
-            finding_from_dict(entry)
+            open_finding_from_dict(entry)
             for entry in _list(mapping.get("open_findings", []), "open_findings")
         ),
         standard_version=_int(mapping.get("standard_version"), "standard_version"),

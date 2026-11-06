@@ -226,6 +226,22 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class OpenFinding:
+    """一条等你回应或写手修改的意见。
+
+    ``key`` 是复合键：提供方 + 提交编号 + 审核标准版本 + 该审核者自己的编号。
+    不同轮次、不同审核者都从 F1 开始编号，只有复合键才能把它们区分开。
+    """
+
+    key: str
+    provider: str
+    sha: str
+    standard_version: int
+    local_id: str
+    text: str
+
+
+@dataclass(frozen=True)
 class VetoReason:
     """你对某一条意见的否决理由（按意见编号）。"""
 
@@ -301,7 +317,7 @@ class TaskRecord:
     # review_history：所有历史审核意见，只追加，退回修改也不删
     review_history: tuple[Review, ...] = ()
     # open_findings：还要你回应或写手修改的意见（否决时必须逐条给理由）
-    open_findings: tuple[Finding, ...] = ()
+    open_findings: tuple[OpenFinding, ...] = ()
     standard_version: int = 1
 
     # 次数

@@ -262,7 +262,12 @@ def test_scenario_9_you_change_core_and_ai_disagrees() -> None:
         ev(
             EventKind.INTERVENTION_APPROVED,
             sha=walker.record.latest_sha,
-            veto_reasons=(VetoReason(finding_id="F1", reason="这条我补了重放测试"),),
+            veto_reasons=(
+                VetoReason(
+                    finding_id=walker.record.open_findings[0].key,
+                    reason="这条我补了重放测试",
+                ),
+            ),
         )
     )
     assert walker.record.status is TaskStatus.AWAITING_MERGE
