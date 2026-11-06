@@ -63,7 +63,9 @@ class LocalRun:
         }
         rule = self.runner.policy.rule_for(task.level)
         if rule.requires_plan_approval and task.approved_plan_version != task.plan_version:
-            payload["plan"] = "模拟方案：按 --changes 指定的改动工作，执行模拟 CI 后等待审核。"
+            paths = self.runner.diff_source.collect(task.base_sha, sha).changes.all_paths
+            changed = ", ".join(paths) or "不改仓库"
+            payload["plan"] = f"模拟方案：改动 {changed}；执行模拟 CI 后等待审核。"
             return render_receipt("PLAN：模拟方案，等待你批准", payload)
         if self.agent_script == "refuse" and task.returned_from_review:
             return render_receipt("REFUSE：模拟写手拒绝修改，交给你决定", payload)

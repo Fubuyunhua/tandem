@@ -94,6 +94,7 @@ def test_d_level_waits_for_plan_and_then_for_code_approval(tmp_path: Path) -> No
     plan = _task(db)
     assert plan.status is TaskStatus.AWAITING_PLAN_APPROVAL
     assert not plan.ci_green
+    assert core in plan.note
     assert _run(db, "--until-idle") == 0
     assert _task(db) == plan  # 人工暂停期间不发任何推进事件。
     _approve(db, plan)
