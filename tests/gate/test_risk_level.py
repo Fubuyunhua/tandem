@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "gate" / "risk_level.py"
@@ -179,3 +180,71 @@ def test_help_discloses_limitations(repository: Path) -> None:
     assert "分支保护" in result.stdout
     assert "D 级必须人工批准" in result.stdout
     assert "未扫描" in result.stdout
+
+
+def test_ordinary_rename_uses_existing_core_semantics(repository: Path) -> None:
+    """内核不会把普通改名直接判 D；受保护旧路径的场景另有测试。"""
+    git(repository, "mv", "app.py", "docs/app.py")
+    commit(repository)
+    report = check_report(repository, "C", "改名规则：新旧路径同时参与判断")
+    assert report["bottom_lines"] == []
+    assert report["files"][0]["paths"] == ["app.py", "docs/app.py"]
+
+
+def test_reports_existing_cross_file_assertion_limitation(repository: Path) -> None:
+    """复现 task-001 的合计抵消遗漏，保留既有裁决并如实解释。"""
+    write(repository, "tests/test_app.py", "def test_app():\n    assert 1\n")
+    write(repository, "tests/test_new.py", "def test_new():\n    assert True\n")
+    commit(repository)
+    report = check_report(repository, "C", "测试断言减少：2 → 1")
+    assert report["assertions_before"] == report["assertions_after"] == 2
+    assert report["bottom_lines"] == []
+
+
+@pytest.mark.parametrize("event", [{}, {"pull_request": []}, {"pull_request": {"base": {}}}])
+def test_invalid_pr_event_does_not_pass(repository: Path, event: object) -> None:
+    (repository.parent / "event.json").write_text(json.dumps(event), encoding="utf-8")
+    result = invoke(repository, use_event=True)
+    assert result.returncode == 2
+    assert "事件缺少 PR base/head" in result.stderr
+    assert not (repository / "risk-level.json").exists()
+
+
+def test_diverged_base_uses_common_ancestor(repository: Path) -> None:
+    ancestor = git(repository, "rev-parse", "HEAD")
+    write(repository, "app.py", "base_only = True\n")
+    base = commit(repository)
+    git(repository, "checkout", "-qb", "review", ancestor)
+    write(repository, "docs/说明.md", "仅待审分支的改动\n")
+    head = commit(repository)
+    result = invoke(repository, "--base", base, "--head", head)
+    assert result.returncode == 0, result.stderr
+    report = json.loads((repository / "risk-level.json").read_text(encoding="utf-8"))
+    assert report["merge_base"] == ancestor
+    assert report["files"][0]["paths"] == ["docs/说明.md"]
+    assert len(report["files"]) == 1
+
+
+def test_workflow_keeps_gate_read_only_and_blocking() -> None:
+    """保护触发器、最小权限和失败语义，避免接线改变闸门的安全契约。"""
+    # BaseLoader 不会按 YAML 1.1 把 GitHub 的 on 关键字当作布尔值。
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/risk-gate.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    assert set(workflow["on"]) == {"pull_request"}
+    assert workflow["permissions"] == {"contents": "read"}
+    assert len(workflow["jobs"]) == 1
+    job = workflow["jobs"]["risk-level"]
+    assert job["name"] == "risk-level"
+    assert "permissions" not in job
+    assert "continue-on-error" not in job
+    checkout = next(step for step in job["steps"] if "checkout@" in step.get("uses", ""))
+    assert checkout["with"]["fetch-depth"] == "0"
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+    assert checkout["with"]["persist-credentials"] == "false"
+    gate = next(step for step in job["steps"] if "risk_level.py" in step.get("run", ""))
+    assert "continue-on-error" not in gate
+    assert "||" not in gate["run"]
+    summary = next(step for step in job["steps"] if "GITHUB_STEP_SUMMARY" in step.get("run", ""))
+    assert summary["if"] == "always()"
