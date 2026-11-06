@@ -12,7 +12,7 @@ from tandem.shell.config import ConfigError, load_config, load_policy, parse_con
 
 def test_load_repository_risk_yml() -> None:
     config = load_config()
-    assert config.run_mode is RunMode.MULTI_AGENT
+    assert config.run_mode is RunMode.SINGLE_AGENT
     assert [provider.name for provider in config.providers] == ["claude", "codex", "opencode-go"]
     assert config.policy.default_writer == "claude"
     assert "core/**" in config.policy.bottom_line_paths

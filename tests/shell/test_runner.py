@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from tandem.core.model import (
     Level,
     QuotaState,
     Review,
+    RunMode,
     TaskStatus,
     Verdict,
 )
@@ -56,7 +58,9 @@ def make_runner(
         agents={"claude": agent} if agents is None else agents,  # type: ignore[arg-type]
         dry_run=dry_run,
     )
-    return Runner(store=store, policy=load_policy(), executor=executor, clock=lambda: NOW)
+    # 端到端测试走多 Agent 流程；risk.yml 的默认值是单 Agent 模式
+    policy = replace(load_policy(), run_mode=RunMode.MULTI_AGENT)
+    return Runner(store=store, policy=policy, executor=executor, clock=lambda: NOW)
 
 
 def test_submit_creates_pending_task(tmp_path: Path) -> None:

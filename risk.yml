@@ -3,9 +3,10 @@
 
 version: 1
 
-# 运行模式：M1 只有 Claude，所以用 single_agent（所有等级都由你审）。
+# 运行模式：M1 只有 Claude，所以默认 single_agent（所有等级都由你审）。
 # 等到 M2 有了第二家审核者，改成 multi_agent。
-run_mode: multi_agent
+# `tandem demo` 要跑多 Agent 的场景，它在代码里显式覆盖成 multi_agent，不依赖这个默认值。
+run_mode: single_agent
 
 # 默认写手（risk.yml 里没特别说明时派给谁）
 default_writer: claude

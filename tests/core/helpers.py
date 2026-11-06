@@ -36,9 +36,14 @@ DOC_CHANGES = ChangeSet(paths=("docs/design/note.md",))
 CORE_CHANGES = ChangeSet(paths=("src/tandem/core/model.py",))
 
 
-def policy() -> Policy:
-    """仓库里真实的 risk.yml。"""
+def repository_policy() -> Policy:
+    """仓库里真实的 risk.yml（M1 的默认配置是单 Agent 模式）。"""
     return load_policy()
+
+
+def policy() -> Policy:
+    """测试默认用多 Agent 策略：转换表里大部分条目只在多 Agent 模式下才会发生。"""
+    return replace(load_policy(), run_mode=RunMode.MULTI_AGENT)
 
 
 def quota(exhausted: tuple[str, ...] = ()) -> QuotaSnapshot:

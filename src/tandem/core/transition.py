@@ -264,6 +264,7 @@ def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         f"交回第 {plan_version} 版方案，等你批准",
         actions.items,
         plan_version=plan_version,
+        latest_sha=event.sha if event.sha is not None else task.latest_sha,
         note=event.plan or task.note,
     )
 

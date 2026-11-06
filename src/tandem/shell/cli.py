@@ -9,8 +9,11 @@
 from __future__ import annotations
 
 import argparse
+import io
+import sys
 import tempfile
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,7 +23,9 @@ from tandem.core.model import (
     Event,
     EventKind,
     Level,
+    Policy,
     Review,
+    RunMode,
     TaskRecord,
     TaskStatus,
     Verdict,
@@ -58,11 +63,19 @@ def _db_path(args: argparse.Namespace) -> Path:
     return value if isinstance(value, Path) else DEFAULT_DB
 
 
-def _open(db: Path, agents: dict[str, FakeAgent] | None = None) -> tuple[Store, Runner]:
+def _open(
+    db: Path,
+    agents: dict[str, FakeAgent] | None = None,
+    policy: Policy | None = None,
+) -> tuple[Store, Runner]:
     store = Store(db)
-    policy = load_policy()
     executor = Executor(agents=agents if agents is not None else {}, dry_run=True)
-    return store, Runner(store=store, policy=policy, executor=executor, clock=_clock)
+    return store, Runner(
+        store=store,
+        policy=policy if policy is not None else load_policy(),
+        executor=executor,
+        clock=_clock,
+    )
 
 
 def _print_decision(runner: Runner, event: Event) -> None:
@@ -223,8 +236,25 @@ def _print_path(task_id: str, title: str, statuses: list[TaskStatus]) -> None:
     print(f"  {task_id}：{' → '.join(collapsed)}")
 
 
-def run_demo() -> int:
-    """两个场景都跑一遍，用一个临时数据库。"""
+def _demo_policy() -> Policy:
+    """demo 的场景 1 需要多 Agent 模式。
+
+    risk.yml 的默认值是 M1 的真实配置（单 Agent 模式），demo 不能靠改默认值来跑，
+    而是在这里显式覆盖，免得默认配置为了 demo 而失真。
+    """
+    return replace(load_policy(), run_mode=RunMode.MULTI_AGENT)
+
+
+def _expect(ok: bool, message: str) -> bool:
+    """场景断言：不符合就打印出来，让 demo 返回非零。"""
+    if not ok:
+        print(f"场景失败：{message}")
+    return ok
+
+
+def run_demo(policy_: Policy | None = None) -> int:
+    """两个场景都跑一遍，用一个临时数据库。返回 0 表示两个场景都走到了预期状态。"""
+    demo_policy = policy_ if policy_ is not None else _demo_policy()
     with tempfile.TemporaryDirectory(prefix="tandem-demo-") as directory:
         db = Path(directory) / "tandem.sqlite3"
         claude = FakeAgent(
@@ -239,7 +269,7 @@ def run_demo() -> int:
                 _demo_plan_receipt("demo-d", 1, "先改 core 里的 decide，再接外壳"),
             ],
         )
-        store, runner = _open(db, {"claude": claude})
+        store, runner = _open(db, {"claude": claude}, demo_policy)
         try:
             # 场景 1：C 级任务，多 Agent 模式，走到已合并（dry-run）
             path_c: list[TaskStatus] = [TaskStatus.PENDING]
@@ -283,6 +313,24 @@ def run_demo() -> int:
             path_c.append(finished.decision.task.status)
             _print_path("demo-c", "场景 1：C 级任务，多 Agent 模式（合并是 dry-run）", path_c)
 
+            task_c = runner.store.load_task("demo-c")
+            ok = _expect(task_c is not None, "场景 1 没有留下任务记录")
+            actual_c = task_c.status.value if task_c else "无"
+            ok = (
+                _expect(
+                    task_c is not None and task_c.status is TaskStatus.MERGED,
+                    f"场景 1 应该走到已合并，实际是 {actual_c}",
+                )
+                and ok
+            )
+            ok = (
+                _expect(
+                    task_c is not None and task_c.latest_sha == receipt.sha,
+                    "场景 1 记录的提交编号应该和回执一致",
+                )
+                and ok
+            )
+
             # 场景 2：D 级任务，停在"待你批准方案"
             path_d: list[TaskStatus] = [TaskStatus.PENDING]
             runner.submit("demo-d", Level.D)
@@ -293,18 +341,36 @@ def run_demo() -> int:
                 Event(
                     kind=EventKind.PLAN_SUBMITTED,
                     task_id="demo-d",
+                    sha=plan_receipt.sha,
                     plan=plan_receipt.plan,
                 )
             )
             path_d.append(plan.decision.task.status)
             _print_path("demo-d", "场景 2：D 级任务（停在待你批准方案）", path_d)
 
+            task_d = runner.store.load_task("demo-d")
+            actual_d = task_d.status.value if task_d else "无"
+            ok = (
+                _expect(
+                    task_d is not None and task_d.status is TaskStatus.AWAITING_PLAN_APPROVAL,
+                    f"场景 2 应该停在待你批准方案，实际是 {actual_d}",
+                )
+                and ok
+            )
+            ok = (
+                _expect(
+                    task_d is not None and task_d.latest_sha == plan_receipt.sha,
+                    "场景 2 记录的提交编号应该和方案回执一致",
+                )
+                and ok
+            )
+
             print()
             print("两个场景都用假 Agent，没有调用任何真实 AI。")
             print("合并、关闭 PR、通知这些动作都是 dry-run，只记了日志：")
             for line in runner.executor.log:
                 print(f"  {line}")
-            return 0
+            return 0 if ok else 1
         finally:
             store.close()
 
@@ -359,7 +425,19 @@ COMMANDS = {
 }
 
 
+def _configure_utf8_output() -> None:
+    """把输出显式设成 UTF-8。
+
+    Windows 上把输出重定向到管道时，Python 会用系统代码页（cp936），中文会乱码；
+    外壳以后要读命令行的输出，也会遇到同样的问题。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_utf8_output()
     parser = build_parser()
     args = parser.parse_args(argv)
     command = str(args.command)

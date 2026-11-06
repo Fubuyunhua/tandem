@@ -138,3 +138,61 @@ def test_approve_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     out = capsys.readouterr().out
     assert "待处理" in out
     assert "你批准了第 1 版方案" in out
+
+
+def test_utf8_output_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F14：重定向输出时 Python 会用系统代码页，中文会乱码，入口要显式设成 UTF-8。"""
+    import io
+
+    from tandem.shell import cli
+
+    raw_out = io.BytesIO()
+    raw_err = io.BytesIO()
+    out = io.TextIOWrapper(raw_out, encoding="cp936", errors="strict")
+    err = io.TextIOWrapper(raw_err, encoding="cp936", errors="strict")
+    monkeypatch.setattr("sys.stdout", out)
+    monkeypatch.setattr("sys.stderr", err)
+
+    cli._configure_utf8_output()
+
+    assert out.encoding.lower() == "utf-8"
+    assert err.encoding.lower() == "utf-8"
+    print("中文输出")
+    out.flush()
+    assert "中文输出" in raw_out.getvalue().decode("utf-8")
+
+
+def test_main_configures_utf8_before_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tandem.shell import cli
+
+    called: list[str] = []
+    monkeypatch.setattr(cli, "_configure_utf8_output", lambda: called.append("utf8"))
+    assert cli.main(["demo"]) == 0
+    assert called == ["utf8"]
+
+
+def test_default_risk_mode_is_single_agent() -> None:
+    """F10：M1 只有 Claude，默认必须是单 Agent 模式；demo 自己显式开多 Agent。"""
+    from tandem.core.model import RunMode
+    from tandem.shell.config import load_config
+
+    assert load_config().run_mode is RunMode.SINGLE_AGENT
+
+
+def test_demo_fails_when_a_scenario_does_not_reach_expected_state(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """F10：场景没走到预期状态时，demo 必须返回非零，不能假报成功。"""
+    from dataclasses import replace
+
+    from tandem.core.model import RunMode
+    from tandem.shell.cli import _demo_policy, run_demo
+    from tandem.shell.config import load_policy
+
+    # 故意用单 Agent 模式跑：场景 1 会停在"待你审核"，走不到"已合并"
+    broken = replace(load_policy(), run_mode=RunMode.SINGLE_AGENT)
+    assert _demo_policy().run_mode is RunMode.MULTI_AGENT
+    assert run_demo(policy_=broken) != 0
+    out = capsys.readouterr().out
+    assert "场景 1" in out
+    assert "失败" in out
