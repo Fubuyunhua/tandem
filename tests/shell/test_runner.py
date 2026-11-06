@@ -19,7 +19,7 @@ from tandem.core.model import (
     Verdict,
 )
 from tandem.shell.agents.claude_cli import ClaudeCliAgent
-from tandem.shell.receipt import parse_receipt
+from tandem.shell.receipt import parse_receipt, render_receipt
 from tandem.shell.runner import QuotaTracker, RunnerError
 from tests.core.helpers import SHA_1
 from tests.shell.shell_helpers import NOW, code_receipt, make_runner
@@ -311,3 +311,48 @@ def test_agent_failure_becomes_an_incident_and_retry_really_reruns(tmp_path: Pat
     assert task is not None
     received = runner.handle(runner.code_event(task, receipt))
     assert received.decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+
+
+class _CountingDiffSource:
+    """包一层采集器，用来断言"回执被拒时采集器也没被调用"。"""
+
+    def __init__(self, inner: object) -> None:
+        self.inner = inner
+        self.calls: list[tuple[str, str]] = []
+
+    def collect(self, base: str, sha: str) -> object:
+        self.calls.append((base, sha))
+        return self.inner.collect(base, sha)  # type: ignore[attr-defined]
+
+
+def test_code_event_rejects_a_receipt_from_another_task(tmp_path: Path) -> None:
+    """H3：回执里的任务编号和当前任务不一致时，采集器和任务都不能推进。"""
+    from tandem.shell.diff_source import FakeDiffSource
+    from tandem.shell.receipt import ReceiptError
+    from tests.core.helpers import CODE_CHANGES
+
+    counting = _CountingDiffSource(FakeDiffSource(changes=CODE_CHANGES))
+    runner = make_runner(
+        tmp_path,
+        [code_receipt("t1"), code_receipt("t2")],
+        diff_source=counting,  # type: ignore[arg-type]
+    )
+    runner.submit("t1", Level.C)
+    runner.submit("t2", Level.C)
+    runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    runner.handle(Event(kind=EventKind.ASSIGN, task_id="t2", provider="claude"))
+
+    task1 = runner.store.load_task("t1")
+    assert task1 is not None
+    # 两个任务尝试次数相同，把 t2 的回执投给 t1
+    crossed = render_receipt(
+        "DONE：t2 的回执", {"task_id": "t2", "attempt": task1.attempt, "sha": "c" * 40}
+    )
+    events_before = len(runner.store.list_events("t1"))
+
+    with pytest.raises(ReceiptError):
+        runner.code_event(task1, parse_receipt(crossed))
+
+    assert counting.calls == []  # 采集器没有被调用
+    assert len(runner.store.list_events("t1")) == events_before
+    assert runner.store.load_task("t1") == task1

@@ -26,7 +26,7 @@ from tandem.core.model import (
 from tandem.core.transition import create_task, decide
 from tandem.shell.diff_source import DiffSource
 from tandem.shell.executor import ExecutedAction, Executor
-from tandem.shell.receipt import Receipt
+from tandem.shell.receipt import Receipt, ReceiptError
 from tandem.shell.store import Store
 
 
@@ -116,6 +116,11 @@ class Runner:
         改动一律来自 `DiffSource`：回执只提供任务编号、尝试次数和提交编号，
         Agent 自报的 changes 已经被回执解析丢掉了（回执只是自述，不是证据）。
         """
+        if receipt.task_id != task.task_id:
+            # 别的任务的回执：不能改写成当前任务的编号，任务和采集器都不推进
+            raise ReceiptError(
+                f"回执里的任务编号是 {receipt.task_id}，和当前任务 {task.task_id} 不一致"
+            )
         collected = self.diff_source.collect(
             base if base is not None else (task.base_sha or "main"), receipt.sha
         )
