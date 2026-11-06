@@ -1439,3 +1439,61 @@ def test_row_20_same_sha_prefix_findings_must_be_answered_separately() -> None:
         ),
     )
     assert both.task.status is TaskStatus.AWAITING_MERGE
+
+
+# ------------------------------------------------- 提交编号一变，旧证据必须全部作废
+
+SHA_OLD = "a1" + "0" * 38
+SHA_NEW = "b2" + "0" * 38
+
+
+def test_row_02_new_plan_with_a_new_sha_clears_stale_ci_and_seats() -> None:
+    """D 级退回修改后重新交方案（新提交编号）：CI 绿、审核席位、批准都要作废。
+
+    复现：ASSIGN → PLAN_SUBMITTED → PLAN_APPROVED → ASSIGN → CODE_SUBMITTED →
+    CI_GREEN → 审核 FAIL → ASSIGN → PLAN_SUBMITTED(新 sha)。
+    此时 latest_sha 换了，ci_green 仍然留着旧提交的 True。
+    """
+    walker = Walker(new_task(Level.D))
+    walker.assign("claude")
+    walker.step(ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="第一版方案"))
+    walker.step(ev(EventKind.PLAN_APPROVED, sha="plan-a"))
+    walker.assign("claude")
+    walker.submit_code(sha=SHA_OLD, changes=CORE_CHANGES)
+    walker.ci_green()
+    walker.review("codex", Verdict.FAIL, (Finding(id="F1", text="这里有问题"),))
+    walker.assign("claude")
+
+    assert walker.record.ci_green is True  # 上一轮的 CI 结论
+    assert walker.record.designated_reviewers == ("codex", "opencode-go")
+
+    walker.step(ev(EventKind.PLAN_SUBMITTED, sha=SHA_NEW, plan="第二版方案"))
+
+    assert walker.record.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert walker.record.latest_sha == SHA_NEW
+    assert walker.record.ci_green is False
+    assert walker.record.reviews == ()
+    assert walker.record.approved_sha is None
+    assert walker.record.designated_reviewers == ()
+
+
+def test_any_transition_that_changes_the_sha_drops_stale_evidence() -> None:
+    """凡是换提交编号的转移，都不能把旧提交的 CI/批准/席位带进新提交。
+
+    第 24 条（你提交代码）也走同一条规则：R03 之后你接手，CI 还是绿的，
+    你换了一个新提交编号提交，旧的 CI 绿色不能跟过来。
+    """
+    record = to_needs_intervention_by_reviewers()  # R03，ci_green=True
+    record = run(record, ev(EventKind.TAKE_OVER)).task
+    assert record.status is TaskStatus.YOU_WORKING
+    assert record.ci_green is True
+
+    decision = run(
+        record,
+        ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_NEW, changes=CODE_CHANGES),
+    )
+    assert decision.task.latest_sha == SHA_NEW
+    assert decision.task.ci_green is False
+    assert decision.task.approved_sha is None
+    assert decision.task.reviews == ()
+    assert decision.task.designated_reviewers == ()

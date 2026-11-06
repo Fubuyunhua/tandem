@@ -74,6 +74,29 @@ def _ignore(task: TaskRecord, why: str) -> Decision:
     return Decision(task=task, actions=[], reason=why, changed=False)
 
 
+def _drop_stale_evidence(task: TaskRecord, changes: dict[str, object]) -> dict[str, object]:
+    """换提交编号时，旧提交的证据一律作废。
+
+    "证据"指那些绑定某一个提交编号的结论：CI 是否绿、你批准的是哪个提交、
+    这一轮的有效审核结论、以及这次指定的审核席位。只要 ``latest_sha`` 变了，
+    它们就都不能跟到新提交上，否则会出现"新提交带着旧提交的 CI 绿"这种假证据。
+    显式传了值的调用方优先（目前没有任何路径需要在新提交上沿用旧证据）。
+    """
+    sha = changes.get("latest_sha")
+    if not isinstance(sha, str) or sha == task.latest_sha:
+        return changes
+    invalidated: dict[str, object] = {
+        "ci_green": False,
+        "approved_sha": None,
+        "reviews": (),
+        "designated_reviewers": (),
+        "returned_from_review": False,
+    }
+    merged = dict(invalidated)
+    merged.update(changes)
+    return merged
+
+
 def _transition(
     task: TaskRecord,
     status: TaskStatus,
@@ -81,13 +104,17 @@ def _transition(
     actions: list[Action],
     **changes: object,
 ) -> Decision:
-    """进入下一个状态：状态版本号 +1，动作记进任务记录。"""
+    """进入下一个状态：状态版本号 +1，动作记进任务记录。
+
+    换提交编号时自动作废旧证据（见 ``_drop_stale_evidence``），
+    这样每条转换都不用自己记得清 CI 绿、批准和审核席位。
+    """
     updated = replace(
         task,
         status=status,
         state_version=task.state_version + 1,
         reason=reason,
-        **changes,
+        **_drop_stale_evidence(task, changes),
     )
     return Decision(
         task=updated.with_actions(tuple(actions)), actions=actions, reason=reason, changed=True
