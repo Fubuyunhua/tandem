@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tandem.shell.cli import main
+from tandem.shell.store import Store
 
 
 def test_demo_prints_both_scenarios(capsys: pytest.CaptureFixture[str]) -> None:
@@ -183,3 +184,62 @@ def test_demo_fails_when_a_scenario_does_not_reach_expected_state(
     out = capsys.readouterr().out
     assert "场景 1" in out
     assert "失败" in out
+
+
+def test_approve_sends_your_approval_when_waiting_for_you(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8：待你审核要发 YOUR_APPROVAL，不能发成交给"待你介入"的那个事件。"""
+    from tandem.core.model import RunMode, TaskStatus
+    from tests.shell.shell_helpers import advance_to_your_review, code_receipt, make_runner
+
+    db = tmp_path / "tandem.sqlite3"
+    runner = make_runner(db, [code_receipt("t1")], run_mode=RunMode.SINGLE_AGENT)
+    task = advance_to_your_review(runner)
+    assert task.status is TaskStatus.AWAITING_YOUR_REVIEW
+    runner.store.close()
+
+    assert main(["approve", "--db", str(db), "--task-id", "t1"]) == 0
+    out = capsys.readouterr().out
+    assert "待合并" in out
+
+    with Store(db) as store:
+        loaded = store.load_task("t1")
+        assert loaded is not None
+        assert loaded.status is TaskStatus.AWAITING_MERGE
+
+
+def test_approve_returns_nonzero_when_kernel_ignores_event(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F8：内核忽略事件时，CLI 不能假报成功。"""
+    from tests.shell.shell_helpers import advance_to_needs_intervention, code_receipt, make_runner
+
+    db = tmp_path / "tandem.sqlite3"
+    runner = make_runner(db, [code_receipt("t1", attempt=i, sha=f"{i}" * 40) for i in (1, 2, 3)])
+    task = advance_to_needs_intervention(runner)
+    assert task.error_code == "R01"
+    runner.store.close()
+
+    # CI 是红的，人工审核通过会被内核拒绝
+    assert main(["approve", "--db", str(db), "--task-id", "t1", "--reason", "我看过了"]) != 0
+    out = capsys.readouterr().out
+    assert "没有生效" in out
+    assert "CI" in out
+
+
+def test_reject_returns_nonzero_when_kernel_ignores_event(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tandem.core.model import RunMode
+    from tests.shell.shell_helpers import advance_to_your_review, code_receipt, make_runner
+
+    db = tmp_path / "tandem.sqlite3"
+    runner = make_runner(db, [code_receipt("t1")], run_mode=RunMode.SINGLE_AGENT)
+    advance_to_your_review(runner)
+    runner.store.close()
+
+    # 待你审核只能打回一次；第二次已经没有可打回的状态了
+    assert main(["reject", "--db", str(db), "--task-id", "t1", "--reason", "不行"]) == 0
+    capsys.readouterr()
+    assert main(["reject", "--db", str(db), "--task-id", "t1", "--reason", "再不行"]) != 0

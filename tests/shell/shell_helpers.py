@@ -6,13 +6,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tandem.core.model import Policy, RunMode
+from tandem.core.model import Event, EventKind, Level, Policy, RunMode, TaskRecord
 from tandem.shell.agents.base import AgentAdapter
 from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.config import load_policy
 from tandem.shell.diff_source import DiffSource, FakeDiffSource
 from tandem.shell.executor import Executor
-from tandem.shell.receipt import render_receipt
+from tandem.shell.receipt import parse_receipt, render_receipt
 from tandem.shell.runner import Runner
 from tandem.shell.store import Store
 from tests.core.helpers import CODE_CHANGES, SHA_1
@@ -71,3 +71,34 @@ def make_runner(
         ),
         clock=lambda: NOW,
     )
+
+
+def required(task: TaskRecord | None, task_id: str = "t1") -> TaskRecord:
+    if task is None:  # pragma: no cover - 测试辅助，找不到就是测试写错了
+        raise AssertionError(f"没有任务 {task_id}")
+    return task
+
+
+def advance_to_your_review(runner: Runner, task_id: str = "t1") -> TaskRecord:
+    """走单 Agent 模式的正常流程，停在"待你审核"。"""
+    runner.submit(task_id, Level.C)
+    started = runner.handle(Event(kind=EventKind.ASSIGN, task_id=task_id, provider="claude"))
+    receipt = parse_receipt(started.receipts[0])
+    runner.handle(runner.code_event(required(runner.store.load_task(task_id), task_id), receipt))
+    runner.handle(Event(kind=EventKind.CI_GREEN, task_id=task_id, sha=receipt.sha))
+    return required(runner.store.load_task(task_id), task_id)
+
+
+def advance_to_needs_intervention(runner: Runner, task_id: str = "t1") -> TaskRecord:
+    """连续三次 CI 红，进入"待你介入"（R01，CI 是红的）。"""
+    runner.submit(task_id, Level.C)
+    for _ in range(3):
+        started = runner.handle(Event(kind=EventKind.ASSIGN, task_id=task_id, provider="claude"))
+        receipt = parse_receipt(started.receipts[0])
+        runner.handle(
+            runner.code_event(required(runner.store.load_task(task_id), task_id), receipt)
+        )
+        runner.handle(
+            Event(kind=EventKind.CI_RED, task_id=task_id, sha=receipt.sha, reason="测试没过")
+        )
+    return required(runner.store.load_task(task_id), task_id)

@@ -80,13 +80,18 @@ def _open(
     )
 
 
-def _print_decision(runner: Runner, event: Event) -> None:
+def _print_decision(runner: Runner, event: Event) -> bool:
+    """处理一个事件并打印结果。返回"内核是否真的改了状态"。"""
     result = runner.handle(event)
     task = result.decision.task
     print(f"{task.task_id}：{task.status.value}")
-    print(f"  原因：{result.decision.reason}")
+    if result.decision.changed:
+        print(f"  原因：{result.decision.reason}")
+    else:
+        print(f"  没有生效：{result.decision.reason}")
     for action in result.executed:
         print(f"  动作：{action.message}")
+    return result.decision.changed
 
 
 # ---------------------------------------------------------------- status
@@ -154,13 +159,16 @@ def cmd_approve(args: argparse.Namespace) -> int:
         match task.status:
             case TaskStatus.AWAITING_PLAN_APPROVAL:
                 event = _event(EventKind.PLAN_APPROVED, task)
-            case TaskStatus.AWAITING_YOUR_REVIEW | TaskStatus.NEEDS_INTERVENTION:
+            case TaskStatus.AWAITING_YOUR_REVIEW:
+                # "待你审核"是你批准 AI 写完的代码，走第 17 条
+                event = _event(EventKind.YOUR_APPROVAL, task, reason=args.reason)
+            case TaskStatus.NEEDS_INTERVENTION:
+                # "待你介入"是人工审核通过 / 批准你自己的代码，走第 20 条
                 event = _event(EventKind.INTERVENTION_APPROVED, task, reason=args.reason)
             case _:
                 print(f"{task.task_id} 在{task.status.value}，现在不需要你批准")
                 return 1
-        _print_decision(runner, event)
-        return 0
+        return 0 if _print_decision(runner, event) else 2
     finally:
         store.close()
 
@@ -180,8 +188,7 @@ def cmd_reject(args: argparse.Namespace) -> int:
             case _:
                 print(f"{task.task_id} 在{task.status.value}，现在不能打回")
                 return 1
-        _print_decision(runner, event)
-        return 0
+        return 0 if _print_decision(runner, event) else 2
     finally:
         store.close()
 
@@ -196,8 +203,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         if task is None:
             print(f"没有任务 {args.task_id}")
             return 1
-        _print_decision(runner, _event(EventKind.CANCEL, task, reason=args.reason))
-        return 0
+        changed = _print_decision(runner, _event(EventKind.CANCEL, task, reason=args.reason))
+        return 0 if changed else 2
     finally:
         store.close()
 
