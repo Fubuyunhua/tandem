@@ -7,7 +7,10 @@
 新增 `scripts/gate/risk_level.py`，通过现有 `GitDiffSource` 和 `compute_level`
 根据真实提交差异计算等级。普通代码和纯文档均为 C；命中底线为 D；无改动为 A。
 不接收模型意见。输出含中文规则解释的报告和 UTF-8 JSON，列明提交编号、共同祖先、
-各文件新旧路径、路径规则、删除和断言变化。密钥扫描明确标为“未扫描”。
+各文件新旧路径、底线原因、删除和断言变化。汇总与逐文件底线解释都调用内核的
+`bottom_line_reasons()`；脚本只选取对应文件的采集数据，不另写路径匹配或断言计数。
+JSON 的 `assertion_drops` 保留逐文件减少记录，断言合计仅用于概览。
+密钥扫描明确标为“未扫描”。
 
 等级工作流使用 `pull_request_target`，检查名固定为 `risk-level`，权限仅
 `contents: read`，检出时设 `persist-credentials: false`。
@@ -54,7 +57,7 @@ uv run python scripts/gate/risk_level.py --base <base提交> --head <head提交>
 工作流将两份报告写入 `$RUNNER_TEMP/risk-level.json` 和 `$RUNNER_TEMP/risk-level.md`，
 JSON 可供同一 job 的后续步骤读取，Markdown 会写入 job summary。
 
-## 已知限制与 task-001 问题
+## 已知限制与已修复问题
 
 - 修改 `.github/workflows/risk-gate.yml` 本身仍是 D 级，修改不能在同一 PR 的检查中
   替换正在运行的 base 裁判。仍需配置分支保护并审查裁判升级。
@@ -66,10 +69,11 @@ JSON 可供同一 job 的后续步骤读取，Markdown 会写入 job summary。
   普通代码文件移入 docs/ 且无其他底线命中时仍为 C。
   这是按既有 ADR 和内核语义作出的选择；若任务意图为所有此类移动都判 D，
   需要另行调整 task-001 的规则，本轮未修改内核。
-- task-001 的采集器按所有改动测试文件合计断言数量，存在抵消遗漏：
-  `tests/test_app.py` 从 2 条减到 1 条，同时另一测试文件新增 1 条，合计仍为 2，
-  因而现有内核判 C。新增复现测试记录了当前行为；报告会指出具体文件的断言减少，
-  但等级仍忠实使用现有内核结果。本轮未修改采集器或内核。
+- 已通过本地 merge 合入 `feat/m1-runnable` 的 `2988de3`，task-001 的断言抵消问题
+  已修复：采集器生成逐文件 `assertion_drops`，一个文件从 2 条减到 1 条，
+  另一个文件新增 1 条，即使合计仍为 2，也会判 D。原记录 C 级行为的测试已改为
+  D 级回归，并验证内核解释、逐文件归属和 JSON 中的减少记录。
+  内核及采集器的修复来自合并的目标分支，闸门直接复用该接口。
 
 ## 验证
 
@@ -79,6 +83,7 @@ J4 已把 `scripts` 加入 pyright 默认检查范围，与 `src`、`tests` 一�
 ruff 的默认文件发现原本就覆盖 `scripts/`，无需另加路径或改掉现有排除规则。
 新增测试使用真实临时 Git 仓库，通过子进程断言标准输出、JSON、摘要和退出码，
 覆盖任务书要求及 PR 默认输入、错误输入、分叉历史和上述既有边界。
+新增改名后断言减少、删除测试文件的报告验证，确保汇总和逐文件解释使用内核原因。
 J1 回归覆盖“head 删空底线并改受保护路径仍判 D”、base 规则缺失/损坏拒绝放行，
 以及 base 工作树读取含恶意入口、包初始化代码和无效依赖文件的 head 时不执行它们。
 工作流权限及阻断契约也有本地检查。未联网，未运行 GitHub Actions；

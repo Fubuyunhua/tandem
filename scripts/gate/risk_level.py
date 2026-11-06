@@ -7,20 +7,15 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import yaml
 
-from tandem.core.level import compute_level
+from tandem.core.level import bottom_line_reasons, compute_level
 from tandem.core.model import ChangeSet, Level, Policy
 from tandem.shell.config import ConfigError, parse_config
-from tandem.shell.diff_source import (
-    ASSERTION_PATTERN,
-    TEST_FILE_PATTERN,
-    DiffError,
-    GitDiffSource,
-)
+from tandem.shell.diff_source import DiffError, GitDiffSource
 
 MANUAL_EXIT_CODE = 3
 ERROR_EXIT_CODE = 2
@@ -70,39 +65,20 @@ def pr_revisions() -> tuple[str, str]:
     return base, head
 
 
-def assertion_count(repository: Path, revision: str, path: str | None) -> int:
-    """沿用采集器的近似断言计数；不存在的旧/新路径由调用方传 None。"""
-    if path is None:
-        return 0
-    content = git(repository, "show", f"{revision}:{path}")
-    return len(ASSERTION_PATTERN.findall(content))
-
-
 def explain_file(
-    repository: Path,
-    merge_base: str,
-    head: str,
+    changes: ChangeSet,
     policy: Policy,
     paths: tuple[str, ...],
     action: str,
-    existing_before: set[str],
 ) -> FileResult:
-    """用内核逐条检查路径规则，避免外壳另写一套 glob 匹配语义。"""
-    rules: list[str] = []
-    for path in paths:
-        for pattern in policy.bottom_line_paths:
-            single_rule = replace(policy, bottom_line_paths=(pattern,))
-            if compute_level(ChangeSet(paths=(path,)), single_rule) is Level.D:
-                rules.append(f"底线路径：{pattern}（{path}）")
-    if action == "删除":
-        rules.append("底线动作：删除文件")
-    if any(TEST_FILE_PATTERN.search(path) for path in paths):
-        before_path = paths[0] if paths[0] in existing_before else None
-        after_path = None if action == "删除" else paths[-1]
-        before = assertion_count(repository, merge_base, before_path)
-        after = assertion_count(repository, head, after_path)
-        if after < before:
-            rules.append(f"测试断言减少：{before} → {after}（采集器按所有测试文件合计裁决）")
+    """只选取本文件的采集数据，底线解释统一交给内核。"""
+    file_changes = ChangeSet(
+        paths=paths if action == "修改或新增" else (),
+        deleted_paths=paths if action == "删除" else (),
+        renames=((paths[0], paths[1]),) if action == "改名" else (),
+        assertion_drops=tuple(drop for drop in changes.assertion_drops if drop.path == paths[-1]),
+    )
+    rules = list(bottom_line_reasons(file_changes, policy))
     if action == "改名":
         rules.append("改名规则：新旧路径同时参与判断，取更严格级别")
     if not rules:
@@ -123,24 +99,10 @@ def build_report(repository: Path, base: str, head: str) -> dict[str, object]:
     changes = collected.changes
     level = compute_level(changes, policy)
     merge_base = git(repository, "merge-base", base, head)
-    # -z 保留中文、空格、换行等路径字符，集合只用于判断文件是否为新增。
-    existing_before = set(
-        git(repository, "ls-tree", "-r", "--name-only", "-z", merge_base).split("\0")
-    )
     entries: list[tuple[str, tuple[str, ...]]] = [("修改或新增", (p,)) for p in changes.paths]
     entries.extend(("删除", (p,)) for p in changes.deleted_paths)
     entries.extend(("改名", pair) for pair in changes.renames)
-    files = [
-        explain_file(repository, merge_base, head, policy, paths, action, existing_before)
-        for action, paths in entries
-    ]
-    bottom_lines = sorted(
-        {rule for file in files for rule in file.rules if rule.startswith("底线")}
-    )
-    if changes.assertions_decreased:
-        bottom_lines.append(
-            f"底线动作：测试断言总数减少 {changes.assertions_before} → {changes.assertions_after}"
-        )
+    files = [explain_file(changes, policy, paths, action) for action, paths in entries]
     return {
         "base": base,
         "policy_source": f"{base}:risk.yml",
@@ -149,9 +111,10 @@ def build_report(repository: Path, base: str, head: str) -> dict[str, object]:
         "level": level.value,
         "needs_manual": level is Level.D,
         "secret_scan": collected.secret_scan.value,
-        "bottom_lines": bottom_lines,
+        "bottom_lines": list(bottom_line_reasons(changes, policy)),
         "assertions_before": changes.assertions_before,
         "assertions_after": changes.assertions_after,
+        "assertion_drops": [asdict(drop) for drop in changes.assertion_drops],
         "files": [asdict(file) for file in files],
         "limitations": LIMITATIONS,
     }

@@ -1369,3 +1369,199 @@ def test_row_20_veto_answers_are_per_composite_key() -> None:
         ),
     )
     assert complete.task.status is TaskStatus.AWAITING_MERGE
+
+
+# ------------------------------------------------- H5 复核：键里必须用完整提交编号
+
+# 两个不同的提交，前 8 位相同：拿前缀当身份就会把它们混成一条
+SHA_PREFIX_SAME_A = "abcdef12" + "1" * 32
+SHA_PREFIX_SAME_B = "abcdef12" + "2" * 32
+
+
+def _two_rounds_same_prefix_different_sha() -> TaskRecord:
+    """同一提供方、同标准、同本地编号 F1，针对两个前 8 位相同的提交各给一条意见。"""
+    walker = Walker(new_task())
+    walker.assign("claude")
+    walker.submit_code(sha=SHA_PREFIX_SAME_A)
+    walker.ci_green()
+    walker.review("codex", Verdict.FAIL, (Finding(id="F1", text="旧提交的问题"),))
+    walker.assign("claude")
+    walker.submit_code(sha=SHA_PREFIX_SAME_B)
+    walker.ci_green()
+    walker.review("codex", Verdict.FAIL, (Finding(id="F1", text="新提交的问题"),))
+    walker.assign("claude")
+    return walker.step(ev(EventKind.REFUSED_TO_FIX, reason="标准不对")).task
+
+
+def test_row_20_same_sha_prefix_does_not_swallow_the_newer_finding() -> None:
+    """前 8 位相同但完整提交编号不同：两条意见都要保留，不能只留一条。"""
+    record = _two_rounds_same_prefix_different_sha()
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    texts = {finding.text for finding in record.open_findings}
+    assert texts == {"旧提交的问题", "新提交的问题"}
+    keys = [finding.key for finding in record.open_findings]
+    assert len(set(keys)) == 2
+    # 展示用的短键会撞车，所以完整键里不能只有前缀
+    assert {finding.sha for finding in record.open_findings} == {
+        SHA_PREFIX_SAME_A,
+        SHA_PREFIX_SAME_B,
+    }
+    assert len({finding.short_key for finding in record.open_findings}) == 1  # 缩写确实相同
+    # 展示时用短键列出来，存储和否决用的是完整键
+    assert "codex:F1@abcdef12:v1" in record.note
+    assert "旧提交的问题" in record.note and "新提交的问题" in record.note
+
+
+def test_row_20_same_sha_prefix_findings_must_be_answered_separately() -> None:
+    record = _two_rounds_same_prefix_different_sha()
+    first, second = record.open_findings
+
+    only_first = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            veto_reasons=(VetoReason(finding_id=first.key, reason="这条我改了"),),
+        ),
+    )
+    assert only_first.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert second.key in only_first.reason  # 还缺的那一条要按完整键指出来
+
+    both = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            veto_reasons=(
+                VetoReason(finding_id=first.key, reason="这条我改了"),
+                VetoReason(finding_id=second.key, reason="这条我不同意"),
+            ),
+        ),
+    )
+    assert both.task.status is TaskStatus.AWAITING_MERGE
+
+
+# ------------------------------------------------- 提交编号一变，旧证据必须全部作废
+
+SHA_OLD = "a1" + "0" * 38
+SHA_NEW = "b2" + "0" * 38
+
+
+def test_row_02_new_plan_with_a_new_sha_clears_stale_ci_and_seats() -> None:
+    """D 级退回修改后重新交方案（新提交编号）：CI 绿、审核席位、批准都要作废。
+
+    复现：ASSIGN → PLAN_SUBMITTED → PLAN_APPROVED → ASSIGN → CODE_SUBMITTED →
+    CI_GREEN → 审核 FAIL → ASSIGN → PLAN_SUBMITTED(新 sha)。
+    此时 latest_sha 换了，ci_green 仍然留着旧提交的 True。
+    """
+    walker = Walker(new_task(Level.D))
+    walker.assign("claude")
+    walker.step(ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="第一版方案"))
+    walker.step(ev(EventKind.PLAN_APPROVED, sha="plan-a"))
+    walker.assign("claude")
+    walker.submit_code(sha=SHA_OLD, changes=CORE_CHANGES)
+    walker.ci_green()
+    walker.review("codex", Verdict.FAIL, (Finding(id="F1", text="这里有问题"),))
+    walker.assign("claude")
+
+    assert walker.record.ci_green is True  # 上一轮的 CI 结论
+    assert walker.record.designated_reviewers == ("codex", "opencode-go")
+
+    walker.step(ev(EventKind.PLAN_SUBMITTED, sha=SHA_NEW, plan="第二版方案"))
+
+    assert walker.record.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert walker.record.latest_sha == SHA_NEW
+    assert walker.record.ci_green is False
+    assert walker.record.reviews == ()
+    assert walker.record.approved_sha is None
+    assert walker.record.designated_reviewers == ()
+
+
+def test_any_transition_that_changes_the_sha_drops_stale_evidence() -> None:
+    """凡是换提交编号的转移，都不能把旧提交的 CI/批准/席位带进新提交。
+
+    第 24 条（你提交代码）也走同一条规则：R03 之后你接手，CI 还是绿的，
+    你换了一个新提交编号提交，旧的 CI 绿色不能跟过来。
+    """
+    record = to_needs_intervention_by_reviewers()  # R03，ci_green=True
+    record = run(record, ev(EventKind.TAKE_OVER)).task
+    assert record.status is TaskStatus.YOU_WORKING
+    assert record.ci_green is True
+
+    decision = run(
+        record,
+        ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_NEW, changes=CODE_CHANGES),
+    )
+    assert decision.task.latest_sha == SHA_NEW
+    assert decision.task.ci_green is False
+    assert decision.task.approved_sha is None
+    assert decision.task.reviews == ()
+    assert decision.task.designated_reviewers == ()
+
+
+# ------------------------------------------------- 5b 的方案要有内容，并绑定这次提交
+
+SHA_5B = "c3" + "0" * 38
+
+
+def _escalated_to_d_by_real_changes() -> TaskRecord:
+    """C 级任务实际改了 core：第 5b 条重新分级成 D，进"待你批准方案"。"""
+    record = to_working(new_task(Level.C))
+    return run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_5B, changes=CORE_CHANGES),
+    ).task
+
+
+def test_row_05b_plan_records_what_you_are_approving() -> None:
+    """5b 没有文字方案：任务记录里要写清"内容就是这次提交的改动"，并带上底线原因。"""
+    record = _escalated_to_d_by_real_changes()
+    assert record.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert record.plan_version == 1
+
+    entry = record.plan()
+    assert entry is not None
+    assert entry.version == 1
+    assert entry.sha == SHA_5B  # 方案绑定这次交回的提交编号
+    assert record.plan_text == entry.text
+    assert "第 1 版方案" in entry.text
+    assert "没有文字方案" in entry.text
+    assert SHA_5B in entry.text
+    # 底线原因要说清是哪个文件、哪一条
+    assert "src/tandem/core/model.py" in entry.text
+    assert "底线" in entry.text
+
+
+def test_row_03_plan_approval_must_bind_the_plan_sha() -> None:
+    """5b 场景下批准方案也要带提交编号，且必须和这版方案绑定的一致。"""
+    record = _escalated_to_d_by_real_changes()
+
+    missing = run(record, ev(EventKind.PLAN_APPROVED))
+    assert missing.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "提交编号" in missing.reason
+
+    wrong = run(record, ev(EventKind.PLAN_APPROVED, sha=SHA_2))
+    assert wrong.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert not wrong.changed
+
+    matched = run(record, ev(EventKind.PLAN_APPROVED, sha=SHA_5B))
+    assert matched.task.status is TaskStatus.PENDING
+    assert matched.task.approved_plan_version == 1
+
+
+def test_row_02_submitted_plan_text_survives_later_transitions() -> None:
+    """PLAN_SUBMITTED 的正文要存进任务记录，之后不再被 note 覆盖。"""
+    record = to_working(new_task(Level.D))
+    record = run(
+        record,
+        ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="先加纯函数，再接外壳"),
+    ).task
+    assert record.plan_text == "先加纯函数，再接外壳"
+
+    record = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-a")).task
+    record = to_working(record)
+    record = to_acceptance(record, sha=SHA_1, changes=CORE_CHANGES)
+    # note 会被后面的转换改掉，方案正文不能跟着没
+    assert record.plan_text == "先加纯函数，再接外壳"
+    assert record.plan_version == 1
+    assert record.approved_plan_version == 1

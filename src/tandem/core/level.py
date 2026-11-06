@@ -71,20 +71,39 @@ def judged_paths(changes: ChangeSet) -> tuple[tuple[str, ...], bool]:
     return tuple(normalized), illegal
 
 
+def bottom_line_reasons(changes: ChangeSet, policy: Policy) -> tuple[str, ...]:
+    """命中底线的全部原因，带上是哪个文件、哪一条。
+
+    ``tandem show`` 和 risk-gate 的报告直接用它说明"为什么判 D"。
+    """
+    reasons: list[str] = []
+    if changes.secret_scan_hit:
+        reasons.append("密钥扫描命中")
+    for drop in changes.assertion_drops:
+        if drop.previous_path is not None and drop.previous_path != drop.path:
+            where = f"{drop.previous_path} 改名为 {drop.path}"
+        else:
+            where = drop.path
+        tail = "（文件被删除）" if drop.after == 0 and drop.path in changes.deleted_paths else ""
+        reasons.append(f"测试文件 {where} 的断言从 {drop.before} 条减到 {drop.after} 条{tail}")
+    if not changes.assertion_drops and changes.assertions_decreased:
+        reasons.append(
+            f"测试文件的断言合计从 {changes.assertions_before} 条减到 {changes.assertions_after} 条"
+        )
+    # 删除文件本身是一条底线条目
+    reasons.extend(f"删除了文件 {path}" for path in changes.deleted_paths)
+    paths, illegal = judged_paths(changes)
+    if illegal:
+        reasons.append("改动里有非法路径（绝对路径、空路径或含 .. 的路径）")
+    for path in paths:
+        if _matches_any(policy.bottom_line_paths, path):
+            reasons.append(f"改动了底线条目相关的路径 {path}")
+    return tuple(reasons)
+
+
 def hits_bottom_line(changes: ChangeSet, policy: Policy) -> bool:
     """是否命中底线条目。底线条目一律 D。"""
-    if changes.secret_scan_hit:
-        return True
-    if changes.assertions_decreased:
-        return True
-    # 删除文件本身是一条底线条目
-    if changes.deleted_paths:
-        return True
-    paths, illegal = judged_paths(changes)
-    # 非法路径（绝对路径、空路径、带 .. 的路径）直接按底线处理
-    if illegal:
-        return True
-    return any(_matches_any(policy.bottom_line_paths, path) for path in paths)
+    return bool(bottom_line_reasons(changes, policy))
 
 
 def _is_document(path: str, policy: Policy) -> bool:

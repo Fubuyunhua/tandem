@@ -12,6 +12,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tandem.core.level import bottom_line_reasons
+from tandem.shell.config import parse_config
+from tandem.shell.diff_source import GitDiffSource
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "gate" / "risk_level.py"
 
@@ -94,41 +98,43 @@ def test_ordinary_and_document_changes_are_c(repository: Path, path: str) -> Non
 
 
 @pytest.mark.parametrize(
-    ("path", "pattern"),
+    "path",
     [
-        (".github/workflows/risk-gate.yml", ".github/**"),
-        ("risk.yml", "risk.yml"),
-        ("src/tandem/core/example.py", "src/tandem/core/**"),
-        ("pyproject.toml", "pyproject.toml"),
-        ("uv.lock", "uv.lock"),
-        ("requirements-dev.txt", "requirements*.txt"),
-        ("package.json", "package.json"),
-        ("scripts/gate/example.py", "scripts/gate/**"),
+        ".github/workflows/risk-gate.yml",
+        "risk.yml",
+        "src/tandem/core/example.py",
+        "pyproject.toml",
+        "uv.lock",
+        "requirements-dev.txt",
+        "package.json",
+        "scripts/gate/example.py",
     ],
 )
-def test_protected_paths_are_d(repository: Path, path: str, pattern: str) -> None:
+def test_protected_paths_are_d(repository: Path, path: str) -> None:
     if path == "risk.yml":
         with (repository / path).open("a", encoding="utf-8") as stream:
             stream.write("\n# 配置变更\n")
     else:
         write(repository, path, "changed\n")
     commit(repository)
-    report = check_report(repository, "D", f"底线路径：{pattern}")
-    assert any(pattern in rule for rule in report["files"][0]["rules"])
+    reason = f"改动了底线条目相关的路径 {path}"
+    report = check_report(repository, "D", reason)
+    assert report["files"][0]["rules"] == [reason]
 
 
 def test_deleted_file_is_d(repository: Path) -> None:
     (repository / "app.py").unlink()
     commit(repository)
-    report = check_report(repository, "D", "底线动作：删除文件")
+    report = check_report(repository, "D", "删除了文件 app.py")
     assert report["files"][0]["action"] == "删除"
 
 
 def test_fewer_assertions_is_d(repository: Path) -> None:
     write(repository, "tests/test_app.py", "def test_app():\n    assert 1\n")
     commit(repository)
-    report = check_report(repository, "D", "测试断言总数减少 2 → 1")
-    assert "测试断言减少：2 → 1" in report["files"][0]["rules"][0]
+    reason = "测试文件 tests/test_app.py 的断言从 2 条减到 1 条"
+    report = check_report(repository, "D", reason)
+    assert report["files"][0]["rules"] == [reason]
 
 
 def test_renaming_protected_file_into_docs_is_d(repository: Path) -> None:
@@ -136,7 +142,7 @@ def test_renaming_protected_file_into_docs_is_d(repository: Path) -> None:
     commit(repository)
     report = check_report(repository, "D", "改名规则：新旧路径同时参与判断")
     assert report["files"][0]["paths"] == ["src/tandem/core/example.py", "docs/已移动.md"]
-    assert any("src/tandem/core/**" in rule for rule in report["bottom_lines"])
+    assert "改动了底线条目相关的路径 src/tandem/core/example.py" in report["bottom_lines"]
 
 
 def test_default_revisions_use_pr_event(repository: Path) -> None:
@@ -191,14 +197,19 @@ def test_ordinary_rename_uses_existing_core_semantics(repository: Path) -> None:
     assert report["files"][0]["paths"] == ["app.py", "docs/app.py"]
 
 
-def test_reports_existing_cross_file_assertion_limitation(repository: Path) -> None:
-    """复现 task-001 的合计抵消遗漏，保留既有裁决并如实解释。"""
+def test_cross_file_assertion_increases_do_not_cancel_drops(repository: Path) -> None:
+    """一个文件新增断言不能抵消另一个文件的减少，即使合计持平也判 D。"""
     write(repository, "tests/test_app.py", "def test_app():\n    assert 1\n")
     write(repository, "tests/test_new.py", "def test_new():\n    assert True\n")
     commit(repository)
-    report = check_report(repository, "C", "测试断言减少：2 → 1")
+    reason = "测试文件 tests/test_app.py 的断言从 2 条减到 1 条"
+    report = check_report(repository, "D", reason)
     assert report["assertions_before"] == report["assertions_after"] == 2
-    assert report["bottom_lines"] == []
+    assert report["bottom_lines"] == [reason]
+    assert report["files"][0]["rules"] == [reason]
+    assert report["assertion_drops"] == [
+        {"path": "tests/test_app.py", "before": 2, "after": 1, "previous_path": None}
+    ]
 
 
 @pytest.mark.parametrize("event", [{}, {"pull_request": []}, {"pull_request": {"base": {}}}])
@@ -232,9 +243,9 @@ def test_head_cannot_remove_base_bottom_lines(repository: Path) -> None:
     write(repository, "risk.yml", yaml.safe_dump(policy))
     write(repository, "src/tandem/core/example.py", "protected = False\n")
     commit(repository)
-    report = check_report(repository, "D", "底线路径：src/tandem/core/**")
+    report = check_report(repository, "D", "改动了底线条目相关的路径 src/tandem/core/example.py")
     assert report["policy_source"] == f"{report['base']}:risk.yml"
-    assert any("底线路径：risk.yml" in rule for rule in report["bottom_lines"])
+    assert "改动了底线条目相关的路径 risk.yml" in report["bottom_lines"]
 
 
 @pytest.mark.parametrize("base_policy", [None, "invalid: ["])
@@ -293,7 +304,33 @@ def test_trusted_base_checkout_never_executes_head(repository: Path) -> None:
     assert (repository / "uv.lock").read_text(encoding="utf-8") == (ROOT / "uv.lock").read_text(
         encoding="utf-8"
     )
-    assert any("scripts/gate/**" in rule for rule in report["bottom_lines"])
+    assert "改动了底线条目相关的路径 scripts/gate/risk_level.py" in report["bottom_lines"]
+
+
+def test_report_uses_core_reasons_for_renames_and_deletions(repository: Path) -> None:
+    """改名的断言减少与删除都沿用内核的解释，并归到对应文件。"""
+    git(repository, "mv", "tests/test_app.py", "tests/test_renamed.py")
+    write(repository, "tests/test_renamed.py", "def test_app():\n    assert 1\n")
+    (repository / "app.py").unlink()
+    commit(repository)
+    reason = "测试文件 tests/test_app.py 改名为 tests/test_renamed.py 的断言从 2 条减到 1 条"
+    report = check_report(repository, "D", reason)
+    changes = GitDiffSource(cwd=repository).collect("HEAD~1", "HEAD").changes
+    policy = parse_config(yaml.safe_load(git(repository, "show", "HEAD~1:risk.yml"))).policy
+    assert report["bottom_lines"] == list(bottom_line_reasons(changes, policy))
+    by_action = {file["action"]: file for file in report["files"]}
+    assert by_action["删除"]["rules"] == ["删除了文件 app.py"]
+    assert reason in by_action["改名"]["rules"]
+    assert "删除了文件 app.py" not in by_action["改名"]["rules"]
+
+
+def test_deleted_test_reports_both_drop_and_deletion(repository: Path) -> None:
+    (repository / "tests/test_app.py").unlink()
+    commit(repository)
+    reason = "测试文件 tests/test_app.py 的断言从 2 条减到 0 条（文件被删除）"
+    report = check_report(repository, "D", reason)
+    assert report["files"][0]["rules"] == [reason, "删除了文件 tests/test_app.py"]
+    assert report["bottom_lines"] == report["files"][0]["rules"]
 
 
 def test_workflow_keeps_gate_read_only_and_blocking() -> None:

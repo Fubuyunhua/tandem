@@ -16,7 +16,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import assert_never
 
-from tandem.core.level import compute_level
+from tandem.core.level import bottom_line_reasons, compute_level
 from tandem.core.model import (
     Action,
     ActionKind,
@@ -27,6 +27,7 @@ from tandem.core.model import (
     Finding,
     Level,
     OpenFinding,
+    PlanEntry,
     Policy,
     QuotaSnapshot,
     Review,
@@ -74,6 +75,29 @@ def _ignore(task: TaskRecord, why: str) -> Decision:
     return Decision(task=task, actions=[], reason=why, changed=False)
 
 
+def _drop_stale_evidence(task: TaskRecord, changes: dict[str, object]) -> dict[str, object]:
+    """换提交编号时，旧提交的证据一律作废。
+
+    "证据"指那些绑定某一个提交编号的结论：CI 是否绿、你批准的是哪个提交、
+    这一轮的有效审核结论、以及这次指定的审核席位。只要 ``latest_sha`` 变了，
+    它们就都不能跟到新提交上，否则会出现"新提交带着旧提交的 CI 绿"这种假证据。
+    显式传了值的调用方优先（目前没有任何路径需要在新提交上沿用旧证据）。
+    """
+    sha = changes.get("latest_sha")
+    if not isinstance(sha, str) or sha == task.latest_sha:
+        return changes
+    invalidated: dict[str, object] = {
+        "ci_green": False,
+        "approved_sha": None,
+        "reviews": (),
+        "designated_reviewers": (),
+        "returned_from_review": False,
+    }
+    merged = dict(invalidated)
+    merged.update(changes)
+    return merged
+
+
 def _transition(
     task: TaskRecord,
     status: TaskStatus,
@@ -81,13 +105,17 @@ def _transition(
     actions: list[Action],
     **changes: object,
 ) -> Decision:
-    """进入下一个状态：状态版本号 +1，动作记进任务记录。"""
+    """进入下一个状态：状态版本号 +1，动作记进任务记录。
+
+    换提交编号时自动作废旧证据（见 ``_drop_stale_evidence``），
+    这样每条转换都不用自己记得清 CI 绿、批准和审核席位。
+    """
     updated = replace(
         task,
         status=status,
         state_version=task.state_version + 1,
         reason=reason,
-        **changes,
+        **_drop_stale_evidence(task, changes),
     )
     return Decision(
         task=updated.with_actions(tuple(actions)), actions=actions, reason=reason, changed=True
@@ -333,12 +361,18 @@ def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     actions.add(
         ActionKind.NOTIFY, detail=f"{task.level.value} 级需要你先批准第 {plan_version} 版方案"
     )
+    entry = PlanEntry(
+        version=plan_version,
+        sha=event.sha or "",
+        text=event.plan or "",
+    )
     return _transition(
         task,
         TaskStatus.AWAITING_PLAN_APPROVAL,
         f"交回第 {plan_version} 版方案，等你批准",
         actions.items,
         plan_version=plan_version,
+        plan_history=task.plan_history + (entry,),
         latest_sha=event.sha if event.sha is not None else task.latest_sha,
         note=event.plan or task.note,
     )
@@ -348,8 +382,13 @@ def _on_plan_approved(task: TaskRecord, event: Event) -> Decision:
     """3. 待你批准方案 → 待处理：记下批准的是哪一版方案。"""
     if task.status is not TaskStatus.AWAITING_PLAN_APPROVAL:
         return _ignore(task, "只有待你批准方案的任务才会批准方案")
-    if event.sha is not None and task.latest_sha is not None and event.sha != task.latest_sha:
-        return _ignore(task, "你批准的是另一版方案：提交编号和当前的不一致")
+    entry = task.plan()
+    expected_sha = entry.sha if entry is not None and entry.sha else (task.latest_sha or "")
+    if expected_sha and (event.sha is None or event.sha != expected_sha):
+        return _ignore(
+            task,
+            f"你批准方案要带上你看到的那一版方案的提交编号（{expected_sha}），对不上就不生效",
+        )
     actions = _Actions(task, task.state_version + 1)
     # 写手是你时，批准完方案回到"你处理中"，你可以接着提交自己已经写好的代码；
     # 写手是 Agent 时回到"待处理"，等重新派活。
@@ -417,6 +456,17 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
 
     if plan_pending:
         plan_version = task.plan_version + 1
+        # 5b 没有文字方案：把这次交回的代码当作本版方案的内容，
+        # 写清提交编号和命中的底线条目，免得你"批准一个不存在的方案"。
+        reasons = "；".join(bottom_line_reasons(event.changes, policy)) or "无"
+        entry = PlanEntry(
+            version=plan_version,
+            sha=event.sha,
+            text=(
+                f"第 {plan_version} 版方案：没有文字方案，内容就是提交 {event.sha} 的改动，"
+                f"涉及的底线：{reasons}"
+            ),
+        )
         actions.add(ActionKind.NOTIFY, detail="按真实改动算出 D 级，要先批准方案")
         return _transition(
             task,
@@ -424,12 +474,13 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
             f"按真实改动重新算出来是 {new_level.value} 级，方案还没批准",
             actions.items,
             level=new_level,
+            plan_version=plan_version,
+            plan_history=task.plan_history + (entry,),
             latest_sha=event.sha,
             approved_sha=None,
             reviews=(),
             designated_reviewers=(),
             ci_green=False,
-            plan_version=plan_version,
             returned_from_review=False,
         )
 
@@ -515,12 +566,14 @@ def _on_refused_to_fix(task: TaskRecord, event: Event) -> Decision:
     reason = event.reason or "写手没有写理由"
     actions = _Actions(task, task.state_version + 1)
     actions.add(ActionKind.NOTIFY, detail="写手拒绝修改，等你决定")
+    # 备注里按短键列出待回应的意见，方便你在手机上先看个大概
+    pending = "；".join(f"{finding.short_key} {finding.text}" for finding in task.open_findings)
     return _transition(
         task,
         TaskStatus.NEEDS_INTERVENTION,
         f"写手拒绝修改：{reason}",
         actions.items,
-        note=reason,
+        note=f"{reason}｜待回应意见：{pending}" if pending else reason,
         returned_from_review=False,
     )
 
@@ -770,7 +823,10 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
                 TaskStatus.NEEDS_INTERVENTION,
                 f"{len(failing)} 家审核不通过（写手是你）：{failing_names}",
                 actions.items,
-                note="AI 的反对意见：" + failing_names,
+                note="待回应意见："
+                + "；".join(
+                    f"{finding.short_key} {finding.text}" for finding in recorded.open_findings
+                ),
             )
         revisions = task.revision_count(task.standard_version) + 1
         if revisions >= policy.thresholds.max_revisions:
@@ -1113,8 +1169,12 @@ def usable_findings(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
 
 
 def finding_key(review: Review, finding: Finding) -> str:
-    """意见的复合键：提供方 + 提交编号 + 标准版本 + 本地编号。"""
-    return f"{review.provider}:{finding.id.strip()}@{review.sha[:8]}:v{review.standard_version}"
+    """意见的复合键：提供方 + **完整**提交编号 + 标准版本 + 本地编号。
+
+    提交编号必须用完整的：前 8 位相同的不同提交也各有各的意见，
+    截断会把新提交的反对意见吞掉。缩写只出现在展示用的 short_key 里。
+    """
+    return f"{review.provider}:{finding.id.strip()}@{review.sha}:v{review.standard_version}"
 
 
 def open_findings_from(recorded: tuple[Review, ...]) -> tuple[OpenFinding, ...]:
