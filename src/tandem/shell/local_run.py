@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+import sys
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -32,8 +34,10 @@ AUTOMATIC_STATES = frozenset(
 
 
 def _quote(value: str) -> str:
-    """提示中的参数按 PowerShell 单引号规则转义。"""
-    return "'" + value.replace("'", "''") + "'"
+    """Windows 提示面向 PowerShell，其他平台使用 POSIX shell 转义。"""
+    if sys.platform == "win32":
+        return "'" + value.replace("'", "''") + "'"
+    return shlex.quote(value)
 
 
 @dataclass

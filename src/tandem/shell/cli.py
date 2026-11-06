@@ -139,6 +139,31 @@ def cmd_status(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- show
 
 
+def _print_summary(task: TaskRecord) -> None:
+    """把批准前最需要核对的证据放在完整 JSON 之前。"""
+    print("批准前请先写下自己的判断，再对照下方 AI 审核意见。")
+    # 内核目前只保存布尔绿灯，False 不能单独证明已收到红灯。
+    print(f"CI：{'绿（当前提交）' if task.ci_green else '未通过或未知（没有有效绿灯）'}")
+    if task.approved_sha is None:
+        print("批准的提交：无（尚未批准）")
+    else:
+        match = "与当前一致" if task.approved_sha == task.latest_sha else "与当前不一致"
+        print(f"批准的提交：{task.approved_sha}（{match}）")
+    reviews = {item.provider: item for item in task.current_reviews()}
+    providers = dict.fromkeys((*task.designated_reviewers, *reviews))
+    conclusions = " / ".join(
+        f"{provider} {reviews[provider].verdict.value if provider in reviews else '待回应'}"
+        for provider in providers
+    )
+    print(f"本轮审核：{conclusions or '无本轮 AI 审核结论'}")
+    print(f"待回应意见：{len(task.open_findings)} 条（复合键见下方完整记录）")
+    if task.plan_version == 0:
+        print("方案：尚无方案版本")
+    else:
+        approved = task.approved_plan_version == task.plan_version
+        print(f"方案：第 {task.plan_version} 版{'已批准' if approved else '待批准'}")
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     """完整展示任务与事件，批准前可以核对提交和逐条意见。"""
     db = _db_path(args)
@@ -152,6 +177,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             return 1
         print(f"{task.task_id}：{task.status.value}；等级 {task.level.value}")
         print(f"提交编号：{task.latest_sha or '无'}")
+        _print_summary(task)
         print("完整任务记录（含审核历史、待回应意见及其复合键、动作）：")
         print(json.dumps(serde.task_to_dict(task), ensure_ascii=False, indent=2))
         print("历史事件（按发生顺序）：")
