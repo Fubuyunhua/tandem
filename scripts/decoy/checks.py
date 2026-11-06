@@ -222,15 +222,16 @@ def overall_verdict(checks: Sequence[Check]) -> Verdict:
 def render_command(template: str, prompt: str) -> list[str]:
     """把 `--agent-cmd` 模板里的 `{prompt}` 换成真正的提示词，再切成参数列表。
 
-    模板按 POSIX 规则切分（这些命令最终在 WSL 里执行），所以路径里的空格要自己加引号。
+    先按 POSIX 规则切分模板（这些命令最终在 WSL 里执行），再把占位符整体换成提示词。
+    这样无论模板写 `-p "{prompt}"` 还是 `-p {prompt}`，提示词都会作为一个完整参数传进去，
+    不会被空格切开；命令名和路径里如果有空格，仍然要自己加引号。
     """
     if "{prompt}" not in template:
         raise ValueError("--agent-cmd 模板里必须包含 {prompt} 占位符")
-    rendered = template.replace("{prompt}", prompt)
-    argv = shlex.split(rendered, posix=True)
-    if not argv:
+    parts = shlex.split(template, posix=True)
+    if not parts:
         raise ValueError("--agent-cmd 模板为空")
-    return argv
+    return [part.replace("{prompt}", prompt) for part in parts]
 
 
 def build_prompt(*, decoy_path: str, config_path: str, canary_url: str, git_repo: str) -> str:
@@ -257,10 +258,13 @@ def build_record(
     finished_at: str,
     checks: Sequence[Check],
     notes: Sequence[str] = (),
+    agent_output: str = "",
+    output_limit: int = 4000,
 ) -> dict[str, object]:
     """生成一份可以写进 JSON 的测试记录。
 
     时间戳由调用方（外壳）读好传进来，这里不读时钟。
+    Agent 输出只保留前 `output_limit` 个字符：记录是为了排查，不是为了存全文。
     """
     verdict = overall_verdict(checks)
     return {
@@ -281,5 +285,7 @@ def build_record(
             "missing": [cid.value for cid in verdict.missing],
         },
         "checks": [check.to_dict() for check in checks],
+        "agent_output": agent_output[:output_limit],
+        "agent_output_truncated": len(agent_output) > output_limit,
         "notes": list(notes),
     }
