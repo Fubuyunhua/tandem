@@ -8,6 +8,9 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.scripts]
+tandem = "tandem.shell.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
