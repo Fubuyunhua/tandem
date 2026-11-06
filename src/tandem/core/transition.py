@@ -128,6 +128,66 @@ def _current_reviews(task: TaskRecord) -> tuple[Review, ...]:
     return task.current_reviews()
 
 
+def _reviews_by_provider(reviews: tuple[Review, ...]) -> dict[str, Review]:
+    """按提供方去重：一家提供方只能算一票。
+
+    审核者的名字（"codex"、"codex-session-2"）只是会话名，独立性按模型提供方算。
+    """
+    grouped: dict[str, Review] = {}
+    for review in reviews:
+        grouped.setdefault(review.provider, review)
+    return grouped
+
+
+def merge_blocker(task: TaskRecord, policy: Policy) -> tuple[str, ...]:
+    """放行的统一不变量：任何产生 MERGE 动作的路径都要先过这里。
+
+    返回非空表示不允许合并，元组里是原因（写进日志）。
+    """
+    reasons: list[str] = []
+    if not task.ci_green:
+        reasons.append("当前提交编号的 CI 不是绿的")
+    if task.latest_sha is None:
+        reasons.append("任务没有提交编号")
+    if task.approved_sha is not None and task.approved_sha != task.latest_sha:
+        reasons.append("批准的提交编号和当前的不一致")
+    if task.latest_sha is not None:
+        intruders = set(task.designated_reviewers) & task.providers_involved
+        if intruders:
+            reasons.append(f"审核者里有人写过这次代码：{'、'.join(sorted(intruders))}")
+    return tuple(reasons)
+
+
+def _merge(
+    task: TaskRecord,
+    policy: Policy,
+    reason: str,
+    actions: _Actions,
+    blocked_record: TaskRecord | None = None,
+    **changes: object,
+) -> Decision:
+    """唯一产生 MERGE 动作的出口。
+
+    守卫不过时：默认把这个事件当作没生效（忽略），
+    传了 ``blocked_record`` 就把"审核结论"记下来、状态留在原地（第 12 条用）。
+    """
+    candidate = replace(task, **changes)
+    blockers = merge_blocker(candidate, policy)
+    if blockers:
+        message = "；".join(blockers)
+        if blocked_record is None:
+            return _ignore(task, f"{reason}；但不能合并：{message}")
+        actions.add(ActionKind.NOTIFY, detail=f"不能合并：{message}")
+        return _transition(
+            blocked_record,
+            blocked_record.status,
+            f"{reason}；但不能合并：{message}",
+            actions.items,
+        )
+    actions.add(ActionKind.MERGE, detail=reason)
+    return _transition(candidate, TaskStatus.AWAITING_MERGE, reason, actions.items)
+
+
 def decide(
     task: TaskRecord,
     event: Event,
@@ -183,13 +243,13 @@ def _dispatch(
         case EventKind.REVIEW:
             return _on_review(task, event, policy)
         case EventKind.YOUR_APPROVAL:
-            return _on_your_approval(task, event)
+            return _on_your_approval(task, event, policy)
         case EventKind.YOUR_REJECTION:
             return _on_your_rejection(task, event)
         case EventKind.MERGED:
             return _on_merged(task, event)
         case EventKind.INTERVENTION_APPROVED:
-            return _on_intervention_approved(task, event)
+            return _on_intervention_approved(task, event, policy)
         case EventKind.REWORK:
             return _on_rework(task, event)
         case EventKind.STANDARD_CHANGED:
@@ -444,12 +504,11 @@ def _on_ci_green(task: TaskRecord, event: Event, policy: Policy, quota: QuotaSna
 
     rule = policy.rule_for(task.level)
     if not rule.requires_ai_review:
-        actions.add(ActionKind.MERGE, detail=f"{task.level.value} 级不需要 AI 审核，自动合并")
-        return _transition(
+        return _merge(
             task,
-            TaskStatus.AWAITING_MERGE,
+            policy,
             f"CI 绿，{task.level.value} 级不需要 AI 审核",
-            actions.items,
+            actions,
             ci_green=True,
             approved_sha=task.latest_sha,
         )
@@ -539,12 +598,15 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     if review.standard_version != task.standard_version:
         return _ignore(task, "审核结论用的是旧的审核标准版本，作废")
 
+    if any(existing.provider == review.provider for existing in _current_reviews(task)):
+        return _ignore(task, f"{review.provider} 已经出过结论，同一提供方不能算两家")
+
     recorded = replace(task, reviews=task.reviews + (review,))
-    current = _current_reviews(recorded)
+    by_provider = _reviews_by_provider(_current_reviews(recorded))
     rule = policy.rule_for(task.level)
     actions = _Actions(task, task.state_version + 1)
 
-    failing = tuple(item for item in current if item.verdict is Verdict.FAIL)
+    failing = tuple(item for item in by_provider.values() if item.verdict is Verdict.FAIL)
     failing_names = "；".join(item.reviewer for item in failing)
     if failing:
         if task.writer_is_human:
@@ -581,8 +643,15 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
             returned_from_review=True,
         )
 
-    passing = {item.reviewer for item in current if item.verdict is Verdict.PASS}
-    if all(reviewer in passing for reviewer in task.designated_reviewers):
+    designated = set(task.designated_reviewers)
+    passing = {
+        provider: item
+        for provider, item in by_provider.items()
+        if item.verdict is Verdict.PASS and provider in designated
+    }
+    enough_seats = len(designated) >= rule.min_reviewers
+    complete = enough_seats and designated <= set(passing) and len(passing) >= rule.min_reviewers
+    if complete:
         if rule.requires_human_merge:
             # 13：D 级，审核都过了，等你审
             actions.add(ActionKind.NOTIFY, detail="AI 审核全过，D 级等你看完整 diff")
@@ -592,39 +661,37 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
                 "所有指定的审核者都通过，D 级等你看",
                 actions.items,
             )
-        # 12：全过就合并（dry-run），绑定当前提交编号
-        actions.add(ActionKind.MERGE, detail=f"所有审核者通过，合并 {task.latest_sha}")
-        return _transition(
+        # 12：全过就合并（dry-run），守卫会再核对一次 CI 和提交编号
+        return _merge(
             recorded,
-            TaskStatus.AWAITING_MERGE,
-            "所有指定的审核者都通过，准备合并",
-            actions.items,
+            policy,
+            f"所有指定的审核者都通过，准备合并 {task.latest_sha}",
+            actions,
+            recorded,
             approved_sha=task.latest_sha,
         )
 
-    # 还有审核者没出结论，状态不变，只把这条结论记下来
-    return _transition(recorded, TaskStatus.AWAITING_AI_REVIEW, "还要等其他审核者的结论", [])
+    # 还有提供方没出结论，状态不变，只把这条结论记下来
+    return _transition(recorded, TaskStatus.AWAITING_AI_REVIEW, "还要等其他提供方的结论", [])
 
 
 # ---------------------------------------------------------------- 第 17–25 条
 
 
-def _on_your_approval(task: TaskRecord, event: Event) -> Decision:
+def _on_your_approval(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """17. 待你审核 → 待合并：CI 绿，绑定当前提交编号。"""
     if task.status is not TaskStatus.AWAITING_YOUR_REVIEW:
         return _ignore(task, "只有待你审核的任务才会由你批准")
-    if not task.ci_green:
-        return _ignore(task, "CI 不是绿的，谁都不能批准")
-    if task.latest_sha is None:
-        return _ignore(task, "任务没有提交编号，不能批准")
     actions = _Actions(task, task.state_version + 1)
-    actions.add(ActionKind.MERGE, detail=f"你批准了 {task.latest_sha}，合并")
-    return _transition(
+    approved_sha = task.latest_sha
+    if approved_sha is None:
+        return _ignore(task, "任务没有提交编号，不能批准")
+    return _merge(
         task,
-        TaskStatus.AWAITING_MERGE,
-        f"你批准了提交 {task.latest_sha}",
-        actions.items,
-        approved_sha=task.latest_sha,
+        policy,
+        f"你批准了提交 {approved_sha}",
+        actions,
+        approved_sha=approved_sha,
         note=event.reason or task.note,
     )
 
@@ -659,24 +726,21 @@ def _on_merged(task: TaskRecord, event: Event) -> Decision:
     return _transition(task, TaskStatus.MERGED, f"提交 {approved} 已合并", actions.items)
 
 
-def _on_intervention_approved(task: TaskRecord, event: Event) -> Decision:
-    """20. 待你介入 → 待合并：CI 必须是绿的，否决 AI 意见要逐条写理由。"""
+def _on_intervention_approved(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """20. 待你介入 → 待合并：CI 必须是绿的，否决 AI 意见要写理由。"""
     if task.status is not TaskStatus.NEEDS_INTERVENTION:
         return _ignore(task, "只有待你介入的任务才会人工审核通过")
-    if not task.ci_green:
-        return _ignore(task, "CI 不是绿的，人的权限也不能越过 CI")
     if task.latest_sha is None:
         return _ignore(task, "任务没有提交编号，不能批准")
     failing = [item for item in _current_reviews(task) if item.verdict is Verdict.FAIL]
     if failing and not (event.reason or "").strip():
         return _ignore(task, "否决 AI 的审核意见要对每一条写理由")
     actions = _Actions(task, task.state_version + 1)
-    actions.add(ActionKind.MERGE, detail=f"你人工审核通过 {task.latest_sha}，合并")
-    return _transition(
+    return _merge(
         task,
-        TaskStatus.AWAITING_MERGE,
+        policy,
         f"你人工审核通过了提交 {task.latest_sha}",
-        actions.items,
+        actions,
         approved_sha=task.latest_sha,
         note=event.reason or task.note,
     )

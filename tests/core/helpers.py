@@ -130,12 +130,13 @@ def review_event(
     verdict: Verdict = Verdict.PASS,
     sha: str | None = None,
     standard_version: int | None = None,
+    provider: str | None = None,
 ) -> Event:
     return ev(
         EventKind.REVIEW,
         review=Review(
             reviewer=reviewer,
-            provider=reviewer,
+            provider=provider if provider is not None else reviewer,
             verdict=verdict,
             sha=sha if sha is not None else (record.latest_sha or SHA_1),
             standard_version=(

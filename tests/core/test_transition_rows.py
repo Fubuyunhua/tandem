@@ -585,3 +585,103 @@ def test_quota_snapshot_unknown_means_available() -> None:
     snapshot = quota()
     assert snapshot.state("nobody") is QuotaState.UNKNOWN
     assert snapshot.has_quota("nobody")
+
+
+# ------------------------------------------------------------------ F2：合并前必须过 CI 这一关
+
+
+def test_row_12_cannot_merge_after_ci_failure_even_with_new_standard() -> None:
+    """R01 之后改审核标准、两家都通过，仍然不能合并：CI 是红的。"""
+    record = to_needs_intervention_by_ci()
+    assert not record.ci_green
+    record = run(record, ev(EventKind.STANDARD_CHANGED, standard_version=2)).task
+    assert record.status is TaskStatus.AWAITING_AI_REVIEW
+    for reviewer in record.designated_reviewers:
+        record = run(record, review_event(record, reviewer)).task
+
+    assert record.status is TaskStatus.AWAITING_AI_REVIEW
+    assert not any(action.kind is ActionKind.MERGE for action in record.actions)
+    assert "CI" in record.reason
+
+
+def test_merge_action_is_only_produced_with_green_ci() -> None:
+    """所有能产生 MERGE 的路径都走同一个守卫：CI 不绿就不产生合并动作。"""
+    # 路径一：AI 审核全过（C 级）
+    merging = to_merge_ready()
+    assert merging.ci_green
+    assert any(action.kind is ActionKind.MERGE for action in merging.actions)
+
+    # 路径二：人工介入后批准（R03，CI 绿）
+    record = to_needs_intervention_by_reviewers()
+    approved = run(record, ev(EventKind.INTERVENTION_APPROVED, reason="我看过了")).task
+    assert approved.status is TaskStatus.AWAITING_MERGE
+    assert any(action.kind is ActionKind.MERGE for action in approved.actions)
+
+    # 路径三：你自己批准（第 17 条）
+    record = to_d_ai_review()
+    for reviewer in record.designated_reviewers:
+        record = run(record, review_event(record, reviewer)).task
+    approved = run(record, ev(EventKind.YOUR_APPROVAL)).task
+    assert approved.status is TaskStatus.AWAITING_MERGE
+    assert any(action.kind is ActionKind.MERGE for action in approved.actions)
+
+
+def test_merge_guard_checks_the_approved_sha() -> None:
+    """批准的提交编号和当前的不一致时，不能合并。"""
+    from dataclasses import replace
+
+    record = to_merge_ready()
+    tampered = replace(record, approved_sha=SHA_2)
+    decision = run(tampered, review_event(tampered, "codex"))
+    assert not any(action.kind is ActionKind.MERGE for action in decision.actions)
+
+
+# ------------------------------------------------- F3：审核者按提供方去重、绑定席位
+
+
+def test_row_12_same_provider_with_two_names_cannot_fake_two_reviewers() -> None:
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex")).task
+    impostor = review_event(record, "codex-session-2", provider="codex")
+    decision = run(record, impostor)
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert not any(action.kind is ActionKind.MERGE for action in decision.actions)
+    assert "已经出过结论" in decision.reason
+
+
+def test_row_12_reviewer_must_hold_a_designated_seat() -> None:
+    record = to_ai_review()
+    # 没有任何席位邀请过 deepseek
+    decision = run(record, review_event(record, "deepseek", provider="deepseek"))
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert decision.task.reviews == ()
+    assert "指定的审核者" in decision.reason
+
+
+def test_row_12_cannot_merge_below_the_minimum_number_of_providers() -> None:
+    """就算把席位配错成两家同名，也不能凑够两家就合并。"""
+    from dataclasses import replace
+
+    record = to_ai_review()
+    tampered = replace(record, designated_reviewers=("codex", "codex"), reviews=())
+    decision = run(tampered, review_event(tampered, "codex"))
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert not any(action.kind is ActionKind.MERGE for action in decision.actions)
+
+
+def test_row_13_d_level_needs_two_distinct_providers_too() -> None:
+    record = to_d_ai_review()
+    record = run(record, review_event(record, record.designated_reviewers[0])).task
+    assert record.status is TaskStatus.AWAITING_AI_REVIEW
+    record = run(record, review_event(record, record.designated_reviewers[1])).task
+    assert record.status is TaskStatus.AWAITING_YOUR_REVIEW
+
+
+def test_row_12_review_extension_provider_counts_as_provider() -> None:
+    """opencode-go 只是入口，审核结论里记录的真实提供方要参与判断。"""
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex")).task
+    # 席位是 opencode-go，但结论里报的真实提供方是 codex（同一家）
+    decision = run(record, review_event(record, "opencode-go", provider="codex"))
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert "已经出过结论" in decision.reason or "指定的审核者" in decision.reason
