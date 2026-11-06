@@ -3,8 +3,8 @@
 TANDEM_INVARIANTS_DEEP=1: 1000 traces of up to 200 events (CI: 80 x 40).
 No network, shell execution, or real agents are used. Review counts follow each
 level's policy. D assignments may request a plan; code needs plan approval and
-merging needs human approval bound to the current SHA. The old baseline's plan
-SHA/CI defect remains a strict xfail (fixed upstream in 4310a82).
+merging needs human approval bound to the current SHA. Plan approval must name
+the current plan's SHA, independently of the latest code SHA.
 """
 
 from __future__ import annotations
@@ -146,6 +146,25 @@ def human_approval_sha(
     return previous
 
 
+def current_plan_sha(task: TaskRecord) -> str | None:
+    # Read the versioned input evidence rather than trusting an approval output.
+    entries = [entry for entry in task.plan_history if entry.version == task.plan_version]
+    return entries[0].sha if entries and entries[0].sha else task.latest_sha
+
+
+def check_plan_approval(before: TaskRecord, ev: Event, decision: Decision) -> None:
+    if ev.kind is not EventKind.PLAN_APPROVED:
+        return
+    if before.status is not TaskStatus.AWAITING_PLAN_APPROVAL:
+        assert not decision.changed, "plan_sha: approval outside plan review"
+        return
+    expected = current_plan_sha(before)
+    if ev.sha is None or ev.sha != expected:
+        assert not decision.changed and decision.task == before, "plan_sha: wrong plan approved"
+    elif decision.changed:
+        assert decision.task.approved_plan_version == before.plan_version, "plan_sha: wrong version"
+
+
 def check_fresh(before: TaskRecord, decision: Decision) -> None:
     after = decision.task
     if after.latest_sha != before.latest_sha:
@@ -187,7 +206,9 @@ def advance(task: TaskRecord) -> Event:
     return event(
         task,
         kind,
-        sha=task.latest_sha or "s0",
+        sha=(current_plan_sha(task) if kind is EventKind.PLAN_APPROVED else task.latest_sha)
+        or "s0",
+        plan="Generated proposal",
         attempt=task.attempt,
         changes=changes,
         model_suggestion=task.level,
@@ -203,7 +224,7 @@ def advance(task: TaskRecord) -> Event:
     required=st.integers(2, 3),
     prefix=st.integers(0, 9),
     instructions=st.lists(
-        st.tuples(st.integers(0, 5), st.sampled_from(list(EventKind)), st.integers(0, 7)),
+        st.tuples(st.integers(0, 6), st.sampled_from(list(EventKind)), st.integers(0, 7)),
         min_size=1,
         max_size=200 if DEEP else 40,
     ),
@@ -243,11 +264,14 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
                 ),
                 changes=ChangeSet(paths=("core/a.py",) if value % 2 else ("app.py",)),
                 check_result=list(CheckResult)[value % 3],
+                plan="Generated proposal",
             )
         elif choice == 4:
             ev = replace(ev, task_id="another-task")
         elif choice == 5:
             quota = QuotaSnapshot(((PROVIDERS[value % 4], QuotaState.EXHAUSTED),))
+        elif choice == 6:
+            ev = replace(ev, kind=EventKind.PLAN_APPROVED, sha=None)
         before = task
         decision = check_pure(before, ev, policy, quota)
         if decision.changed and ev.kind is EventKind.CI_GREEN:
@@ -268,6 +292,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
         check_terminal(before, decision)
         check_version(before, decision)
         check_d(before, decision, human_sha)
+        check_plan_approval(before, ev, decision)
         check_fresh(before, decision)
         task = decision.task
 
@@ -339,7 +364,6 @@ def test_d_intervention_approval_requires_current_sha(sha: str | None) -> None:
     check_d(task, decision, human_approval_sha(task, ev, decision))
 
 
-@pytest.mark.xfail(strict=True, reason="PLAN_SUBMITTED changes SHA without invalidating CI")
 def test_regression_new_plan_sha_invalidates_old_ci() -> None:
     policy = make_policy()
     task = walk(
@@ -713,3 +737,83 @@ def test_unapproved_d_code_receipts_cannot_advance(mode, attempt, sha) -> None:
                 TaskStatus.AWAITING_MERGE,
             )
             check_d(task, decision, None)
+
+
+@TRACE_SETTINGS
+@given(
+    first_sha=st.text(min_size=1, max_size=20),
+    suffix=st.text(min_size=1, max_size=20),
+    submitted=st.sampled_from([EventKind.PLAN_SUBMITTED, EventKind.CODE_SUBMITTED]),
+)
+def test_plan_approval_is_bound_to_current_plan_sha(first_sha, suffix, submitted) -> None:
+    policy = make_policy()
+    task = walk(Level.D, [EventKind.ASSIGN])
+    task = core.decide(
+        task,
+        event(task, EventKind.PLAN_SUBMITTED, sha=first_sha, plan="First proposal"),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    ).task
+    task = core.decide(
+        task, event(task, EventKind.PLAN_REJECTED), policy, QuotaSnapshot(), NOW
+    ).task
+    task = core.decide(task, event(task, EventKind.ASSIGN), policy, QuotaSnapshot(), NOW).task
+    current_sha = first_sha + suffix
+    task = core.decide(
+        task,
+        event(
+            task,
+            submitted,
+            sha=current_sha,
+            plan="Revised proposal",
+            attempt=task.attempt,
+            changes=ChangeSet(paths=("core/a.py",)),
+        ),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    ).task
+    assert task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert task.plan_version == 2
+    assert current_plan_sha(task) == current_sha
+    assert task.plan_text.strip()
+    for sha in (None, first_sha, current_sha):
+        ev = event(task, EventKind.PLAN_APPROVED, sha=sha)
+        decision = check_pure(task, ev, policy, QuotaSnapshot())
+        check_plan_approval(task, ev, decision)
+        check_version(task, decision)
+        assert decision.changed == (sha == current_sha)
+
+
+@pytest.mark.parametrize("sha", [None, "old-plan"])
+def test_plan_sha_guard_mutant_is_caught(monkeypatch: pytest.MonkeyPatch, sha: str | None) -> None:
+    policy = make_policy()
+    task = walk(Level.D, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED])
+    ev = event(task, EventKind.PLAN_APPROVED, sha=sha)
+    baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    check_plan_approval(task, ev, baseline)
+    assert not baseline.changed
+    original = core._on_plan_approved
+
+    def ignore_plan_sha(task, ev):
+        return original(task, replace(ev, sha=current_plan_sha(task)))
+
+    monkeypatch.setattr(core, "_on_plan_approved", ignore_plan_sha)
+    decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert decision.changed
+    with pytest.raises(AssertionError, match="plan_sha: wrong plan approved"):
+        check_plan_approval(task, ev, decision)
+
+
+def test_approval_generator_uses_plan_sha_instead_of_latest_code_sha() -> None:
+    policy = make_policy()
+    task = walk(Level.D, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED])
+    # A snapshot can retain a plan separately from the current code commit.
+    task = replace(task, latest_sha="different-code")
+    ev = advance(task)
+    assert ev.kind is EventKind.PLAN_APPROVED
+    assert ev.sha == "s0" and ev.sha != task.latest_sha
+    decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert decision.changed
+    check_plan_approval(task, ev, decision)

@@ -419,3 +419,46 @@ def test_approve_d_level_task_from_cli(tmp_path: Path, capsys: pytest.CaptureFix
         loaded = store.load_task("t1")
         assert loaded is not None
         assert loaded.status is TaskStatus.AWAITING_MERGE
+
+
+def test_approve_escalated_plan_requires_the_plan_sha(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """5b（C 级按真实改动升 D）：批准方案也要绑定这次交回的提交编号，show 能看到方案内容。"""
+    from tandem.core.model import Event, EventKind, Level, TaskStatus
+    from tandem.shell.diff_source import FakeDiffSource
+    from tests.core.helpers import CORE_CHANGES
+    from tests.shell.shell_helpers import code_receipt, make_runner
+
+    db = tmp_path / "tandem.sqlite3"
+    runner = make_runner(
+        db,
+        [code_receipt("t1")],
+        diff_source=FakeDiffSource(changes=CORE_CHANGES),
+    )
+    runner.submit("t1", Level.C)
+    started = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    receipt = parse_receipt(started.receipts[0])
+    task = runner.store.load_task("t1")
+    assert task is not None
+    runner.handle(runner.code_event(task, receipt))
+
+    task = runner.store.load_task("t1")
+    assert task is not None
+    assert task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "没有文字方案" in task.plan_text
+    assert receipt.sha in task.plan_text
+    runner.store.close()
+
+    # 错的提交编号不生效
+    assert main(["approve", "--db", str(db), "--task-id", "t1", "--sha", "另一个提交"]) != 0
+    assert "没有生效" in capsys.readouterr().out
+    # 带上这次交回的编号才生效
+    assert main(["approve", "--db", str(db), "--task-id", "t1", "--sha", receipt.sha]) == 0
+    with Store(db) as store:
+        approved = store.load_task("t1")
+        assert approved is not None
+        assert approved.status is TaskStatus.PENDING
+        assert approved.approved_plan_version == 1
+        # note 没有被方案正文占用，方案正文独立保存
+        assert approved.plan_text
