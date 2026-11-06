@@ -10,9 +10,11 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+import yaml
+
 from tandem.core.level import compute_level
 from tandem.core.model import ChangeSet, Level, Policy
-from tandem.shell.config import ConfigError, load_policy
+from tandem.shell.config import ConfigError, parse_config
 from tandem.shell.diff_source import (
     ASSERTION_PATTERN,
     TEST_FILE_PATTERN,
@@ -23,8 +25,9 @@ from tandem.shell.diff_source import (
 MANUAL_EXIT_CODE = 3
 ERROR_EXIT_CODE = 2
 LIMITATIONS = (
-    "工作流按 PR 分支里的版本运行，同一个 PR 可以修改闸门；"
-    "须由分支保护和 D 级必须人工批准兜底，本轮不解决。"
+    "工作流使用 pull_request_target，从 base 运行裁判代码和依赖；"
+    "head 仅作为 Git 数据读取，risk.yml 固定读取 base 提交。"
+    "分支保护和 D 级必须人工批准仍需配置；D 级退出码保持 3，批准后变绿机制待用户决定。"
     "密钥扫描尚未接入，结果标明未扫描。"
 )
 
@@ -111,7 +114,11 @@ def build_report(repository: Path, base: str, head: str) -> dict[str, object]:
     """采集实际改动，用内核裁决并生成可追溯报告。"""
     base = resolve_commit(repository, base)
     head = resolve_commit(repository, head)
-    policy = load_policy(repository / "risk.yml")
+    # 不读取工作树或 head 的规则，防止 PR 删除底线后给自己降级。
+    try:
+        policy = parse_config(yaml.safe_load(git(repository, "show", f"{base}:risk.yml"))).policy
+    except yaml.YAMLError as error:
+        raise ConfigError(f"{base}:risk.yml 不是合法的 YAML：{error}") from error
     collected = GitDiffSource(cwd=repository).collect(base, head)
     changes = collected.changes
     level = compute_level(changes, policy)
@@ -136,6 +143,7 @@ def build_report(repository: Path, base: str, head: str) -> dict[str, object]:
         )
     return {
         "base": base,
+        "policy_source": f"{base}:risk.yml",
         "head": head,
         "merge_base": merge_base,
         "level": level.value,

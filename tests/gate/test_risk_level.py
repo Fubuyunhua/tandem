@@ -225,6 +225,77 @@ def test_diverged_base_uses_common_ancestor(repository: Path) -> None:
     assert len(report["files"]) == 1
 
 
+def test_head_cannot_remove_base_bottom_lines(repository: Path) -> None:
+    """PR 同时删空底线、改受保护文件，仍按 base 的每条底线判 D。"""
+    policy = yaml.safe_load((repository / "risk.yml").read_text(encoding="utf-8"))
+    policy["bottom_line_paths"] = []
+    write(repository, "risk.yml", yaml.safe_dump(policy))
+    write(repository, "src/tandem/core/example.py", "protected = False\n")
+    commit(repository)
+    report = check_report(repository, "D", "底线路径：src/tandem/core/**")
+    assert report["policy_source"] == f"{report['base']}:risk.yml"
+    assert any("底线路径：risk.yml" in rule for rule in report["bottom_lines"])
+
+
+@pytest.mark.parametrize("base_policy", [None, "invalid: ["])
+def test_bad_base_policy_cannot_be_replaced_by_head(
+    repository: Path, base_policy: str | None
+) -> None:
+    """base 规则缺失或损坏就报错，不能改读 head 的可用规则。"""
+    if base_policy is None:
+        (repository / "risk.yml").unlink()
+    else:
+        write(repository, "risk.yml", base_policy)
+    commit(repository)
+    shutil.copyfile(ROOT / "risk.yml", repository / "risk.yml")
+    commit(repository)
+    result = invoke(repository, "--base", "HEAD~1", "--head", "HEAD")
+    assert result.returncode == 2
+    assert "等级闸门失败" in result.stderr
+    assert not (repository / "risk-level.json").exists()
+
+
+def test_trusted_base_checkout_never_executes_head(repository: Path) -> None:
+    """模拟工作流的 base 工作树；恶意 head 的入口、导入和依赖都只能当数据。"""
+    shutil.copytree(
+        ROOT / "src" / "tandem",
+        repository / "src" / "tandem",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    write(repository, "scripts/gate/risk_level.py", SCRIPT.read_text(encoding="utf-8"))
+    shutil.copyfile(ROOT / "pyproject.toml", repository / "pyproject.toml")
+    shutil.copyfile(ROOT / "uv.lock", repository / "uv.lock")
+    base = commit(repository)
+    malicious = "from pathlib import Path\nPath('head-executed').touch()\nraise SystemExit(0)\n"
+    write(repository, "scripts/gate/risk_level.py", malicious)
+    write(repository, "src/tandem/__init__.py", malicious)
+    write(repository, "pyproject.toml", "invalid: head build must never run\n")
+    write(repository, "uv.lock", "invalid: head lock must never be loaded\n")
+    write(repository, "risk.yml", "bottom_line_paths: []\n")
+    head = commit(repository)
+    # head 对象留在对象库，工作树只检出 base；用 PYTHONPATH 显式导入 base 的包。
+    git(repository, "checkout", "-q", "--detach", base)
+    result = subprocess.run(
+        [sys.executable, "scripts/gate/risk_level.py", "--base", base, "--head", head],
+        cwd=repository,
+        env=dict(os.environ, PYTHONPATH=str(repository / "src"), PYTHONIOENCODING="utf-8"),
+        capture_output=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert result.returncode == 3, result.stderr
+    assert not (repository / "head-executed").exists()
+    report = json.loads((repository / "risk-level.json").read_text(encoding="utf-8"))
+    assert report["level"] == "D"
+    assert report["policy_source"] == f"{base}:risk.yml"
+    assert git(repository, "rev-parse", "HEAD") == base
+    assert (repository / "uv.lock").read_text(encoding="utf-8") == (ROOT / "uv.lock").read_text(
+        encoding="utf-8"
+    )
+    assert any("scripts/gate/**" in rule for rule in report["bottom_lines"])
+
+
 def test_workflow_keeps_gate_read_only_and_blocking() -> None:
     """保护触发器、最小权限和失败语义，避免接线改变闸门的安全契约。"""
     # BaseLoader 不会按 YAML 1.1 把 GitHub 的 on 关键字当作布尔值。
@@ -232,17 +303,26 @@ def test_workflow_keeps_gate_read_only_and_blocking() -> None:
         (ROOT / ".github/workflows/risk-gate.yml").read_text(encoding="utf-8"),
         Loader=yaml.BaseLoader,
     )
-    assert set(workflow["on"]) == {"pull_request"}
+    assert set(workflow["on"]) == {"pull_request_target"}
     assert workflow["permissions"] == {"contents": "read"}
     assert len(workflow["jobs"]) == 1
     job = workflow["jobs"]["risk-level"]
     assert job["name"] == "risk-level"
     assert "permissions" not in job
     assert "continue-on-error" not in job
-    checkout = next(step for step in job["steps"] if "checkout@" in step.get("uses", ""))
+    checkouts = [step for step in job["steps"] if "checkout@" in step.get("uses", "")]
+    assert len(checkouts) == 1
+    checkout = checkouts[0]
     assert checkout["with"]["fetch-depth"] == "0"
-    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"
     assert checkout["with"]["persist-credentials"] == "false"
+    fetch = next(step for step in job["steps"] if "git -c" in step.get("run", ""))
+    assert fetch["env"]["PR_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+    assert 'fetch --no-tags --no-recurse-submodules origin "$PR_HEAD_SHA"' in fetch["run"]
+    assert all("${{" not in step.get("run", "") for step in job["steps"])
+    sync = next(step for step in job["steps"] if "uv sync" in step.get("run", ""))
+    assert sync["run"] == "uv sync --locked"
+    assert job["steps"].index(checkout) < job["steps"].index(fetch) < job["steps"].index(sync)
     gate = next(step for step in job["steps"] if "risk_level.py" in step.get("run", ""))
     assert "continue-on-error" not in gate
     assert "||" not in gate["run"]
