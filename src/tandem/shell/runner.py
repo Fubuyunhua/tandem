@@ -95,6 +95,7 @@ class Runner:
     def __post_init__(self) -> None:
         # 启动时接上存储，把之前记下的额度估计恢复回来
         self.quota.attach(self.store)
+        self.executor.github_store = self.store
 
     def submit(self, task_id: str, level: Level, *, base_sha: str = "main") -> TaskRecord:
         """建一个新任务。等级由提交时收集到的真实改动算好传进来。"""

@@ -130,12 +130,22 @@ def cmd_status(args: argparse.Namespace) -> int:
         if not tasks:
             print("还没有任务")
             return 0
-        print(f"{'任务':<20}{'状态':<16}{'等级':<6}{'版本':<6}{'提交编号':<12}原因")
+        print(f"{'任务':<20}{'状态':<16}{'等级':<6}{'版本':<6}{'提交编号':<12}原因  标题")
         for task in tasks:
             sha = (task.latest_sha or "-")[:8]
+            source = store.github_source(task.task_id)
+            title = (
+                "-"
+                if source is None
+                else "".join(
+                    character if character.isprintable() else " " for character in source.title
+                )
+            )
+            if len(title) > 80:
+                title = title[:79] + "…"
             print(
                 f"{task.task_id:<20}{task.status.value:<16}{task.level.value:<6}"
-                f"{task.state_version:<6}{sha:<12}{task.reason}"
+                f"{task.state_version:<6}{sha:<12}{task.reason}  {title}"
             )
     return 0
 
