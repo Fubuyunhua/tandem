@@ -25,3 +25,13 @@
 ## 低
 - J3：`LIMITATIONS` 里写的"本轮不解决"在 J1 修好后要更新。
 - J4：`ruff`/`pyright` 的默认范围不包括 `scripts/`，写手是手动额外检查的。建议把 `scripts` 加进 pyright 的 include，让 CI 也检查。
+
+## 第二轮（85a9675、fbb4a30）· Claude
+
+J1 **已修好**：改为 `pull_request_target`，检出 base 运行，head 只 fetch 为对象，`risk.yml`、脚本、依赖都来自 base；新增"PR 删空底线 + 改受保护路径仍判 D"的回归。J3、J4 已修。J2 仍等用户决定。
+
+剩余两点（低）：
+- 仓库是公开的，fetch PR head 不需要令牌。建议去掉 `FETCH_TOKEN` 和 `http.extraheader`，少一处凭据暴露面。
+- `pull_request_target` 用的是**基准分支上的工作流文件**。PR #3 本身的目标分支 `feat/m1-runnable` 上还没有这个文件，所以本 PR 上 `risk-level` 不会再运行，要等它进入基准分支后，后续 PR 才会受检。这是预期行为，请用户知悉。
+
+结论：**修改后可以**（J2 待用户决定）。
