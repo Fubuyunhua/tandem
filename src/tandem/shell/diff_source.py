@@ -241,15 +241,3 @@ class GitDiffSource:
             detail = completed.stderr.decode("utf-8", "replace").strip()
             raise DiffError(f"git {' '.join(args)} 失败：{detail}")
         return completed.stdout
-
-    def _git(self, *args: str) -> str:
-        completed = subprocess.run(
-            ["git", *args],
-            cwd=self.cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise DiffError(f"git {' '.join(args)} 失败：{completed.stderr.strip()}")
-        return completed.stdout

@@ -252,3 +252,22 @@ def test_action_id_reuse_with_different_content_is_rejected(store: Store) -> Non
     with pytest.raises(ConflictError):
         store.commit(actions=[other])
     assert [item.kind for item in store.list_actions("t1")] == [ActionKind.START_AGENT]
+
+
+def test_open_findings_survive_a_store_roundtrip(store: Store) -> None:
+    """H5 的复合键要能存下来：重开数据库以后还能按同一个键写否决理由。"""
+    from tandem.core.model import OpenFinding
+
+    finding = OpenFinding(
+        key="codex:F1@abcdef12:v1",
+        provider="codex",
+        sha="abcdef12" + "0" * 32,
+        standard_version=1,
+        local_id="F1",
+        text="异常分支没有测试",
+    )
+    task = _task(2, open_findings=(finding,))
+    store.commit(task=task)
+    loaded = store.load_task("t1")
+    assert loaded is not None
+    assert loaded.open_findings == (finding,)
