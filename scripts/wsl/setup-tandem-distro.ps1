@@ -1,63 +1,194 @@
 ﻿<#
 .SYNOPSIS
-    创建 tandem 专用 WSL2 发行版，并写入关闭 automount / interop / appendWindowsPath 的 /etc/wsl.conf。
+    用本地 rootfs 镜像创建 tandem 专用 WSL2 发行版，并写入关闭 automount / interop / appendWindowsPath 的 /etc/wsl.conf。
 
 .DESCRIPTION
     这个脚本做什么（按顺序）：
-      1. 检查前提：wsl.exe 可用、源发行版存在、目标发行版不存在（除非加 -Recreate）；
-      2. 把源发行版（默认 Ubuntu）导出成一个临时 tar；
-      3. 用这个 tar 导入成新的发行版（默认 tandem，WSL 2）；
-      4. 把 scripts/wsl/wsl.conf 以 LF 换行写入发行版的 /etc/wsl.conf；
-      5. 终止这个发行版，让它下次以新配置启动，并打印验证命令。
+      1. 检查前提：wsl.exe 可用；目标发行版名不与任何已有发行版重名；rootfs 文件存在；
+      2. 校验 rootfs 的 SHA256 是否等于你提供的期望值（不一致就停，不导入）；
+      3. 在专用运行目录里记一份阶段报告（唯一名字，绝不复用已有目录）；
+      4. 用 `wsl --import` 把 rootfs 导入成新发行版（WSL 2）；
+      5. 把 scripts/wsl/wsl.conf 以 LF 换行写入发行版的 /etc/wsl.conf；
+      6. 终止这个发行版，让它下次以新配置启动，并打印只读的验证结果。
 
-    它不做什么：
-      - 不改 .wslconfig（那是全局配置，会影响你所有的发行版）；
-      - 不安装任何软件，不登录任何 AI；
-      - 不删除已有的发行版（只有 -Recreate 会，而且会再确认一次）；
-      - 不联网下载镜像：用「导出再导入」的方式，所以源发行版必须已经存在。
+    它**不会**做什么：
+      - 不会复制你现有的发行版（第一轮的 `--export` 会把私人资料一起带进"隔离"环境，已删除）；
+      - 不会注销、删除、覆盖任何已有发行版（`-Recreate` 已删除）；
+      - 不会修改 .wslconfig（那是全局配置）；
+      - 不联网下载镜像：rootfs 要你自己准备好，并且自己核对哈希。
 
-    破坏性操作（注销已有发行版、导入覆盖目录）之前都会要求确认；加 -DryRun 只打印计划。
+    任何阶段失败都会打印"已完成 / 失败在 / 未完成"，不会说"未做任何改动"。
+
+.PARAMETER RootfsPath
+    本地 rootfs 文件（例如从 Ubuntu 官方发布的 WSL 镜像里解出来的 install.tar.gz）。
+
+.PARAMETER ExpectedSha256
+    rootfs 的期望 SHA256（64 位十六进制）。必须提供，脚本不会相信未经校验的镜像。
 
 .PARAMETER DistroName
-    新发行版的名字，默认 tandem。
-
-.PARAMETER SourceDistro
-    导出 tar 用的现有发行版，默认 Ubuntu。
+    新发行版的名字，默认 tandem。必须与已有发行版都不同。
 
 .PARAMETER InstallDir
-    新发行版的数据放在 Windows 的哪个目录，默认 %LOCALAPPDATA%\tandem\wsl\tandem。
+    新发行版的数据目录，默认 %LOCALAPPDATA%\tandem\wsl\tandem。已存在则拒绝（不覆盖）。
 
-.PARAMETER TarPath
-    导出用的临时 tar，默认 %TEMP%\tandem-source.tar（导出期间可能占几个 GB）。
-
-.PARAMETER Recreate
-    目标发行版已存在时，先注销它再重建。这会丢掉里面的一切。
+.PARAMETER RunsRoot
+    阶段报告和临时文件的父目录，默认 %LOCALAPPDATA%\tandem\wsl\runs。
 
 .PARAMETER DryRun
-    只打印计划，不执行任何会改变系统状态的命令。
+    只做只读检查并打印计划，不创建目录、不导入、不写配置。
 
 .PARAMETER Yes
     跳过交互确认（给自动化用；慎用）。
 
 .EXAMPLE
-    .\scripts\wsl\setup-tandem-distro.ps1 -DryRun
+    .\scripts\wsl\setup-tandem-distro.ps1 -RootfsPath D:\images\ubuntu-wsl-rootfs.tar.gz -ExpectedSha256 <64 位十六进制> -DryRun
 
 .EXAMPLE
-    .\scripts\wsl\setup-tandem-distro.ps1 -SourceDistro Ubuntu
+    .\scripts\wsl\setup-tandem-distro.ps1 -RootfsPath D:\images\ubuntu-wsl-rootfs.tar.gz -ExpectedSha256 <64 位十六进制>
 #>
 [CmdletBinding()]
 param(
+    [string]$RootfsPath = "",
+    [string]$ExpectedSha256 = "",
     [string]$DistroName = "tandem",
-    [string]$SourceDistro = "Ubuntu",
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "tandem\wsl\tandem"),
-    [string]$TarPath = (Join-Path $env:TEMP "tandem-source.tar"),
-    [switch]$Recreate,
+    [string]$RunsRoot = (Join-Path $env:LOCALAPPDATA "tandem\wsl\runs"),
     [switch]$DryRun,
     [switch]$Yes
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# ==========================================================================
+# 纯逻辑：测试脚本会 dot-source 本文件后直接调用这些函数
+# ==========================================================================
+
+function Assert-DistroNameFresh {
+    <# 目标名字必须合法、且与任何已有发行版都不同（G2）。绝不注销已有发行版。 #>
+    param(
+        [string]$DistroName,
+        [string[]]$Existing = @()
+    )
+    if ([string]::IsNullOrWhiteSpace($DistroName)) {
+        throw "发行版名字不能为空。"
+    }
+    if ($DistroName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        throw "发行版名字只能包含字母、数字、点、下划线、短横线：$DistroName"
+    }
+    if ($Existing -contains $DistroName) {
+        throw ("发行版 '$DistroName' 已经存在。这个脚本不会注销任何已有发行版：" +
+            "要重建请按 docs/runbooks/wsl-isolation.md 的回滚一节手动删除，或者换一个 -DistroName。")
+    }
+}
+
+function Assert-RootfsReady {
+    <# rootfs 必须存在、是普通文件、并且哈希等于你给的期望值（G1）。 #>
+    param(
+        [string]$Path,
+        [string]$ExpectedSha256
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "必须用 -RootfsPath 指定一个本地 rootfs 文件：不会从你现有的发行版复制。"
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "rootfs 文件不存在：$Path"
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.LinkType) {
+        throw "rootfs 不能是符号链接：$Path"
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        throw "必须用 -ExpectedSha256 提供期望的 SHA256：脚本不会导入未经校验的镜像。"
+    }
+    if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "ExpectedSha256 必须是 64 位十六进制：$ExpectedSha256"
+    }
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    $expected = $ExpectedSha256.ToUpperInvariant()
+    if ($actual -ne $expected) {
+        throw ("rootfs 哈希不符：期望 $expected，实际 $actual。" +
+            "镜像可能损坏或被替换，已停止，未导入任何东西。")
+    }
+}
+
+function Assert-InstallDirFree {
+    <# 安装目录不能是已经存在且非空的目录（G3：不覆盖别人的东西）。 #>
+    param([string]$InstallDir)
+    if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+        throw "必须指定 -InstallDir。"
+    }
+    if (Test-Path -LiteralPath $InstallDir) {
+        $item = Get-Item -LiteralPath $InstallDir -Force
+        if (-not $item.PSIsContainer) {
+            throw "安装目录路径已被一个文件占用：$InstallDir"
+        }
+        if (@(Get-ChildItem -LiteralPath $InstallDir -Force).Count -gt 0) {
+            throw "安装目录非空，拒绝覆盖：$InstallDir"
+        }
+    }
+}
+
+function New-RunDirectory {
+    <# 专用运行目录：唯一名字，已存在就报错，绝不复用（G3）。 #>
+    param(
+        [string]$RunsRoot,
+        [string]$DistroName,
+        [string]$Stamp = "",
+        [string]$Suffix = ""
+    )
+    if ([string]::IsNullOrWhiteSpace($RunsRoot)) {
+        throw "必须指定 -RunsRoot。"
+    }
+    if ([string]::IsNullOrWhiteSpace($Stamp)) {
+        $Stamp = Get-Date -Format "yyyyMMddTHHmmss"
+    }
+    if ([string]::IsNullOrWhiteSpace($Suffix)) {
+        $Suffix = [string](Get-Random -Minimum 100000 -Maximum 999999)
+    }
+    $path = Join-Path $RunsRoot ("{0}-{1}-{2}" -f $Stamp, $DistroName, $Suffix)
+    if (Test-Path -LiteralPath $path) {
+        throw "运行目录已存在，拒绝复用：$path"
+    }
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
+    return $path
+}
+
+function Format-StageReport {
+    <# 每个阶段失败时都要说清楚做了什么、还剩什么（G4）。 #>
+    param(
+        [string[]]$Completed = @(),
+        [string]$Failed = "",
+        [string[]]$Remaining = @()
+    )
+    $lines = New-Object System.Collections.ArrayList
+    if ($Completed.Count -gt 0) {
+        [void]$lines.Add("已完成：")
+        foreach ($item in $Completed) {
+            [void]$lines.Add("  - $item")
+        }
+    }
+    else {
+        [void]$lines.Add("已完成：无")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Failed)) {
+        [void]$lines.Add("失败在：$Failed")
+    }
+    if ($Remaining.Count -gt 0) {
+        [void]$lines.Add("未完成：")
+        foreach ($item in $Remaining) {
+            [void]$lines.Add("  - $item")
+        }
+    }
+    else {
+        [void]$lines.Add("未完成：无")
+    }
+    return ($lines -join [Environment]::NewLine)
+}
+
+# ==========================================================================
+# IO：只在这一段里调用外部命令
+# ==========================================================================
 
 function Write-Step {
     param([string]$Message)
@@ -66,7 +197,6 @@ function Write-Step {
 }
 
 function Invoke-External {
-    <# 执行一条外部命令；DryRun 时只打印。失败就抛异常。 #>
     param(
         [string]$FilePath,
         [string[]]$Arguments
@@ -101,7 +231,6 @@ function Get-WslDistroNames {
 }
 
 function Confirm-Action {
-    <# 破坏性操作前问一句；-Yes 直接过，-DryRun 只说明会问。 #>
     param([string]$Question)
     if ($Yes) { return }
     if ($DryRun) {
@@ -110,93 +239,124 @@ function Confirm-Action {
     }
     $answer = Read-Host "$Question`n输入 yes 继续，其它任意输入取消"
     if ($answer -ne "yes") {
-        throw "用户取消，未做任何改动。"
+        throw "用户取消。已完成的步骤见下面的阶段报告。"
     }
 }
 
-# ---------------------------------------------------------------- 1. 前提检查
-Write-Step "检查前提"
+function Invoke-TandemSetup {
+    param(
+        [string]$RootfsPath,
+        [string]$ExpectedSha256,
+        [string]$DistroName,
+        [string]$InstallDir,
+        [string]$RunsRoot
+    )
 
-if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-    throw "找不到 wsl.exe。请先确认 WSL 已安装（wsl --install）。"
-}
+    $stages = @("检查前提", "校验 rootfs", "创建运行目录", "导入发行版", "写入 /etc/wsl.conf", "终止并验证")
+    $completed = New-Object System.Collections.ArrayList
+    $current = "检查前提"
+    $runDir = $null
 
-$confPath = Join-Path $PSScriptRoot "wsl.conf"
-if (-not (Test-Path -LiteralPath $confPath)) {
-    throw "找不到要写入的配置：$confPath"
-}
+    try {
+        Write-Step "检查前提"
+        if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+            throw "找不到 wsl.exe。请先确认 WSL 已安装（wsl --install）。"
+        }
+        $confPath = Join-Path $PSScriptRoot "wsl.conf"
+        if (-not (Test-Path -LiteralPath $confPath)) {
+            throw "找不到要写入的配置：$confPath"
+        }
+        $existing = Get-WslDistroNames
+        Write-Host ("现有发行版：{0}" -f ($(if ($existing) { $existing -join ", " } else { "（无）" })))
+        Assert-DistroNameFresh -DistroName $DistroName -Existing $existing
+        Assert-InstallDirFree -InstallDir $InstallDir
+        [void]$completed.Add($current)
 
-$distros = Get-WslDistroNames
-Write-Host ("现有发行版：{0}" -f ($(if ($distros) { $distros -join ", " } else { "（无）" })))
+        $current = "校验 rootfs"
+        Write-Step "校验 rootfs"
+        Assert-RootfsReady -Path $RootfsPath -ExpectedSha256 $ExpectedSha256
+        Write-Host "rootfs 哈希校验通过：$RootfsPath"
+        [void]$completed.Add($current)
 
-if ($distros -notcontains $SourceDistro) {
-    throw "源发行版 '$SourceDistro' 不存在。可用的有：$($distros -join ', ')。用 -SourceDistro 指定。"
-}
+        $current = "创建运行目录"
+        Write-Step "创建运行目录"
+        if (-not $DryRun) {
+            if (-not (Test-Path -LiteralPath $RunsRoot)) {
+                New-Item -ItemType Directory -Path $RunsRoot -Force | Out-Null
+            }
+            $runDir = New-RunDirectory -RunsRoot $RunsRoot -DistroName $DistroName
+            Write-Host "运行目录：$runDir"
+        }
+        else {
+            Write-Host "[dry-run] 会在 $RunsRoot 下新建一个唯一名字的运行目录"
+        }
+        [void]$completed.Add($current)
 
-$targetExists = $distros -contains $DistroName
-if ($targetExists -and -not $Recreate) {
-    throw "发行版 '$DistroName' 已存在。要继续请加 -Recreate（会先注销它，里面的一切都会丢）。"
-}
+        Write-Host "计划：把 $RootfsPath 导入为 '$DistroName'（WSL 2），安装到 $InstallDir"
+        Confirm-Action "将导入一个新的 WSL 发行版 '$DistroName'（不会动你已有的发行版）。"
 
-Write-Host "计划：从 '$SourceDistro' 导出 → 导入为 '$DistroName'（WSL 2）→ 写入 /etc/wsl.conf"
-Write-Host "安装目录：$InstallDir"
-Write-Host "临时 tar：$TarPath"
+        $current = "导入发行版"
+        Write-Step "导入 $DistroName"
+        if (-not $DryRun -and -not (Test-Path -LiteralPath $InstallDir)) {
+            New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        }
+        Invoke-External "wsl.exe" @("--import", $DistroName, $InstallDir, $RootfsPath, "--version", "2")
+        [void]$completed.Add($current)
 
-# ------------------------------------------------------- 2. 注销（仅 -Recreate）
-if ($targetExists) {
-    Write-Step "注销已有发行版（-Recreate）"
-    Confirm-Action "将注销发行版 '$DistroName'：里面的文件、已安装的软件、登录状态全部丢失。"
-    Invoke-External "wsl.exe" @("--unregister", $DistroName)
-}
+        $current = "写入 /etc/wsl.conf"
+        Write-Step "写入 /etc/wsl.conf"
+        # 先 CRLF→LF，再用 base64 传进去：避免 PowerShell 管道把换行改回 CRLF。
+        # 必须显式 -Encoding UTF8：Windows PowerShell 5.1 对无 BOM 的文件默认按 ANSI 读。
+        $confText = (Get-Content -LiteralPath $confPath -Raw -Encoding UTF8) -replace "`r`n", "`n"
+        $confBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($confText))
+        $writeCommand = "echo $confBase64 | base64 -d > /etc/wsl.conf && chmod 644 /etc/wsl.conf"
+        Invoke-External "wsl.exe" @("-d", $DistroName, "-u", "root", "--", "bash", "-c", $writeCommand)
+        [void]$completed.Add($current)
 
-Confirm-Action "将把 '$SourceDistro' 导出并导入为 '$DistroName'，占用磁盘空间约等于源发行版。"
-
-# ---------------------------------------------------------------- 3. 导出/导入
-Write-Step "导出 $SourceDistro"
-if (-not $DryRun) {
-    if (Test-Path -LiteralPath $TarPath) {
-        Remove-Item -LiteralPath $TarPath -Force
+        $current = "终止并验证"
+        Write-Step "终止 $DistroName，让新配置生效"
+        Invoke-External "wsl.exe" @("--terminate", $DistroName)
+        Write-Step "验证（只读）"
+        Invoke-External "wsl.exe" @(
+            "-d", $DistroName, "-u", "root", "--", "bash", "-c",
+            "echo '--- /etc/wsl.conf ---'; cat /etc/wsl.conf; echo '--- /mnt（应该是空的）---'; ls -la /mnt"
+        )
+        [void]$completed.Add($current)
     }
-}
-Invoke-External "wsl.exe" @("--export", $SourceDistro, $TarPath)
+    catch {
+        Write-Host ""
+        Write-Host "!! 阶段失败：$current" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        $remaining = @($stages | Where-Object { $completed -notcontains $_ })
+        Write-Host (Format-StageReport -Completed @($completed) -Failed $current -Remaining $remaining)
+        if ($runDir) {
+            $reportPath = Join-Path $runDir "stage-report.txt"
+            try {
+                (Format-StageReport -Completed @($completed) -Failed $current -Remaining $remaining) |
+                    Set-Content -LiteralPath $reportPath -Encoding UTF8
+                Write-Host "阶段报告：$reportPath"
+            }
+            catch {
+                Write-Host "阶段报告写不进去：$reportPath"
+            }
+        }
+        exit 1
+    }
 
-Write-Step "导入为 $DistroName"
-if (-not $DryRun -and -not (Test-Path -LiteralPath $InstallDir)) {
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-}
-Invoke-External "wsl.exe" @("--import", $DistroName, $InstallDir, $TarPath, "--version", "2")
-
-# --------------------------------------------------------------- 4. 写 wsl.conf
-Write-Step "写入 /etc/wsl.conf"
-# 先把 CRLF 换成 LF，再用 base64 传进去：避免 PowerShell 管道把换行改回 CRLF。
-# 必须显式指定 -Encoding UTF8：Windows PowerShell 5.1 对无 BOM 的文件默认按 ANSI 读，中文会乱码。
-$confText = (Get-Content -LiteralPath $confPath -Raw -Encoding UTF8) -replace "`r`n", "`n"
-$confBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($confText))
-$writeCommand = "echo $confBase64 | base64 -d > /etc/wsl.conf && chmod 644 /etc/wsl.conf"
-Invoke-External "wsl.exe" @("-d", $DistroName, "-u", "root", "--", "bash", "-c", $writeCommand)
-
-Write-Step "终止 $DistroName，让新配置在下次启动时生效"
-Invoke-External "wsl.exe" @("--terminate", $DistroName)
-
-# ------------------------------------------------------------- 5. 只读验证
-Write-Step "验证（只读）"
-Invoke-External "wsl.exe" @(
-    "-d", $DistroName, "-u", "root", "--", "bash", "-c",
-    "echo '--- /etc/wsl.conf ---'; cat /etc/wsl.conf; echo '--- /mnt（应该是空的）---'; ls -la /mnt"
-)
-
-if (-not $DryRun -and (Test-Path -LiteralPath $TarPath)) {
-    Write-Step "删除临时 tar"
-    Remove-Item -LiteralPath $TarPath -Force
-}
-
-Write-Step "完成，接下来手动做这几步"
-@"
+    Write-Step "完成，接下来手动做这几步"
+    @"
 1. 建一个日常用户（不要用 root 跑 Agent），例如：
      wsl -d $DistroName -u root -- bash -c "adduser --disabled-password --gecos '' tandem && usermod -aG sudo tandem"
    然后在 /etc/wsl.conf 末尾加 [user] default=tandem，再 wsl --terminate $DistroName。
 2. 在发行版里装 Agent 和依赖，登录各家账号（claude、codex 等）。
-3. 对每家 Agent 跑诱饵测试，三项都被挡住才允许无人值守：
-     python3 -m scripts.decoy.run_decoy --agent claude --agent-cmd 'claude -p "{prompt}"'
-4. 完整步骤和回滚办法见 docs/runbooks/wsl-isolation.md。
+3. 对每家 Agent 跑诱饵测试（prepare → probe → report），三项都被挡住才允许无人值守：
+     python3 -m scripts.decoy.run_decoy prepare --run-dir ~/decoy-runs/1
+4. 完整步骤、凭据清单和回滚办法见 docs/runbooks/wsl-isolation.md。
 "@ | Write-Host
+}
+
+# 被测试脚本 dot-source 时只加载函数，不执行主流程
+if ($MyInvocation.InvocationName -ne ".") {
+    Invoke-TandemSetup -RootfsPath $RootfsPath -ExpectedSha256 $ExpectedSha256 `
+        -DistroName $DistroName -InstallDir $InstallDir -RunsRoot $RunsRoot
+}
