@@ -340,3 +340,273 @@ def test_regression_new_plan_sha_invalidates_old_ci() -> None:
     )
     assert decision.task.latest_sha == "new-plan"
     check_fresh(task, decision)
+
+
+@pytest.mark.parametrize(
+    "invariant",
+    [
+        "ci",
+        "separation",
+        "review_count",
+        "terminal",
+        "version",
+        "d",
+        "pure",
+        "fresh",
+    ],
+)
+def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invariant: str) -> None:
+    """Each production-logic mutation must fail the SAME oracle used by traces.
+
+    Run its witness once unmodified first, so an unrelated/pre-existing failure
+    cannot masquerade as a killed mutant. Patches never escape this test.
+    """
+    policy = make_policy()
+    quota = QuotaSnapshot()
+    task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED, EventKind.CI_GREEN])
+    ev = event(task, EventKind.REVIEW, review=passing(task, "r1"))
+    original_dispatch = core._dispatch
+    original_transition = core._transition
+    original_rule = Policy.rule_for
+    original_review = core._on_review
+    original_new = core._on_new_submission
+    original_add = core._Actions.add
+
+    if invariant == "ci":
+        task = replace(task, status=TaskStatus.AWAITING_YOUR_REVIEW, ci_green=False)
+        ev = event(task, EventKind.YOUR_APPROVAL, sha=task.latest_sha)
+    elif invariant == "separation":
+        # A designated provider has subsequently participated in writing.
+        task = replace(task, providers_involved=task.providers_involved | {"r1"})
+    elif invariant == "review_count":
+        task = replace(task, designated_reviewers=("r1",))
+    elif invariant == "pure":
+        ev = event(task, EventKind.INCIDENT)
+    elif invariant == "terminal":
+        task = walk(Level.C, [EventKind.CANCEL])
+        ev = event(task, EventKind.ASSIGN)
+    elif invariant == "d":
+        task = walk(Level.D, [EventKind.ASSIGN])
+        ev = advance(task)
+    elif invariant == "fresh":
+        task = core.decide(task, ev, policy, quota, NOW).task
+        ev = event(
+            task,
+            EventKind.CODE_SUBMITTED,
+            sha="new",
+            attempt=task.attempt,
+            changes=ChangeSet(paths=("app.py",)),
+        )
+
+    def witness() -> None:
+        decision = check_pure(task, ev, policy, quota)
+        if invariant == "ci":
+            check_ci(task, decision, None)
+        elif invariant == "separation":
+            check_separation(decision.task)
+        elif invariant == "review_count":
+            check_review_count(decision.task, policy, False, strict=True)
+        elif invariant == "terminal":
+            check_terminal(task, decision)
+        elif invariant == "version":
+            check_version(task, decision)
+        elif invariant == "d":
+            check_d(task, decision, False)
+        elif invariant == "fresh":
+            check_fresh(task, decision)
+
+    witness()
+    if invariant == "ci":
+        monkeypatch.setattr(core, "merge_blocker", lambda *args, **kwargs: ())
+    elif invariant == "separation":
+
+        def accept_writer(task, ev, policy):
+            decision = original_review(replace(task, providers_involved=frozenset()), ev, policy)
+            return replace(
+                decision,
+                task=replace(
+                    decision.task,
+                    providers_involved=task.providers_involved,
+                ),
+            )
+
+        monkeypatch.setattr(core, "_on_review", accept_writer)
+    elif invariant == "review_count":
+
+        def one_vote(self, level):
+            return replace(original_rule(self, level), min_reviewers=1)
+
+        # Also select only one seat, matching an erroneous one-provider quorum.
+        monkeypatch.setattr(Policy, "rule_for", one_vote)
+    elif invariant == "terminal":
+
+        def reopen(task, ev, policy, quota):
+            return original_dispatch(replace(task, status=TaskStatus.PENDING), ev, policy, quota)
+
+        monkeypatch.setattr(core, "_dispatch", reopen)
+    elif invariant == "version":
+
+        def double_bump(*args, **kwargs):
+            result = original_transition(*args, **kwargs)
+            return replace(
+                result,
+                task=replace(
+                    result.task,
+                    state_version=result.task.state_version + 1,
+                ),
+            )
+
+        monkeypatch.setattr(core, "_transition", double_bump)
+    elif invariant == "d":
+
+        def no_plan(self, level):
+            return replace(original_rule(self, level), requires_plan_approval=False)
+
+        monkeypatch.setattr(Policy, "rule_for", no_plan)
+    elif invariant == "pure":
+        # Emit an action whose identity depends on hidden call history.
+        counter = 0
+
+        def stateful_add(self, kind, detail="", provider=None):
+            nonlocal counter
+            counter += 1
+            return original_add(self, kind, f"{detail}:{counter}", provider)
+
+        monkeypatch.setattr(core._Actions, "add", stateful_add)
+    elif invariant == "fresh":
+
+        def keep_old_reviews(task, ev, policy):
+            result = original_new(task, ev, policy)
+            return replace(result, task=replace(result.task, reviews=task.reviews))
+
+        monkeypatch.setattr(core, "_on_new_submission", keep_old_reviews)
+    with pytest.raises(AssertionError, match=invariant):
+        witness()
+
+
+@TRACE_SETTINGS
+@given(
+    status=st.sampled_from([TaskStatus.MERGED, TaskStatus.CANCELLED, TaskStatus.FAILED]),
+    version=st.integers(0, 100),
+    sha=st.text(min_size=1, max_size=20),
+)
+def test_every_event_leaves_each_terminal_unchanged(status, version, sha) -> None:
+    task = TaskRecord("terminal", status=status, state_version=version, latest_sha=sha)
+    for kind in EventKind:
+        ev = event(
+            task,
+            kind,
+            sha=sha,
+            attempt=task.attempt,
+            changes=ChangeSet(paths=("app.py",)),
+            review=passing(task, "r1"),
+            check_result=CheckResult.NOT_CONFIRMED,
+            standard_version=2,
+        )
+        decision = check_pure(task, ev, make_policy(), QuotaSnapshot())
+        check_terminal(task, decision)
+        check_version(task, decision)
+
+
+@TRACE_SETTINGS
+@given(
+    required=st.integers(2, 3),
+    old=st.text(min_size=1, max_size=15),
+    suffix=st.text(min_size=1, max_size=15),
+)
+def test_new_commit_requires_all_reviewers_again(required, old, suffix) -> None:
+    policy = make_policy(required=required)
+    task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED], policy)
+    task = core.decide(
+        task,
+        event(
+            task,
+            EventKind.CODE_SUBMITTED,
+            sha=old,
+            attempt=task.attempt,
+            changes=ChangeSet(paths=("app.py",)),
+        ),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    ).task
+    task = core.decide(
+        task, event(task, EventKind.CI_GREEN, sha=old), policy, QuotaSnapshot(), NOW
+    ).task
+    first = passing(task, task.designated_reviewers[0])
+    task = core.decide(
+        task, event(task, EventKind.REVIEW, review=first), policy, QuotaSnapshot(), NOW
+    ).task
+    new = old + suffix
+    decision = core.decide(
+        task,
+        event(
+            task,
+            EventKind.CODE_SUBMITTED,
+            sha=new,
+            attempt=task.attempt,
+            changes=ChangeSet(paths=("app.py",)),
+        ),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    )
+    check_fresh(task, decision)
+    task = decision.task
+    task = core.decide(
+        task, event(task, EventKind.CI_GREEN, sha=new), policy, QuotaSnapshot(), NOW
+    ).task
+    stale = core.decide(
+        task, event(task, EventKind.REVIEW, review=first), policy, QuotaSnapshot(), NOW
+    )
+    assert not stale.changed and stale.task == task
+    for provider in task.designated_reviewers:
+        decision = core.decide(
+            task,
+            event(task, EventKind.REVIEW, review=passing(task, provider)),
+            policy,
+            QuotaSnapshot(),
+            NOW,
+        )
+        check_ci(task, decision, new)
+        check_review_count(decision.task, policy, False, strict=True)
+        check_separation(decision.task)
+        check_version(task, decision)
+        task = decision.task
+    assert task.status is TaskStatus.AWAITING_MERGE
+
+
+def test_d_review_route_mutant_cannot_skip_human(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kill the other half of invariant 6: keep plan guard, remove human merge guard."""
+    policy = make_policy()
+    task = walk(
+        Level.D,
+        [
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.PLAN_APPROVED,
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.CI_GREEN,
+        ],
+    )
+    task = core.decide(
+        task,
+        event(task, EventKind.REVIEW, review=passing(task, "r1")),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    ).task
+    ev = event(task, EventKind.REVIEW, review=passing(task, "r2"))
+    baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    check_d(task, baseline, True)
+    assert baseline.task.status is TaskStatus.AWAITING_YOUR_REVIEW
+    original = Policy.rule_for
+
+    def no_human(self, level):
+        return replace(original(self, level), requires_human_merge=False)
+
+    monkeypatch.setattr(Policy, "rule_for", no_human)
+    decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    with pytest.raises(AssertionError, match="d: skipped your review"):
+        check_d(task, decision, False)
