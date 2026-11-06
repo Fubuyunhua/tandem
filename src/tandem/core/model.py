@@ -240,6 +240,14 @@ class OpenFinding:
     local_id: str
     text: str
 
+    @property
+    def short_key(self) -> str:
+        """给人看的短键：提交编号只留前 8 位。
+
+        只用于展示；``key`` 里是完整提交编号，否决时要引用 ``key``。
+        """
+        return f"{self.provider}:{self.local_id}@{self.sha[:8]}:v{self.standard_version}"
+
 
 @dataclass(frozen=True)
 class VetoReason:

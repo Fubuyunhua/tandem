@@ -1369,3 +1369,73 @@ def test_row_20_veto_answers_are_per_composite_key() -> None:
         ),
     )
     assert complete.task.status is TaskStatus.AWAITING_MERGE
+
+
+# ------------------------------------------------- H5 复核：键里必须用完整提交编号
+
+# 两个不同的提交，前 8 位相同：拿前缀当身份就会把它们混成一条
+SHA_PREFIX_SAME_A = "abcdef12" + "1" * 32
+SHA_PREFIX_SAME_B = "abcdef12" + "2" * 32
+
+
+def _two_rounds_same_prefix_different_sha() -> TaskRecord:
+    """同一提供方、同标准、同本地编号 F1，针对两个前 8 位相同的提交各给一条意见。"""
+    walker = Walker(new_task())
+    walker.assign("claude")
+    walker.submit_code(sha=SHA_PREFIX_SAME_A)
+    walker.ci_green()
+    walker.review("codex", Verdict.FAIL, (Finding(id="F1", text="旧提交的问题"),))
+    walker.assign("claude")
+    walker.submit_code(sha=SHA_PREFIX_SAME_B)
+    walker.ci_green()
+    walker.review("codex", Verdict.FAIL, (Finding(id="F1", text="新提交的问题"),))
+    walker.assign("claude")
+    return walker.step(ev(EventKind.REFUSED_TO_FIX, reason="标准不对")).task
+
+
+def test_row_20_same_sha_prefix_does_not_swallow_the_newer_finding() -> None:
+    """前 8 位相同但完整提交编号不同：两条意见都要保留，不能只留一条。"""
+    record = _two_rounds_same_prefix_different_sha()
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    texts = {finding.text for finding in record.open_findings}
+    assert texts == {"旧提交的问题", "新提交的问题"}
+    keys = [finding.key for finding in record.open_findings]
+    assert len(set(keys)) == 2
+    # 展示用的短键会撞车，所以完整键里不能只有前缀
+    assert {finding.sha for finding in record.open_findings} == {
+        SHA_PREFIX_SAME_A,
+        SHA_PREFIX_SAME_B,
+    }
+    assert len({finding.short_key for finding in record.open_findings}) == 1  # 缩写确实相同
+    # 展示时用短键列出来，存储和否决用的是完整键
+    assert "codex:F1@abcdef12:v1" in record.note
+    assert "旧提交的问题" in record.note and "新提交的问题" in record.note
+
+
+def test_row_20_same_sha_prefix_findings_must_be_answered_separately() -> None:
+    record = _two_rounds_same_prefix_different_sha()
+    first, second = record.open_findings
+
+    only_first = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            veto_reasons=(VetoReason(finding_id=first.key, reason="这条我改了"),),
+        ),
+    )
+    assert only_first.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert second.key in only_first.reason  # 还缺的那一条要按完整键指出来
+
+    both = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            veto_reasons=(
+                VetoReason(finding_id=first.key, reason="这条我改了"),
+                VetoReason(finding_id=second.key, reason="这条我不同意"),
+            ),
+        ),
+    )
+    assert both.task.status is TaskStatus.AWAITING_MERGE

@@ -515,12 +515,14 @@ def _on_refused_to_fix(task: TaskRecord, event: Event) -> Decision:
     reason = event.reason or "写手没有写理由"
     actions = _Actions(task, task.state_version + 1)
     actions.add(ActionKind.NOTIFY, detail="写手拒绝修改，等你决定")
+    # 备注里按短键列出待回应的意见，方便你在手机上先看个大概
+    pending = "；".join(f"{finding.short_key} {finding.text}" for finding in task.open_findings)
     return _transition(
         task,
         TaskStatus.NEEDS_INTERVENTION,
         f"写手拒绝修改：{reason}",
         actions.items,
-        note=reason,
+        note=f"{reason}｜待回应意见：{pending}" if pending else reason,
         returned_from_review=False,
     )
 
@@ -770,7 +772,10 @@ def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
                 TaskStatus.NEEDS_INTERVENTION,
                 f"{len(failing)} 家审核不通过（写手是你）：{failing_names}",
                 actions.items,
-                note="AI 的反对意见：" + failing_names,
+                note="待回应意见："
+                + "；".join(
+                    f"{finding.short_key} {finding.text}" for finding in recorded.open_findings
+                ),
             )
         revisions = task.revision_count(task.standard_version) + 1
         if revisions >= policy.thresholds.max_revisions:
@@ -1113,8 +1118,12 @@ def usable_findings(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
 
 
 def finding_key(review: Review, finding: Finding) -> str:
-    """意见的复合键：提供方 + 提交编号 + 标准版本 + 本地编号。"""
-    return f"{review.provider}:{finding.id.strip()}@{review.sha[:8]}:v{review.standard_version}"
+    """意见的复合键：提供方 + **完整**提交编号 + 标准版本 + 本地编号。
+
+    提交编号必须用完整的：前 8 位相同的不同提交也各有各的意见，
+    截断会把新提交的反对意见吞掉。缩写只出现在展示用的 short_key 里。
+    """
+    return f"{review.provider}:{finding.id.strip()}@{review.sha}:v{review.standard_version}"
 
 
 def open_findings_from(recorded: tuple[Review, ...]) -> tuple[OpenFinding, ...]:
