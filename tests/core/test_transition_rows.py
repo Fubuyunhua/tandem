@@ -27,6 +27,7 @@ from tests.core.helpers import (
     actions_of,
     ev,
     new_task,
+    policy,
     quota,
     review_event,
     run,
@@ -342,7 +343,8 @@ def test_row_15_third_revision_goes_to_you() -> None:
     assert decision.task.revision_count(decision.task.standard_version) == 3
 
 
-def test_row_16_not_enough_reviewers_goes_to_you() -> None:
+def test_row_16_not_enough_reviewers_at_entry_goes_to_you() -> None:
+    """第 16 条的入口分支：进审核之前就凑不齐合格的审核者。"""
     record = to_needs_intervention_by_reviewers()
     assert record.status is TaskStatus.NEEDS_INTERVENTION
     assert record.error_code == "R03"
@@ -909,3 +911,52 @@ def test_row_03_plan_approval_returns_a_human_writer_to_you_working() -> None:
     decision = run(record, ev(EventKind.PLAN_APPROVED, sha=record.latest_sha))
     assert decision.task.status is TaskStatus.YOU_WORKING
     assert decision.task.approved_plan_version == record.plan_version
+
+
+def test_row_16_reviewer_lost_during_review_goes_to_you() -> None:
+    """审核途中审核者失效：按当前额度和参与历史重新检查，凑不齐就以 R03 找你。"""
+    record = to_ai_review()
+    assert record.status is TaskStatus.AWAITING_AI_REVIEW
+    record = run(record, review_event(record, "codex")).task
+    decision = run(
+        record,
+        ev(EventKind.QUOTA_EXHAUSTED, provider="codex"),
+        quota_=quota(("codex",)),
+    )
+    assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert decision.task.error_code == "R03"
+    # 已经完成的证据要保留
+    assert decision.task.reviews
+
+
+def test_row_16_remaining_reviewers_continue_when_still_enough() -> None:
+    """只要还剩够家数，就继续审，把失效的席位剔除。"""
+    from dataclasses import replace
+
+    policy_b = policy()
+    level_b = Level.B
+    record = to_ai_review()
+    record = replace(
+        record,
+        level=level_b,
+        designated_reviewers=("codex", "opencode-go"),
+    )
+    decision = run(
+        record,
+        ev(EventKind.QUOTA_EXHAUSTED, provider="codex"),
+        policy_=policy_b,
+        quota_=quota(("codex",)),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert decision.task.designated_reviewers == ("opencode-go",)
+
+
+def test_row_16_reviewer_lost_marks_quota_exhausted_action() -> None:
+    from dataclasses import replace
+
+    record = replace(to_ai_review(), level=Level.B)  # B 级只要 1 家，少一家还能继续
+    decision = run(record, ev(EventKind.QUOTA_EXHAUSTED, provider="opencode-go"))
+    exhausted = actions_of(decision, ActionKind.SET_QUOTA_EXHAUSTED)
+    assert exhausted and exhausted[0].provider == "opencode-go"
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert decision.task.designated_reviewers == ("codex",)

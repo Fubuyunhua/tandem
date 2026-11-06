@@ -233,7 +233,7 @@ def _dispatch(
         case EventKind.REFUSED_TO_FIX:
             return _on_refused_to_fix(task, event)
         case EventKind.QUOTA_EXHAUSTED:
-            return _on_quota_exhausted(task, event, policy)
+            return _on_quota_exhausted(task, event, policy, quota)
         case EventKind.INCIDENT:
             return _on_incident(task, event)
         case EventKind.CI_GREEN:
@@ -506,10 +506,14 @@ def _on_refused_to_fix(task: TaskRecord, event: Event) -> Decision:
     )
 
 
-def _on_quota_exhausted(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+def _on_quota_exhausted(
+    task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnapshot
+) -> Decision:
     """7. 处理中 → 待处理：额度用完，把这一家标记为用完，下次换一家。"""
+    if task.status is TaskStatus.AWAITING_AI_REVIEW:
+        return _on_reviewer_unavailable(task, event, policy, quota)
     if task.status is not TaskStatus.WORKING:
-        return _ignore(task, "只有在处理中的任务才会报额度用完")
+        return _ignore(task, "只有在处理中或待 AI 审核时才会报额度用完")
     provider = event.provider or task.writer or policy.default_writer
     progress = event.reason or "没有写进度说明"
     actions = _Actions(task, task.state_version + 1)
@@ -527,6 +531,44 @@ def _on_quota_exhausted(task: TaskRecord, event: Event, policy: Policy) -> Decis
         actions.items,
         note=f"额度是估计值。{progress}",
         returned_from_review=False,
+    )
+
+
+def _on_reviewer_unavailable(
+    task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnapshot
+) -> Decision:
+    """第 16 条：审核途中审核者失效，按当前额度和参与历史重新检查审核者家数。"""
+    gone = event.provider or "某一方"
+    rule = policy.rule_for(task.level)
+    remaining = tuple(
+        seat
+        for seat in eligible_reviewers(task, policy, quota, extra_excluded=(gone,))
+        if seat in task.designated_reviewers
+    )
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(
+        ActionKind.SET_QUOTA_EXHAUSTED,
+        detail=f"{gone} 额度用完（额度是估计值）",
+        provider=gone,
+    )
+    if len(remaining) < rule.min_reviewers:
+        actions.add(ActionKind.NOTIFY, detail=f"{gone} 用不了，凑不齐合格的审核者")
+        return _transition(
+            task,
+            TaskStatus.NEEDS_INTERVENTION,
+            f"R03 {gone} 用不了，凑不齐 {rule.min_reviewers} 家审核者",
+            actions.items,
+            error_code="R03",
+            designated_reviewers=remaining,
+            note=task.note or f"审核者 {gone} 失效",
+        )
+    actions.add(ActionKind.NOTIFY, detail=f"{gone} 用不了，剩下的 {len(remaining)} 家继续审")
+    return _transition(
+        task,
+        TaskStatus.AWAITING_AI_REVIEW,
+        f"{gone} 用不了，剩下的 {len(remaining)} 家审核者继续审",
+        actions.items,
+        designated_reviewers=remaining,
     )
 
 
