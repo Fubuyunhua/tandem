@@ -104,3 +104,37 @@ def test_status_without_database(tmp_path: Path, capsys: pytest.CaptureFixture[s
 def test_missing_subcommand_exits() -> None:
     with pytest.raises(SystemExit):
         main([])
+
+
+def test_approve_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """D 级任务交回方案后，用 tandem approve 批准，任务回到待处理。"""
+    from tandem.core.model import Event, EventKind, Level
+    from tandem.shell.agents.fake import FakeAgent
+    from tandem.shell.config import load_policy
+    from tandem.shell.executor import Executor
+    from tandem.shell.receipt import render_receipt
+    from tandem.shell.runner import Runner
+    from tandem.shell.store import Store
+
+    db = tmp_path / "tandem.sqlite3"
+    plan = render_receipt(
+        "PLAN：先写内核",
+        {"task_id": "t1", "attempt": 1, "sha": "abc", "plan": "先写内核，再接外壳"},
+    )
+    with Store(db) as store:
+        runner = Runner(
+            store=store,
+            policy=load_policy(),
+            executor=Executor(agents={"claude": FakeAgent(provider="claude", script=[plan])}),
+        )
+        runner.submit("t1", Level.D)
+        runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+        runner.handle(Event(kind=EventKind.PLAN_SUBMITTED, task_id="t1", plan="先写内核，再接外壳"))
+        loaded = store.load_task("t1")
+        assert loaded is not None
+        assert loaded.status.value == "待你批准方案"
+
+    assert main(["approve", "--db", str(db), "--task-id", "t1"]) == 0
+    out = capsys.readouterr().out
+    assert "待处理" in out
+    assert "你批准了第 1 版方案" in out

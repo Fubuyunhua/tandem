@@ -859,7 +859,10 @@ def _on_cancel(task: TaskRecord) -> Decision:
         ):
             actions.add(ActionKind.STOP_AGENT, detail="停掉正在运行的审核进程")
         case TaskStatus.MERGED | TaskStatus.CANCELLED | TaskStatus.FAILED:
+            # 终点状态在上面已经拦过了，这里只是让 pyright 能查漏
             return _ignore(task, "任务已经结束，不能取消")
+        case _:  # pragma: no cover
+            assert_never(task.status)
     if task.pr_opened:
         actions.add(ActionKind.CLOSE_PR, detail="关闭 PR，保留分支")
 
