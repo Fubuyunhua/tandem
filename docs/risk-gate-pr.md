@@ -29,8 +29,8 @@ D 级退出码为 3，使检查失败并显示“需要人工”；
 
 head 只作为 Git 对象供改动采集读取；`git diff`/`git show` 取出的内容不作代码执行。
 fetch 使用环境变量中的已校验提交编号，事件文字不拼接到 shell 脚本。
-仅该步骤使用只读 token，经临时 HTTP header 认证，不把凭据持久化到 Git 配置或
-传给后续裁判进程；不递归获取子模块，不检出 head、不安装 head 依赖、不导入 head 包，
+仓库公开，fetch 匿名读取对象，不提供 token 或认证 header；
+不递归获取子模块，不检出 head、不安装 head 依赖、不导入 head 包，
 也不运行 head 中的本地 Action 或构建钩子。
 
 `pull_request_target` 不能用来直接执行不可信 PR；本工作流的安全前提正是上述数据边界。

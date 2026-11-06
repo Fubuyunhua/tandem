@@ -316,9 +316,12 @@ def test_workflow_keeps_gate_read_only_and_blocking() -> None:
     assert checkout["with"]["fetch-depth"] == "0"
     assert checkout["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"
     assert checkout["with"]["persist-credentials"] == "false"
-    fetch = next(step for step in job["steps"] if "git -c" in step.get("run", ""))
+    fetch = next(step for step in job["steps"] if "git fetch" in step.get("run", ""))
     assert fetch["env"]["PR_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
     assert 'fetch --no-tags --no-recurse-submodules origin "$PR_HEAD_SHA"' in fetch["run"]
+    assert "FETCH_TOKEN" not in fetch["env"]
+    assert "http.extraheader" not in fetch["run"]
+    assert "github.token" not in str(fetch)
     assert all("${{" not in step.get("run", "") for step in job["steps"])
     sync = next(step for step in job["steps"] if "uv sync" in step.get("run", ""))
     assert sync["run"] == "uv sync --locked"
