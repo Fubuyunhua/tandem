@@ -1136,14 +1136,34 @@ def _on_retry(task: TaskRecord, event: Event, policy: Policy) -> Decision:
 
     match check:
         case CheckResult.MERGE_SUCCEEDED:
+            merged_sha = event.sha or task.approved_sha or task.latest_sha
+            # 之前有没有经过本系统的合并放行：批准的必须就是这次合并的提交
+            released_by_us = task.approved_sha is not None and task.approved_sha == merged_sha
             actions.add(ActionKind.NOTIFY, detail="核对后确认合并已经成功")
+            if released_by_us:
+                return _transition(
+                    task,
+                    TaskStatus.MERGED,
+                    f"核对后确认合并其实已经成功（提交 {merged_sha}，系统内有你的批准）",
+                    actions.items,
+                    status_before_error=None,
+                    error_code=None,
+                )
+            # 外部事实优先，但要在记录里说清：这次合并没有经过本系统的审核放行
+            marker = (
+                f"由 GitHub 事实确认，未经本系统审核放行（合并提交 {merged_sha}，"
+                f"本系统的批准：{'无' if task.approved_sha is None else task.approved_sha}）"
+            )
+            actions.add(ActionKind.NOTIFY, detail=f"注意：{marker}")
             return _transition(
                 task,
                 TaskStatus.MERGED,
-                "核对后确认合并其实已经成功",
+                f"核对后确认合并其实已经成功；{marker}",
                 actions.items,
                 status_before_error=None,
                 error_code=None,
+                merge_confirmed_externally=True,
+                note=f"{task.note}｜{marker}",
             )
         case CheckResult.PR_CLOSED:
             actions.add(ActionKind.NOTIFY, detail="核对后确认 PR 已被关闭，回到待处理")

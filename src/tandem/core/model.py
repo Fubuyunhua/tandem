@@ -398,6 +398,9 @@ class TaskRecord:
     # 有没有对终点任务的清理动作做过核对（只记录，不改变终点状态）
     cleanup_checked: bool = False
 
+    # 已合并是由 GitHub 事实确认的（没有经过本系统的合并放行）
+    merge_confirmed_externally: bool = False
+
     # 原因 / 错误码、进度说明、备注
     reason: str = ""
     note: str = ""

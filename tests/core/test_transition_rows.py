@@ -1693,3 +1693,37 @@ def test_cleanup_checked_needs_action_ids() -> None:
     decision = run(record, ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED))
     assert not decision.changed
     assert "动作" in decision.reason
+
+
+def test_row_26_merge_succeeded_without_our_approval_is_marked_external() -> None:
+    """没经过本系统放行的合并（批准为空或不是这个 SHA）要注明"由 GitHub 事实确认"。"""
+    from dataclasses import replace
+
+    record = to_error_before_merge()
+    never_approved = replace(record, approved_sha=None)
+    decision = run(
+        never_approved,
+        ev(EventKind.RETRY, check_result=CheckResult.MERGE_SUCCEEDED, sha=record.latest_sha),
+    )
+    assert decision.task.status is TaskStatus.MERGED
+    assert decision.task.merge_confirmed_externally is True
+    assert "未经本系统审核放行" in decision.task.note
+
+    different_approval = replace(record, approved_sha=SHA_2)
+    other = run(
+        different_approval,
+        ev(EventKind.RETRY, check_result=CheckResult.MERGE_SUCCEEDED, sha=record.latest_sha),
+    )
+    assert other.task.status is TaskStatus.MERGED
+    assert other.task.merge_confirmed_externally is True
+
+
+def test_row_26_merge_succeeded_after_our_approval_is_not_external() -> None:
+    record = to_error_before_merge()
+    decision = run(
+        record,
+        ev(EventKind.RETRY, check_result=CheckResult.MERGE_SUCCEEDED, sha=record.latest_sha),
+    )
+    assert decision.task.status is TaskStatus.MERGED
+    assert decision.task.merge_confirmed_externally is False
+    assert "未经本系统审核放行" not in decision.task.note

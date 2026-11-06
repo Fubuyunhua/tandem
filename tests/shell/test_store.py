@@ -324,3 +324,18 @@ def test_cleanup_record_and_abandoned_action_roundtrip(store: Store) -> None:
     stored_event = store.list_events("t1")[0]
     assert stored_event.action_ids == ("t1:5:1",)
     assert stored_event.check_result is CheckResult.NOT_CONFIRMED
+
+
+def test_external_merge_marker_survives_a_store_roundtrip(store: Store) -> None:
+    """第 26 条"由 GitHub 事实确认"的标记要能存下来，事后审计看得到。"""
+    task = _task(
+        9,
+        status=TaskStatus.MERGED,
+        merge_confirmed_externally=True,
+        note="｜由 GitHub 事实确认，未经本系统审核放行",
+    )
+    store.commit(task=task)
+    loaded = store.load_task("t1")
+    assert loaded is not None
+    assert loaded.merge_confirmed_externally is True
+    assert "未经本系统审核放行" in loaded.note
