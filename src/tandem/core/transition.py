@@ -282,7 +282,15 @@ def _dispatch(
             f"事件带的版本号 {event.state_version} 和任务当前的 {task.state_version} 不一致",
         )
     if task.status.is_terminal:
-        # 唯一的例外：清理核对只更新已经发出的清理动作，不改变终点状态。
+        # 终点的精确语义（给 task-006 的性质测试用）：
+        # 1. 状态永不改变——终点没有任何出边，任何事件都不会让任务离开终点；
+        # 2. 唯一的例外是 CLEANUP_CHECKED：它只把已经发出的清理动作标成
+        #    "已完成/已放弃"，顺带写 cleanup_checked 和一句说明；
+        # 3. 除了"动作状态 + cleanup_checked + note/reason + state_version"，
+        #    其余字段（等级、提交编号、批准、审核结论、席位、方案、CI 标记、
+        #    pr_opened、写手、计数……）在终点之后一律不再变化；
+        # 4. 版本号会 +1，因为任务记录的每次变化都要留一版，重放才对得上——
+        #    这是记录版本，不是状态转换。
         if event.kind is EventKind.CLEANUP_CHECKED:
             return _on_cleanup_checked(task, event)
         return _ignore(task, f"任务已经结束（{task.status.value}），事件直接丢弃")

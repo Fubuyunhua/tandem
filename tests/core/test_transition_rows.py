@@ -1810,3 +1810,55 @@ def test_row_03_legacy_plan_without_any_sha_cannot_be_approved() -> None:
     assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
     assert not decision.changed
     assert "重新" in decision.reason and "编号" in decision.reason
+
+
+# ------------------------------------------------- 终点的精确语义（给 task-006 的不变量用）
+
+
+def test_terminal_status_never_changes_even_when_cleanup_is_checked() -> None:
+    """终点之后：状态永不改变；只有清理记账字段和版本号可以变，其他字段一律不动。"""
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    decision = run(
+        record,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(action_id,),
+        ),
+    )
+    after = decision.task
+    assert after.status is TaskStatus.CANCELLED  # 状态不动
+    # 除"清理记账"以外的字段一个都不许变
+    assert after.level is record.level
+    assert after.latest_sha == record.latest_sha
+    assert after.approved_sha == record.approved_sha
+    assert after.reviews == record.reviews
+    assert after.designated_reviewers == record.designated_reviewers
+    assert after.open_findings == record.open_findings
+    assert after.plan_history == record.plan_history
+    assert after.ci_green == record.ci_green
+    assert after.pr_opened == record.pr_opened
+    assert after.writer == record.writer
+    assert after.accept_failures == record.accept_failures
+    # 允许变化的只有：动作状态、cleanup_checked、说明（note/reason）、版本号
+    assert after.state_version == record.state_version + 1
+    assert after.cleanup_checked is True
+    assert [a.status for a in after.actions] != [a.status for a in record.actions]
+
+
+def test_terminal_task_still_ignores_every_other_event() -> None:
+    """除了清理核对，终点任务收到任何事件都只有"忽略"，连版本号都不动。"""
+    record, _ = cancelled_with_unconfirmed_cleanup()
+    for kind in (
+        EventKind.ASSIGN,
+        EventKind.CODE_SUBMITTED,
+        EventKind.CI_GREEN,
+        EventKind.RETRY,
+        EventKind.YOUR_APPROVAL,
+        EventKind.INTERVENTION_APPROVED,
+        EventKind.CANCEL,
+    ):
+        decision = run(record, ev(kind, sha=record.latest_sha))
+        assert not decision.changed
+        assert decision.task == record
+        assert "已经结束" in decision.reason
