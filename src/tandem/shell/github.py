@@ -146,10 +146,17 @@ class GhGitHub(GitHubWrites):
 
     repo: str
     timeout: float = 30
+    required_checks: tuple[str, ...] = ("check",)
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repo):
             raise GitHubError("仓库必须为 owner/repo")
+        if (
+            not self.required_checks
+            or any(not name.strip() or name != name.strip() for name in self.required_checks)
+            or len(set(self.required_checks)) != len(self.required_checks)
+        ):
+            raise GitHubError("必需检查名单不能为空、重名或包含空白名称")
 
     def _api(
         self,
@@ -222,39 +229,48 @@ class GhGitHub(GitHubWrites):
         return _text(_mapping(self._api(f"issues/{_number(number)}")).get("state"))
 
     def get_ci(self, sha: str) -> CIState:
+        """按精确名称收集必需证据；同名的多条有效证据必须全部成功。"""
         prefix = f"commits/{_sha(sha)}"
-        conclusions: list[CIState] = []
+        by_name: dict[str, list[CIState]] = {name: [] for name in self.required_checks}
         for page in _items(
             self._api(f"{prefix}/check-runs?per_page=100&filter=latest", pages=True)
         ):
             for raw in _items(_mapping(page).get("check_runs")):
                 check = _mapping(raw)
+                name = check.get("name")
+                if not isinstance(name, str) or name not in by_name:
+                    continue
                 if check.get("status") != "completed":
-                    conclusions.append(CIState.PENDING)
-                elif check.get("conclusion") in {"success", "neutral", "skipped"}:
-                    conclusions.append(CIState.GREEN)
+                    by_name[name].append(CIState.PENDING)
+                elif check.get("conclusion") == "success":
+                    by_name[name].append(CIState.GREEN)
                 else:
-                    conclusions.append(CIState.RED)
-        # 旧式 status 按 context 只取最新一条，不能把历史失败算进去。
+                    # 必需检查被跳过或 neutral 都没有给出成功证据。
+                    by_name[name].append(CIState.RED)
+        # 旧式 status 按 context 只取最新一条；其余检查不能干扰必需名单。
         seen: set[str] = set()
         for page in _items(self._api(f"{prefix}/statuses?per_page=100", pages=True)):
             for raw in _items(page):
                 status = _mapping(raw)
                 context = _text(status.get("context"))
-                if context in seen:
+                if context not in by_name or context in seen:
                     continue
                 seen.add(context)
                 state = status.get("state")
-                conclusions.append(
+                by_name[context].append(
                     CIState.GREEN
                     if state == "success"
                     else CIState.RED
                     if state in {"error", "failure"}
                     else CIState.PENDING
                 )
+        # 工作流尚未登记全部必需检查时，不提前结束这一轮验收。
+        if any(not states for states in by_name.values()):
+            return CIState.PENDING
+        conclusions = [state for states in by_name.values() for state in states]
         if CIState.RED in conclusions:
             return CIState.RED
-        if not conclusions or CIState.PENDING in conclusions:
+        if CIState.PENDING in conclusions:
             return CIState.PENDING
         return CIState.GREEN
 

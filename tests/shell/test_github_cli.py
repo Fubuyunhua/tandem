@@ -14,7 +14,7 @@ SHA = "a" * 40
 
 def test_poll_and_reconcile_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     github = FakeGitHub(issues=(Issue(7, labels=("agent",)),), prs={8: PullRequest(8, SHA)})
-    monkeypatch.setattr(cli, "GhGitHub", lambda _repo: github)
+    monkeypatch.setattr(cli, "GhGitHub", lambda _repo, **_kwargs: github)
     db = tmp_path / "cli.sqlite3"
     common = ["--db", str(db), "--repo", "owner/repo"]
     assert cli.main(["poll", *common, "--bind", "gh-7=8"]) == 0
@@ -34,7 +34,7 @@ def test_approve_cli_live_is_explicit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live: bool
 ) -> None:
     github = FakeGitHub(prs={8: PullRequest(8, SHA)}, checks={SHA: CIState.GREEN})
-    monkeypatch.setattr(cli, "GhGitHub", lambda _repo: github)
+    monkeypatch.setattr(cli, "GhGitHub", lambda _repo, **_kwargs: github)
     db = tmp_path / "cli.sqlite3"
     with Store(db) as store:
         store.commit(
@@ -59,7 +59,7 @@ def test_cli_failure_exit_and_safe_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     github = FakeGitHub(fail=True)
-    monkeypatch.setattr(cli, "GhGitHub", lambda _repo: github)
+    monkeypatch.setattr(cli, "GhGitHub", lambda _repo, **_kwargs: github)
     assert cli.main(["poll", "--db", str(tmp_path / "cli.sqlite3"), "--repo", "owner/repo"]) == 1
     assert "失败" in capsys.readouterr().out
     assert github.writes == []

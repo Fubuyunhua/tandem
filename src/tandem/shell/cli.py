@@ -35,7 +35,7 @@ from tandem.core.model import (
     VetoReason,
 )
 from tandem.shell.agents.fake import FakeAgent
-from tandem.shell.config import load_policy
+from tandem.shell.config import load_config, load_policy
 from tandem.shell.diff_source import DiffSource, FakeDiffSource, GitDiffSource
 from tandem.shell.executor import Executor
 from tandem.shell.github import GhGitHub, GitHubError
@@ -423,11 +423,16 @@ def cmd_demo(_args: argparse.Namespace) -> int:
     return run_demo()
 
 
+def _github_client(repo: str) -> GhGitHub:
+    """轮询、核对和合并前复查共用同一份必需检查配置。"""
+    return GhGitHub(repo, required_checks=load_config().required_checks)
+
+
 def cmd_github(args: argparse.Namespace) -> int:
     """拉取或核对一次；live 仅控制 GitHub 写入，不启动真实 Agent。"""
     store, runner = _open(_db_path(args))
     try:
-        github = GhGitHub(str(args.repo))
+        github = _github_client(str(args.repo))
         runner.executor.github = github
         runner.executor.github_store = store
         runner.executor.github_repo = str(args.repo)
@@ -464,7 +469,7 @@ def _connect_github(args: argparse.Namespace, runner: Runner) -> None:
     if live and repo is None:
         raise RunnerError("live 操作需要 GitHub 来源或 --repo")
     if repo is not None:
-        runner.executor.github = GhGitHub(str(repo))
+        runner.executor.github = _github_client(str(repo))
         runner.executor.github_store = runner.store
         runner.executor.github_repo = str(repo)
         runner.executor.dry_run = not live

@@ -3,6 +3,9 @@
 
 version: 1
 
+# GitHub 适配器只认可这些必需检查；缺项等待，跳过不算通过。
+required_checks: [check]
+
 # 运行模式：M1 只有 Claude，所以默认 single_agent（所有等级都由你审）。
 # 等到 M2 有了第二家审核者，改成 multi_agent。
 # `tandem demo` 要跑多 Agent 的场景，它在代码里显式覆盖成 multi_agent，不依赖这个默认值。

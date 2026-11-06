@@ -81,6 +81,7 @@ class FakeGhProcess:
                 {
                     "check_runs": [
                         {
+                            "name": "check",
                             "status": "in_progress" if state is CIState.PENDING else "completed",
                             "conclusion": "success" if state is CIState.GREEN else "failure",
                         }
@@ -129,19 +130,27 @@ def test_gh_merge_carries_atomic_sha_and_confirms(monkeypatch: pytest.MonkeyPatc
     "checks, statuses, expected",
     [
         ([{"check_runs": []}], [[]], CIState.PENDING),
-        ([{"check_runs": [{"status": "queued", "conclusion": None}]}], [[]], CIState.PENDING),
-        ([{"check_runs": [{"status": "completed", "conclusion": "failure"}]}], [[]], CIState.RED),
+        (
+            [{"check_runs": [{"name": "check", "status": "queued", "conclusion": None}]}],
+            [[]],
+            CIState.PENDING,
+        ),
+        (
+            [{"check_runs": [{"name": "check", "status": "completed", "conclusion": "failure"}]}],
+            [[]],
+            CIState.RED,
+        ),
         (
             [{"check_runs": []}],
             [
-                [{"context": "legacy", "state": "success"}],
-                [{"context": "legacy", "state": "failure"}],
+                [{"context": "check", "state": "success"}],
+                [{"context": "check", "state": "failure"}],
             ],
             CIState.GREEN,
         ),
         (
-            [{"check_runs": [{"status": "completed", "conclusion": "success"}]}],
-            [[{"context": "legacy", "state": "error"}]],
+            [{"check_runs": [{"name": "check", "status": "completed", "conclusion": "success"}]}],
+            [[{"context": "check", "state": "error"}]],
             CIState.RED,
         ),
     ],
