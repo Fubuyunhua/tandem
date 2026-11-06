@@ -32,6 +32,8 @@ from tandem.shell.config import load_policy
 NOW = datetime(2026, 11, 7, 9, 30)
 SHA_1 = "1" * 40
 SHA_2 = "2" * 40
+# 正常方案回执里的提交编号（方案必须绑定一个提交）
+PLAN_SHA = "9" * 40
 
 CODE_CHANGES = ChangeSet(paths=("src/tandem/shell/cli.py",))
 
@@ -122,8 +124,10 @@ def to_ai_review(level: Level = Level.C, quota_: QuotaSnapshot | None = None) ->
 def to_d_ai_review() -> TaskRecord:
     """D 级：先走方案批准，再交代码到待AI审核。"""
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="先改 core 里的 decide")).task
-    record = run(record, ev(EventKind.PLAN_APPROVED)).task
+    record = run(
+        record, ev(EventKind.PLAN_SUBMITTED, sha=PLAN_SHA, plan="先改 core 里的 decide")
+    ).task
+    record = run(record, ev(EventKind.PLAN_APPROVED, sha=PLAN_SHA)).task
     record = to_working(record)
     record = to_acceptance(record, changes=CORE_CHANGES)
     return run(record, ev(EventKind.CI_GREEN, sha=record.latest_sha)).task

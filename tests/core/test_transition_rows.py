@@ -96,7 +96,7 @@ def test_row_01_single_agent_mode_needs_no_reviewer() -> None:
 
 def test_row_02_d_level_plan_waits_for_you() -> None:
     record = to_working(new_task(Level.D))
-    decision = run(record, ev(EventKind.PLAN_SUBMITTED, plan="先改 decide 的签名"))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="先改 decide 的签名"))
     assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
     assert decision.task.plan_version == 1
     assert ActionKind.NOTIFY in [action.kind for action in decision.actions]
@@ -111,8 +111,8 @@ def test_row_02_c_level_plan_is_only_a_note() -> None:
 
 def test_row_03_you_approve_the_plan() -> None:
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="方案第一版")).task
-    decision = run(record, ev(EventKind.PLAN_APPROVED))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="方案第一版")).task
+    decision = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-a"))
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.approved_plan_version == 1
     assert decision.task.plan_version == 1
@@ -120,7 +120,7 @@ def test_row_03_you_approve_the_plan() -> None:
 
 def test_row_04_you_reject_the_plan() -> None:
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="方案第一版")).task
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="方案第一版")).task
     decision = run(record, ev(EventKind.PLAN_REJECTED, reason="先写测试"))
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.approved_plan_version is None
@@ -1767,3 +1767,46 @@ def test_plan_escalation_on_your_own_submission_is_written() -> None:
     assert "没有文字方案" in entry.text
     assert SHA_2 in entry.text
     assert "src/tandem/core/model.py" in entry.text
+
+
+# ------------------------------------------------- 升级到 D 的三个入口都要写方案正文
+
+
+# ------------------------------------------------- 方案回执和批准都必须带提交编号
+
+
+def test_row_02_plan_submitted_without_sha_is_rejected() -> None:
+    """新方案回执没有提交编号就拒收：方案必须能绑定到某一个提交。"""
+    record = to_working(new_task(Level.D))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, plan="没有编号的方案"))
+    assert decision.task.status is TaskStatus.WORKING
+    assert not decision.changed
+    assert decision.task.plan_history == ()
+    assert "提交编号" in decision.reason
+
+
+def test_row_03_plan_approval_without_sha_is_rejected_for_new_plans() -> None:
+    """正常提交的方案：批准也必须带编号，缺了不生效。"""
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="文字方案")).task
+    missing = run(record, ev(EventKind.PLAN_APPROVED))
+    assert missing.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "提交编号" in missing.reason
+    wrong = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-b"))
+    assert wrong.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    matched = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-a"))
+    assert matched.task.status is TaskStatus.PENDING
+    assert matched.task.approved_plan_version == 1
+
+
+def test_row_03_legacy_plan_without_any_sha_cannot_be_approved() -> None:
+    """旧任务：既没有方案 SHA 也没有 latest_sha 时不当作匹配，要求重新交带编号的方案。"""
+    from dataclasses import replace
+
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="文字方案")).task
+    legacy = replace(record, plan_history=(), latest_sha=None)
+    decision = run(legacy, ev(EventKind.PLAN_APPROVED, sha="plan-a"))
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert not decision.changed
+    assert "重新" in decision.reason and "编号" in decision.reason
