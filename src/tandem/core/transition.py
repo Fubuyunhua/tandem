@@ -225,7 +225,7 @@ def _dispatch(
         case EventKind.PLAN_SUBMITTED:
             return _on_plan_submitted(task, event, policy)
         case EventKind.PLAN_APPROVED:
-            return _on_plan_approved(task)
+            return _on_plan_approved(task, event)
         case EventKind.PLAN_REJECTED:
             return _on_plan_rejected(task, event)
         case EventKind.CODE_SUBMITTED:
@@ -329,10 +329,12 @@ def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     )
 
 
-def _on_plan_approved(task: TaskRecord) -> Decision:
+def _on_plan_approved(task: TaskRecord, event: Event) -> Decision:
     """3. 待你批准方案 → 待处理：记下批准的是哪一版方案。"""
     if task.status is not TaskStatus.AWAITING_PLAN_APPROVAL:
         return _ignore(task, "只有待你批准方案的任务才会批准方案")
+    if event.sha is not None and task.latest_sha is not None and event.sha != task.latest_sha:
+        return _ignore(task, "你批准的是另一版方案：提交编号和当前的不一致")
     actions = _Actions(task, task.state_version + 1)
     actions.add(ActionKind.NOTIFY, detail=f"第 {task.plan_version} 版方案已批准，回到待处理")
     return _transition(
@@ -361,10 +363,25 @@ def _on_plan_rejected(task: TaskRecord, event: Event) -> Decision:
     )
 
 
+# 这些状态下都允许接收新代码：新提交让旧的审核、批准、否决全部作废
+NEW_SUBMISSION_STATES = frozenset(
+    {
+        TaskStatus.AWAITING_ACCEPTANCE,
+        TaskStatus.AWAITING_AI_REVIEW,
+        TaskStatus.AWAITING_YOUR_REVIEW,
+        TaskStatus.NEEDS_INTERVENTION,
+        TaskStatus.ERROR,
+        TaskStatus.AWAITING_MERGE,
+    }
+)
+
+
 def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """5 / 5b. 处理中 → 待验收，或者重新算级别后升成 D 级 → 待你批准方案。"""
     if task.status is not TaskStatus.WORKING:
-        return _ignore(task, "只有在处理中的任务才会交回代码")
+        if task.status in NEW_SUBMISSION_STATES:
+            return _on_new_submission(task, event, policy)
+        return _ignore(task, f"{task.status.value}时不该收到代码回执")
     if event.sha is None or event.attempt is None or event.changes is None:
         return _ignore(task, "回执缺少任务编号、第几次尝试或提交编号，按无效回执处理")
     if event.attempt != task.attempt:
@@ -410,6 +427,58 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         pr_opened=True,
         returned_from_review=False,
         note=event.reason or "",
+    )
+
+
+def _on_new_submission(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """审核、验收、待合并期间来了新提交。
+
+    更新提交编号、作废旧审核结论和批准、重新算级别，然后回到验收
+    （升成 D 级且方案没批准时，先回到方案批准）。
+    """
+    if event.sha is None or event.attempt is None or event.changes is None:
+        return _ignore(task, "新提交缺少提交编号、尝试次数或真实改动，按无效回执处理")
+    if event.attempt < task.attempt:
+        return _ignore(task, f"收到的是第 {event.attempt} 次尝试的回执，比当前的还早，忽略")
+    if task.status is TaskStatus.AWAITING_MERGE and any(
+        action.kind is ActionKind.MERGE for action in task.actions
+    ):
+        return _ignore(task, "合并已经开始，新提交先记下，等核对合并结果后再决定")
+
+    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    rule = policy.rule_for(new_level)
+    plan_approved = (
+        task.approved_plan_version is not None and task.approved_plan_version == task.plan_version
+    )
+    actions = _Actions(task, task.state_version + 1)
+    invalidated: dict[str, object] = {
+        "level": new_level,
+        "latest_sha": event.sha,
+        "approved_sha": None,
+        "reviews": (),
+        "ci_green": False,
+        "pr_opened": True,
+        "returned_from_review": False,
+        "attempt": max(task.attempt, event.attempt),
+        "note": event.reason or "",
+    }
+    if rule.requires_plan_approval and not plan_approved:
+        actions.add(ActionKind.NOTIFY, detail="新提交升成 D 级，要先批准方案")
+        return _transition(
+            task,
+            TaskStatus.AWAITING_PLAN_APPROVAL,
+            f"新提交 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
+            actions.items,
+            plan_version=task.plan_version + 1,
+            **invalidated,
+        )
+    actions.add(ActionKind.NOTIFY, detail=f"收到新提交 {event.sha}，旧结论全部作废，重新验收")
+    return _transition(
+        task,
+        TaskStatus.AWAITING_ACCEPTANCE,
+        f"新提交 {event.sha}（{new_level.value} 级），旧审核结论和批准全部作废",
+        actions.items,
+        **invalidated,
     )
 
 
@@ -545,6 +614,8 @@ def _on_ci_red(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """10 / 11. 待验收 → 待处理（带原因），失败达到上限 → 待你介入（R01）。"""
     if task.status is not TaskStatus.AWAITING_ACCEPTANCE:
         return _ignore(task, "只有在待验收的任务才会收到 CI 结果")
+    if task.latest_sha is None or event.sha != task.latest_sha:
+        return _ignore(task, "CI 结果没有带当前提交编号，或者编号对不上，忽略")
     failures = task.accept_failures + 1
     limit = policy.thresholds.max_accept_failures
     reason = event.reason or "CI 没有给出原因"
@@ -682,6 +753,8 @@ def _on_your_approval(task: TaskRecord, event: Event, policy: Policy) -> Decisio
     """17. 待你审核 → 待合并：CI 绿，绑定当前提交编号。"""
     if task.status is not TaskStatus.AWAITING_YOUR_REVIEW:
         return _ignore(task, "只有待你审核的任务才会由你批准")
+    if event.sha is None or event.sha != task.latest_sha:
+        return _ignore(task, "你批准时要带上你看到的那个提交编号，和当前不一致就不生效")
     actions = _Actions(task, task.state_version + 1)
     approved_sha = task.latest_sha
     if approved_sha is None:
@@ -719,7 +792,9 @@ def _on_merged(task: TaskRecord, event: Event) -> Decision:
     if task.status is not TaskStatus.AWAITING_MERGE:
         return _ignore(task, "只有待合并的任务才会收到合并成功")
     approved = task.approved_sha or task.latest_sha
-    if event.sha is not None and approved is not None and event.sha != approved:
+    if approved is None or event.sha is None:
+        return _ignore(task, "合并成功必须带核对过的提交编号")
+    if event.sha != approved:
         return _ignore(task, f"合并的提交编号 {event.sha} 和审核时的 {approved} 不一致")
     actions = _Actions(task, task.state_version + 1)
     actions.add(ActionKind.NOTIFY, detail="任务已合并")
@@ -732,6 +807,8 @@ def _on_intervention_approved(task: TaskRecord, event: Event, policy: Policy) ->
         return _ignore(task, "只有待你介入的任务才会人工审核通过")
     if task.latest_sha is None:
         return _ignore(task, "任务没有提交编号，不能批准")
+    if event.sha is None or event.sha != task.latest_sha:
+        return _ignore(task, "人工审核通过要绑定当前提交编号，和当前不一致就不生效")
     failing = [item for item in _current_reviews(task) if item.verdict is Verdict.FAIL]
     if failing and not (event.reason or "").strip():
         return _ignore(task, "否决 AI 的审核意见要对每一条写理由")

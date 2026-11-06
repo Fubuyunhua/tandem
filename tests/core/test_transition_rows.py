@@ -250,7 +250,7 @@ def test_row_09b_single_agent_mode_goes_to_your_review() -> None:
 
 def test_row_10_ci_red_returns_to_pending() -> None:
     record = to_acceptance(to_working(new_task()))
-    decision = run(record, ev(EventKind.CI_RED, reason="测试没过"))
+    decision = run(record, ev(EventKind.CI_RED, sha=record.latest_sha, reason="测试没过"))
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.accept_failures == 1
     assert "测试没过" in decision.task.note
@@ -353,7 +353,7 @@ def test_row_17_you_approve_and_merge() -> None:
     for reviewer in record.designated_reviewers:
         record = run(record, review_event(record, reviewer)).task
     assert record.status is TaskStatus.AWAITING_YOUR_REVIEW
-    decision = run(record, ev(EventKind.YOUR_APPROVAL))
+    decision = run(record, ev(EventKind.YOUR_APPROVAL, sha=record.latest_sha))
     assert decision.task.status is TaskStatus.AWAITING_MERGE
     assert decision.task.approved_sha == record.latest_sha
     assert actions_of(decision, ActionKind.MERGE)
@@ -386,7 +386,10 @@ def test_row_19_merge_with_wrong_sha_is_ignored() -> None:
 
 def test_row_20_you_approve_after_intervention() -> None:
     record = to_needs_intervention_by_reviewers()
-    decision = run(record, ev(EventKind.INTERVENTION_APPROVED, reason="我看过了"))
+    decision = run(
+        record,
+        ev(EventKind.INTERVENTION_APPROVED, sha=record.latest_sha, reason="我看过了"),
+    )
     assert decision.task.status is TaskStatus.AWAITING_MERGE
     assert decision.task.approved_sha == record.latest_sha
     assert actions_of(decision, ActionKind.MERGE)
@@ -395,7 +398,10 @@ def test_row_20_you_approve_after_intervention() -> None:
 def test_row_20_needs_green_ci() -> None:
     record = to_needs_intervention_by_ci()
     assert not record.ci_green
-    decision = run(record, ev(EventKind.INTERVENTION_APPROVED, reason="我看过了"))
+    decision = run(
+        record,
+        ev(EventKind.INTERVENTION_APPROVED, sha=record.latest_sha, reason="我看过了"),
+    )
     assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
     assert "CI" in decision.reason
 
@@ -407,10 +413,15 @@ def test_row_20_vetoing_ai_needs_reasons() -> None:
     record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
     record = run(record, review_event(record, "codex", Verdict.FAIL)).task
     assert record.status is TaskStatus.NEEDS_INTERVENTION
-    without_reason = run(record, ev(EventKind.INTERVENTION_APPROVED))
+    without_reason = run(record, ev(EventKind.INTERVENTION_APPROVED, sha=record.latest_sha))
     assert without_reason.task.status is TaskStatus.NEEDS_INTERVENTION
     with_reason = run(
-        record, ev(EventKind.INTERVENTION_APPROVED, reason="这条意见我不同意，理由如下")
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=record.latest_sha,
+            reason="这条意见我不同意，理由如下",
+        ),
     )
     assert with_reason.task.status is TaskStatus.AWAITING_MERGE
 
@@ -546,7 +557,7 @@ def test_terminal_task_ignores_late_events(level: Level) -> None:
         record = to_d_ai_review()
         for reviewer in record.designated_reviewers:
             record = run(record, review_event(record, reviewer)).task
-        record = run(record, ev(EventKind.YOUR_APPROVAL)).task
+        record = run(record, ev(EventKind.YOUR_APPROVAL, sha=record.latest_sha)).task
         record = run(record, ev(EventKind.MERGED, sha=record.latest_sha)).task
     assert record.status is TaskStatus.MERGED
     decision = run(
@@ -613,7 +624,9 @@ def test_merge_action_is_only_produced_with_green_ci() -> None:
 
     # 路径二：人工介入后批准（R03，CI 绿）
     record = to_needs_intervention_by_reviewers()
-    approved = run(record, ev(EventKind.INTERVENTION_APPROVED, reason="我看过了")).task
+    approved = run(
+        record, ev(EventKind.INTERVENTION_APPROVED, sha=record.latest_sha, reason="我看过了")
+    ).task
     assert approved.status is TaskStatus.AWAITING_MERGE
     assert any(action.kind is ActionKind.MERGE for action in approved.actions)
 
@@ -621,7 +634,7 @@ def test_merge_action_is_only_produced_with_green_ci() -> None:
     record = to_d_ai_review()
     for reviewer in record.designated_reviewers:
         record = run(record, review_event(record, reviewer)).task
-    approved = run(record, ev(EventKind.YOUR_APPROVAL)).task
+    approved = run(record, ev(EventKind.YOUR_APPROVAL, sha=record.latest_sha)).task
     assert approved.status is TaskStatus.AWAITING_MERGE
     assert any(action.kind is ActionKind.MERGE for action in approved.actions)
 
@@ -685,3 +698,124 @@ def test_row_12_review_extension_provider_counts_as_provider() -> None:
     decision = run(record, review_event(record, "opencode-go", provider="codex"))
     assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
     assert "已经出过结论" in decision.reason or "指定的审核者" in decision.reason
+
+
+# ------------------------------------------------- F4：新提交让旧证据作废、放行要核对提交编号
+
+
+def test_row_05_new_commit_during_ai_review_updates_sha() -> None:
+    """审核期间来了新提交：更新提交编号，作废旧结论，回到验收。"""
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex")).task
+    assert record.reviews
+
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2, changes=CODE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+    assert decision.task.latest_sha == SHA_2
+    assert decision.task.reviews == ()
+    assert decision.task.approved_sha is None
+    assert not decision.task.ci_green
+
+
+def test_row_05_new_commit_during_acceptance_restarts_ci() -> None:
+    record = to_acceptance(to_working(new_task()))
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2, changes=CODE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+    assert decision.task.latest_sha == SHA_2
+
+
+def test_row_05_new_commit_during_your_review_voids_approval() -> None:
+    record = to_d_ai_review()
+    for reviewer in record.designated_reviewers:
+        record = run(record, review_event(record, reviewer)).task
+    assert record.status is TaskStatus.AWAITING_YOUR_REVIEW
+
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2, changes=CORE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+    assert decision.task.reviews == ()
+    assert decision.task.level is Level.D
+
+
+def test_row_05_new_d_level_commit_goes_back_to_plan_approval() -> None:
+    record = to_ai_review()  # C 级，方案没批准过
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2, changes=CORE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert decision.task.level is Level.D
+    assert decision.task.plan_version == 1
+
+
+def test_row_05_new_commit_after_merge_started_is_ignored() -> None:
+    record = to_merge_ready()
+    assert any(action.kind is ActionKind.MERGE for action in record.actions)
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2, changes=CODE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    assert not decision.changed
+    assert "合并已经开始" in decision.reason
+
+
+def test_row_05_stale_attempt_during_review_is_ignored() -> None:
+    record = to_ai_review()
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=0, sha=SHA_2, changes=CODE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert not decision.changed
+
+
+def test_row_05_new_commit_without_changes_is_ignored() -> None:
+    record = to_ai_review()
+    decision = run(record, ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2))
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    assert "无效" in decision.reason
+
+
+def test_row_17_your_approval_requires_the_sha_you_saw() -> None:
+    record = to_d_ai_review()
+    for reviewer in record.designated_reviewers:
+        record = run(record, review_event(record, reviewer)).task
+    missing = run(record, ev(EventKind.YOUR_APPROVAL))
+    assert missing.task.status is TaskStatus.AWAITING_YOUR_REVIEW
+    assert "提交编号" in missing.reason
+    wrong = run(record, ev(EventKind.YOUR_APPROVAL, sha=SHA_2))
+    assert wrong.task.status is TaskStatus.AWAITING_YOUR_REVIEW
+    matched = run(record, ev(EventKind.YOUR_APPROVAL, sha=record.latest_sha))
+    assert matched.task.status is TaskStatus.AWAITING_MERGE
+
+
+def test_row_19_merge_success_requires_the_sha() -> None:
+    record = to_merge_ready()
+    missing = run(record, ev(EventKind.MERGED))
+    assert missing.task.status is TaskStatus.AWAITING_MERGE
+    assert "提交编号" in missing.reason
+    matched = run(record, ev(EventKind.MERGED, sha=record.latest_sha))
+    assert matched.task.status is TaskStatus.MERGED
+
+
+def test_row_10_ci_red_requires_the_current_sha() -> None:
+    record = to_acceptance(to_working(new_task()))
+    decision = run(record, ev(EventKind.CI_RED, sha=SHA_2, reason="旧提交红了"))
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+    assert decision.task.accept_failures == 0
+
+
+def test_row_20_intervention_approval_requires_the_current_sha() -> None:
+    record = to_needs_intervention_by_reviewers()
+    decision = run(record, ev(EventKind.INTERVENTION_APPROVED, sha=SHA_2, reason="我看过了"))
+    assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert not decision.changed

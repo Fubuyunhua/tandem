@@ -70,7 +70,7 @@ def test_scenario_2_d_level_needs_plan_approval_first() -> None:
     walker.submit_code(changes=CORE_CHANGES)
     walker.ci_green()
     walker.pass_all()
-    walker.step(ev(EventKind.YOUR_APPROVAL))
+    walker.step(ev(EventKind.YOUR_APPROVAL, sha=walker.record.latest_sha))
     walker.merge_success()
 
     assert walker.statuses == [
@@ -187,7 +187,7 @@ def test_scenario_7_you_send_the_code_back() -> None:
     walker.submit_code(sha=SHA_2, changes=CORE_CHANGES)
     walker.ci_green()
     walker.pass_all()
-    walker.step(ev(EventKind.YOUR_APPROVAL))
+    walker.step(ev(EventKind.YOUR_APPROVAL, sha=walker.record.latest_sha))
     walker.merge_success()
     assert walker.record.status is TaskStatus.MERGED
     assert walker.record.latest_sha == SHA_2
@@ -241,7 +241,13 @@ def test_scenario_9_you_change_core_and_ai_disagrees() -> None:
     assert walker.record.status is TaskStatus.NEEDS_INTERVENTION
     assert "写手是你" in walker.record.reason
 
-    walker.step(ev(EventKind.INTERVENTION_APPROVED, reason="这条反对意见我不同意：保留了重放"))
+    walker.step(
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=walker.record.latest_sha,
+            reason="这条反对意见我不同意：保留了重放",
+        )
+    )
     assert walker.record.status is TaskStatus.AWAITING_MERGE
     walker.merge_success()
     assert walker.record.status is TaskStatus.MERGED

@@ -158,13 +158,18 @@ def cmd_approve(args: argparse.Namespace) -> int:
             return 1
         match task.status:
             case TaskStatus.AWAITING_PLAN_APPROVAL:
-                event = _event(EventKind.PLAN_APPROVED, task)
+                event = _event(EventKind.PLAN_APPROVED, task, sha=args.sha)
             case TaskStatus.AWAITING_YOUR_REVIEW:
                 # "待你审核"是你批准 AI 写完的代码，走第 17 条
-                event = _event(EventKind.YOUR_APPROVAL, task, reason=args.reason)
+                event = _event(EventKind.YOUR_APPROVAL, task, sha=args.sha, reason=args.reason)
             case TaskStatus.NEEDS_INTERVENTION:
                 # "待你介入"是人工审核通过 / 批准你自己的代码，走第 20 条
-                event = _event(EventKind.INTERVENTION_APPROVED, task, reason=args.reason)
+                event = _event(
+                    EventKind.INTERVENTION_APPROVED,
+                    task,
+                    sha=args.sha,
+                    reason=args.reason,
+                )
             case _:
                 print(f"{task.task_id} 在{task.status.value}，现在不需要你批准")
                 return 1
@@ -403,6 +408,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     approve = subparsers.add_parser("approve", parents=[common], help="批准方案或代码")
     approve.add_argument("--task-id", required=True, help="任务编号")
+    approve.add_argument(
+        "--sha",
+        required=True,
+        help="你看到的那个提交编号：和你现在看到的不一致时，批准不生效",
+    )
     approve.add_argument("--reason", default=None, help="否决 AI 意见时要逐条写理由")
 
     reject = subparsers.add_parser("reject", parents=[common], help="打回方案或代码")

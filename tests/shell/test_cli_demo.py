@@ -87,13 +87,13 @@ def test_approve_when_not_needed(tmp_path: Path, capsys: pytest.CaptureFixture[s
     db = tmp_path / "tandem.sqlite3"
     main(["submit", "--db", str(db), "--task-id", "t1", "--paths", "docs/a.md"])
     capsys.readouterr()
-    assert main(["approve", "--db", str(db), "--task-id", "t1"]) == 1
+    assert main(["approve", "--db", str(db), "--task-id", "t1", "--sha", "abc"]) == 1
     assert "不需要你批准" in capsys.readouterr().out
 
 
 def test_approve_unknown_task(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     db = tmp_path / "tandem.sqlite3"
-    assert main(["approve", "--db", str(db), "--task-id", "ghost"]) == 1
+    assert main(["approve", "--db", str(db), "--task-id", "ghost", "--sha", "abc"]) == 1
     assert "没有任务" in capsys.readouterr().out
 
 
@@ -122,7 +122,7 @@ def test_approve_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     assert loaded.status.value == "待你批准方案"
     runner.store.close()
 
-    assert main(["approve", "--db", str(db), "--task-id", "t1"]) == 0
+    assert main(["approve", "--db", str(db), "--task-id", "t1", "--sha", "abc"]) == 0
     out = capsys.readouterr().out
     assert "待处理" in out
     assert "你批准了第 1 版方案" in out
@@ -199,7 +199,9 @@ def test_approve_sends_your_approval_when_waiting_for_you(
     assert task.status is TaskStatus.AWAITING_YOUR_REVIEW
     runner.store.close()
 
-    assert main(["approve", "--db", str(db), "--task-id", "t1"]) == 0
+    assert (
+        main(["approve", "--db", str(db), "--task-id", "t1", "--sha", task.latest_sha or ""]) == 0
+    )
     out = capsys.readouterr().out
     assert "待合并" in out
 
@@ -222,7 +224,22 @@ def test_approve_returns_nonzero_when_kernel_ignores_event(
     runner.store.close()
 
     # CI 是红的，人工审核通过会被内核拒绝
-    assert main(["approve", "--db", str(db), "--task-id", "t1", "--reason", "我看过了"]) != 0
+    assert (
+        main(
+            [
+                "approve",
+                "--db",
+                str(db),
+                "--task-id",
+                "t1",
+                "--sha",
+                task.latest_sha or "",
+                "--reason",
+                "我看过了",
+            ]
+        )
+        != 0
+    )
     out = capsys.readouterr().out
     assert "没有生效" in out
     assert "CI" in out
@@ -243,3 +260,32 @@ def test_reject_returns_nonzero_when_kernel_ignores_event(
     assert main(["reject", "--db", str(db), "--task-id", "t1", "--reason", "不行"]) == 0
     capsys.readouterr()
     assert main(["reject", "--db", str(db), "--task-id", "t1", "--reason", "再不行"]) != 0
+
+
+def test_approve_with_wrong_sha_does_not_approve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F4：批准绑定你看到的提交编号；对不上就不生效。"""
+    from tandem.core.model import RunMode, TaskStatus
+    from tests.shell.shell_helpers import advance_to_your_review, code_receipt, make_runner
+
+    db = tmp_path / "tandem.sqlite3"
+    runner = make_runner(db, [code_receipt("t1")], run_mode=RunMode.SINGLE_AGENT)
+    advance_to_your_review(runner)
+    runner.store.close()
+
+    assert main(["approve", "--db", str(db), "--task-id", "t1", "--sha", "另一个提交"]) != 0
+    out = capsys.readouterr().out
+    assert "没有生效" in out
+    assert "提交编号" in out
+
+    with Store(db) as store:
+        loaded = store.load_task("t1")
+        assert loaded is not None
+        assert loaded.status is TaskStatus.AWAITING_YOUR_REVIEW
+
+
+def test_approve_requires_sha_argument(tmp_path: Path) -> None:
+    """F4：approve 必须带 --sha，漏了就由 argparse 直接报错。"""
+    with pytest.raises(SystemExit):
+        main(["approve", "--db", str(tmp_path / "x.sqlite3"), "--task-id", "t1"])
