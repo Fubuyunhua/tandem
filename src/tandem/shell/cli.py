@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -32,6 +33,7 @@ from tandem.core.model import (
     Verdict,
     VetoReason,
 )
+from tandem.shell import serde
 from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.config import load_policy
 from tandem.shell.diff_source import DiffSource, FakeDiffSource, GitDiffSource
@@ -132,6 +134,35 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- show
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """完整展示任务与事件，批准前可以核对提交和逐条意见。"""
+    db = _db_path(args)
+    if not db.exists():
+        print(f"还没有数据库：{db}")
+        return 1
+    with Store(db) as store:
+        task = store.load_task(args.task_id)
+        if task is None:
+            print(f"没有任务 {args.task_id}")
+            return 1
+        print(f"{task.task_id}：{task.status.value}；等级 {task.level.value}")
+        print(f"提交编号：{task.latest_sha or '无'}")
+        print("完整任务记录（含审核历史、待回应意见及其复合键、动作）：")
+        print(json.dumps(serde.task_to_dict(task), ensure_ascii=False, indent=2))
+        print("历史事件（按发生顺序）：")
+        print(
+            json.dumps(
+                [serde.event_to_dict(event) for event in store.list_events(task.task_id)],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    return 0
+
+
 # ---------------------------------------------------------------- submit
 
 
@@ -146,7 +177,11 @@ def _changes_from_args(args: argparse.Namespace) -> ChangeSet:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
-    store, runner = _open(_db_path(args))
+    policy = load_policy()
+    if args.mode is not None:
+        mode = RunMode.SINGLE_AGENT if args.mode == "single_agent" else RunMode.MULTI_AGENT
+        policy = replace(policy, run_mode=mode)
+    store, runner = _open(_db_path(args), policy=policy)
     try:
         changes = _changes_from_args(args)
         level = compute_level(changes, runner.policy)
@@ -420,8 +455,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status", parents=[common], help="列出任务和当前状态")
 
+    show = subparsers.add_parser("show", parents=[common], help="查看完整任务记录和历史事件")
+    show.add_argument("task_id", help="任务编号")
+
     submit = subparsers.add_parser("submit", parents=[common], help="提交一个新任务")
     submit.add_argument("--task-id", required=True, help="任务编号")
+    submit.add_argument(
+        "--mode",
+        choices=("single_agent", "multi_agent"),
+        default=None,
+        help="此任务的运行模式（默认使用 risk.yml，不修改配置文件）",
+    )
     submit.add_argument("--paths", default="", help="改动的文件，逗号分隔")
     submit.add_argument("--deleted", default="", help="删除的文件，逗号分隔")
     submit.add_argument(
@@ -458,6 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "demo": cmd_demo,
     "status": cmd_status,
+    "show": cmd_show,
     "submit": cmd_submit,
     "approve": cmd_approve,
     "reject": cmd_reject,
