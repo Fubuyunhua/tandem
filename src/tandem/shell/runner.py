@@ -83,7 +83,7 @@ class Runner:
             raise RunnerError(f"任务 {task_id} 已经存在")
         now = self.clock()
         task = replace(create_task(task_id, level, self.policy), updated_at=now, base_sha=base_sha)
-        self.store.save_task(task, now)
+        self.store.commit(task=task, now=now)
         return task
 
     def code_event(self, task: TaskRecord, receipt: Receipt, *, base: str | None = None) -> Event:
@@ -116,13 +116,18 @@ class Runner:
         now = self.clock()
         decision = decide(task, event, self.policy, self.quota.snapshot(), now)
 
-        self.store.append_event(event, now)
-        if decision.changed:
-            self.store.save_task(decision.task, now)
+        # 一个事务：事件 + 带预期旧版本的任务快照 + 待执行动作。
+        # 事务提交以后才去动外部世界，崩在中途也能从日志和动作表看出来。
+        self.store.commit(
+            events=[event],
+            task=decision.task if decision.changed else None,
+            expected_version=task.state_version,
+            actions=decision.actions,
+            now=now,
+        )
 
         executed: list[ExecutedAction] = []
         for action in decision.actions:
-            self.store.record_action(action, now)
             outcome = self.executor.execute(action, decision.task)
             if action.provider is not None and action.kind is ActionKind.SET_QUOTA_EXHAUSTED:
                 self.quota.mark_exhausted(action.provider)

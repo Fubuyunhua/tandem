@@ -1,4 +1,4 @@
-"""存储层测试：只追加、版本号、动作状态。"""
+"""存储层测试：只追加、版本号、原子提交、动作状态。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from tandem.core.model import (
     TaskStatus,
     Verdict,
 )
-from tandem.shell.store import Store, StoreError
+from tandem.shell.store import ConflictError, Store, StoreError
 
 
 @pytest.fixture
@@ -31,9 +31,17 @@ def store(tmp_path: Path) -> Iterator[Store]:
         yield opened
 
 
+def _task(version: int = 0, **changes: object) -> TaskRecord:
+    return replace(TaskRecord(task_id="t1", state_version=version), **changes)
+
+
 def test_events_are_append_only(store: Store) -> None:
-    store.append_event(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
-    store.append_event(Event(kind=EventKind.CI_GREEN, task_id="t1"))
+    store.commit(
+        events=[
+            Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"),
+            Event(kind=EventKind.CI_GREEN, task_id="t1"),
+        ]
+    )
     events = store.list_events("t1")
     assert [event.kind for event in events] == [EventKind.ASSIGN, EventKind.CI_GREEN]
 
@@ -41,7 +49,7 @@ def test_events_are_append_only(store: Store) -> None:
 def test_database_refuses_to_update_or_delete_events(tmp_path: Path) -> None:
     path = tmp_path / "tandem.sqlite3"
     with Store(path) as store:
-        store.append_event(Event(kind=EventKind.ASSIGN, task_id="t1"))
+        store.commit(events=[Event(kind=EventKind.ASSIGN, task_id="t1")])
     connection = sqlite3.connect(str(path))
     try:
         with pytest.raises(sqlite3.DatabaseError):
@@ -83,6 +91,7 @@ def test_task_snapshot_roundtrip(store: Store) -> None:
         ci_green=True,
         pr_opened=True,
         attempt=3,
+        base_sha="main",
         returned_from_review=False,
         actions=(
             Action(
@@ -97,25 +106,85 @@ def test_task_snapshot_roundtrip(store: Store) -> None:
         reason="等审核",
         note="备注",
     )
-    store.save_task(task)
-    loaded = store.load_task("t1")
-    assert loaded == task
+    store.commit(task=task)
+    assert store.load_task("t1") == task
 
 
 def test_task_version_cannot_go_backwards(store: Store) -> None:
-    store.save_task(TaskRecord(task_id="t1", state_version=5))
+    store.commit(task=_task(5))
     with pytest.raises(StoreError):
-        store.save_task(TaskRecord(task_id="t1", state_version=4))
-    # 同一个版本号重复保存是允许的（幂等）
-    store.save_task(TaskRecord(task_id="t1", state_version=5, reason="重放"))
+        store.commit(task=_task(4), expected_version=5)
+
+
+def test_same_version_only_accepts_identical_content(store: Store) -> None:
+    """同一版本号只接受内容完全相同的重复保存（重放）。"""
+    store.commit(task=_task(5))
+    # 内容不同 → 拒绝
+    with pytest.raises(ConflictError):
+        store.commit(task=_task(5, reason="另一份内容"), expected_version=5)
+    # 内容完全相同 → 幂等
+    store.commit(task=_task(5), expected_version=5)
     loaded = store.load_task("t1")
     assert loaded is not None
-    assert loaded.reason == "重放"
+    assert loaded.state_version == 5
+
+
+def test_concurrent_writers_second_one_is_rejected(tmp_path: Path) -> None:
+    """两个处理者基于同一个旧版本各写一次：第二个必须失败，不能覆盖第一个。"""
+    path = tmp_path / "tandem.sqlite3"
+    with Store(path) as first, Store(path) as second:
+        first.commit(task=_task(0))
+        base = first.load_task("t1")
+        assert base is not None
+
+        first.commit(
+            task=replace(base, state_version=1, status=TaskStatus.WORKING),
+            expected_version=0,
+        )
+        with pytest.raises(ConflictError):
+            second.commit(
+                task=replace(base, state_version=1, status=TaskStatus.CANCELLED),
+                expected_version=0,
+            )
+
+        loaded = second.load_task("t1")
+        assert loaded is not None
+        assert loaded.status is TaskStatus.WORKING
+
+
+def test_commit_is_atomic(store: Store) -> None:
+    """任务更新失败时，同一个事务里的事件和动作都不能留在库里。"""
+    store.commit(task=_task(3))
+    with pytest.raises(ConflictError):
+        store.commit(
+            events=[Event(kind=EventKind.CI_GREEN, task_id="t1")],
+            task=replace(_task(4), status=TaskStatus.AWAITING_AI_REVIEW),
+            expected_version=99,  # 旧的版本号对不上
+            actions=[Action(action_id="t1:4:0", kind=ActionKind.NOTIFY, task_id="t1")],
+        )
+    assert store.list_events("t1") == []
+    assert store.list_actions("t1") == []
+    loaded = store.load_task("t1")
+    assert loaded is not None
+    assert loaded.state_version == 3
+
+
+def test_commit_writes_events_task_and_actions_together(store: Store) -> None:
+    result = store.commit(
+        events=[Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude")],
+        task=_task(0, status=TaskStatus.WORKING),
+        actions=[Action(action_id="t1:1:0", kind=ActionKind.START_AGENT, task_id="t1")],
+    )
+    assert result.events == 1
+    assert result.task_written
+    assert result.actions == 1
+    assert store.list_events("t1")
+    assert store.list_actions("t1")
 
 
 def test_list_tasks_by_status(store: Store) -> None:
-    store.save_task(TaskRecord(task_id="a", status=TaskStatus.PENDING))
-    store.save_task(TaskRecord(task_id="b", status=TaskStatus.WORKING))
+    store.commit(task=TaskRecord(task_id="a", status=TaskStatus.PENDING))
+    store.commit(task=TaskRecord(task_id="b", status=TaskStatus.WORKING))
     pending = store.list_tasks_by_status(TaskStatus.PENDING)
     assert [task.task_id for task in pending] == ["a"]
 
@@ -124,7 +193,7 @@ def test_actions_record_and_update(store: Store) -> None:
     action = Action(
         action_id="t1:1:0", kind=ActionKind.MERGE, task_id="t1", detail="合并 PR", provider="github"
     )
-    store.record_action(action)
+    store.commit(actions=[action])
     assert store.unconfirmed_actions("t1") == [action]
 
     store.update_action_status("t1:1:0", ActionStatus.DONE)
@@ -134,17 +203,21 @@ def test_actions_record_and_update(store: Store) -> None:
 
 
 def test_events_can_be_filtered_by_task(store: Store) -> None:
-    store.append_event(Event(kind=EventKind.ASSIGN, task_id="a"))
-    store.append_event(Event(kind=EventKind.ASSIGN, task_id="b"))
+    store.commit(
+        events=[
+            Event(kind=EventKind.ASSIGN, task_id="a"),
+            Event(kind=EventKind.ASSIGN, task_id="b"),
+        ]
+    )
     assert len(store.list_events("a")) == 1
     assert len(store.list_events()) == 2
 
 
 def test_task_snapshot_keeps_state_version(store: Store) -> None:
-    store.save_task(TaskRecord(task_id="t1", state_version=3))
+    store.commit(task=_task(3))
     loaded = store.load_task("t1")
     assert loaded is not None
     assert loaded.state_version == 3
     updated = replace(loaded, state_version=4, status=TaskStatus.WORKING)
-    store.save_task(updated)
+    store.commit(task=updated, expected_version=3)
     assert store.load_task("t1") == updated

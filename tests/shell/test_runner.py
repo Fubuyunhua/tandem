@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -175,3 +176,61 @@ def test_quota_tracker_defaults_to_available() -> None:
     assert not tracker.snapshot().has_quota("codex")
     tracker.mark_available("codex")
     assert tracker.snapshot().has_quota("codex")
+
+
+def test_handle_commits_event_task_and_actions_once(tmp_path: Path) -> None:
+    """F7：一个事件只用一次事务写：事件 + 带预期旧版本的任务 + 待执行动作。"""
+    runner = make_runner(tmp_path, [code_receipt()])
+    runner.submit("t1", Level.C)
+    calls: list[dict[str, object]] = []
+    original = runner.store.commit
+
+    def spy(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    runner.store.commit = spy  # type: ignore[method-assign]
+    runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+
+    assert len(calls) == 1
+    assert calls[0]["expected_version"] == 0
+    events = calls[0]["events"]
+    actions = calls[0]["actions"]
+    assert isinstance(events, list) and len(events) == 1
+    assert isinstance(actions, list) and actions
+    assert calls[0]["task"] is not None
+
+
+def test_handle_persists_even_when_execution_fails(tmp_path: Path) -> None:
+    """F7：先保存再执行。执行阶段出事，事件和决定的记录不能丢。"""
+    from tandem.shell.agents.fake import FakeAgent
+
+    broken = FakeAgent(provider="claude", script=[])
+    runner = make_runner(tmp_path, agents={"claude": broken})
+    runner.submit("t1", Level.C)
+    result = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    assert result.executed[0].status is ActionStatus.UNKNOWN
+    assert "Agent 出错" in result.executed[0].message
+    task = runner.store.load_task("t1")
+    assert task is not None
+    assert task.status is TaskStatus.WORKING
+    assert len(runner.store.list_events("t1")) == 1
+
+
+def test_conflict_is_raised_when_snapshot_changed_underneath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F7：读到的旧版本被别人改过时，写入被拒绝（不能悄悄覆盖）。"""
+    from tandem.shell.store import ConflictError
+
+    runner = make_runner(tmp_path, [code_receipt()])
+    runner.submit("t1", Level.C)
+    stale = runner.store.load_task("t1")
+    assert stale is not None
+    runner.store.commit(
+        task=replace(stale, state_version=1, status=TaskStatus.CANCELLED),
+        expected_version=0,
+    )
+    monkeypatch.setattr(runner.store, "load_task", lambda task_id: stale)
+    with pytest.raises(ConflictError):
+        runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))

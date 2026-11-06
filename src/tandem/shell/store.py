@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -67,6 +69,19 @@ class StoreError(RuntimeError):
     """存储层发现了不该发生的事，比如版本号倒退。"""
 
 
+class ConflictError(StoreError):
+    """同一版本号被另一个处理者抢先改了（并发冲突）。"""
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    """一次事务写进去的东西。"""
+
+    events: int = 0
+    task_written: bool = False
+    actions: int = 0
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -98,17 +113,7 @@ class Store:
         """只追加，不修改。"""
         stamp = (now or _now()).isoformat()
         with self._connection:
-            self._connection.execute(
-                "INSERT INTO events (task_id, kind, state_version, payload, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (
-                    event.task_id,
-                    event.kind.name,
-                    event.state_version,
-                    serde.dumps(serde.event_to_dict(event)),
-                    stamp,
-                ),
-            )
+            self._insert_event(event, stamp)
 
     def list_events(self, task_id: str | None = None) -> list[Event]:
         if task_id is None:
@@ -121,34 +126,127 @@ class Store:
 
     # ------------------------------------------------------------ 任务
 
-    def save_task(self, task: TaskRecord, now: datetime | None = None) -> None:
-        """保存最新快照。状态版本号只允许往前走。"""
-        existing = self.load_task(task.task_id)
-        if existing is not None and task.state_version < existing.state_version:
-            raise StoreError(
-                f"任务 {task.task_id} 的版本号要从 {existing.state_version} 往前，"
-                f"不能退回 {task.state_version}"
-            )
+    def commit(
+        self,
+        *,
+        events: Sequence[Event] = (),
+        task: TaskRecord | None = None,
+        expected_version: int | None = None,
+        actions: Sequence[Action] = (),
+        now: datetime | None = None,
+    ) -> CommitResult:
+        """一个事务保存“事件 + 任务快照 + 待执行动作”。
+
+        ``expected_version`` 是写这次决定时读到的旧版本号：任务表用
+        ``UPDATE ... WHERE state_version = ?`` 更新，受影响行数为 0 就说明
+        有人抢先改过，抛 ``ConflictError``（同一版本号只接受内容完全相同的重放）。
+        事务提交以后才轮到外壳去执行副作用。
+        """
         stamp = (now or _now()).isoformat()
-        with self._connection:
+        with self._connection:  # 一个事务：要么全进去，要么全不进去
+            for event in events:
+                self._insert_event(event, stamp)
+            written = False
+            if task is not None:
+                self._write_task(task, expected_version, stamp)
+                written = True
+            for action in actions:
+                self._insert_action(action, stamp)
+        return CommitResult(events=len(events), task_written=written, actions=len(actions))
+
+    def _insert_event(self, event: Event, stamp: str) -> None:
+        self._connection.execute(
+            "INSERT INTO events (task_id, kind, state_version, payload, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                event.task_id,
+                event.kind.name,
+                event.state_version,
+                serde.dumps(serde.event_to_dict(event)),
+                stamp,
+            ),
+        )
+
+    def _insert_action(self, action: Action, stamp: str) -> None:
+        self._connection.execute(
+            "INSERT INTO actions"
+            " (action_id, task_id, kind, provider, detail, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(action_id) DO UPDATE SET status = excluded.status,"
+            "   updated_at = excluded.updated_at",
+            (
+                action.action_id,
+                action.task_id,
+                action.kind.name,
+                action.provider,
+                action.detail,
+                action.status.name,
+                stamp,
+                stamp,
+            ),
+        )
+
+    def _write_task(self, task: TaskRecord, expected_version: int | None, stamp: str) -> None:
+        payload = serde.dumps(serde.task_to_dict(task))
+        row = self._connection.execute(
+            "SELECT state_version, payload FROM tasks WHERE task_id = ?", (task.task_id,)
+        ).fetchone()
+        current_version = None if row is None else int(row["state_version"])
+        current_payload = None if row is None else str(row["payload"])
+
+        if expected_version is None:
+            if current_version is not None:
+                if current_payload == payload:  # 完全相同的重放
+                    return
+                raise ConflictError(f"任务 {task.task_id} 已经存在，不能重复创建")
             self._connection.execute(
                 "INSERT INTO tasks (task_id, state_version, status, level, payload, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(task_id) DO UPDATE SET"
-                "   state_version = excluded.state_version,"
-                "   status = excluded.status,"
-                "   level = excluded.level,"
-                "   payload = excluded.payload,"
-                "   updated_at = excluded.updated_at",
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     task.task_id,
                     task.state_version,
                     task.status.name,
                     task.level.name,
-                    serde.dumps(serde.task_to_dict(task)),
+                    payload,
                     stamp,
                 ),
             )
+            return
+
+        if current_version is None:
+            raise StoreError(f"任务 {task.task_id} 不存在，不能更新")
+        if task.state_version < current_version:
+            raise StoreError(
+                f"任务 {task.task_id} 的版本号不能从 {current_version} 退回 {task.state_version}"
+            )
+        if task.state_version == current_version:
+            # 同一版本号只接受内容完全相同的重放
+            if current_payload == payload:
+                return
+            raise ConflictError(
+                f"任务 {task.task_id} 在版本 {current_version} 上已经有另一份内容，拒绝覆盖"
+            )
+        if expected_version != current_version:
+            raise ConflictError(
+                f"任务 {task.task_id} 已经被另一个处理者改到版本 {current_version}，"
+                f"本次基于版本 {expected_version} 的写入被拒绝"
+            )
+        cursor = self._connection.execute(
+            "UPDATE tasks SET state_version = ?, status = ?, level = ?, payload = ?,"
+            " updated_at = ? WHERE task_id = ? AND state_version = ?",
+            (
+                task.state_version,
+                task.status.name,
+                task.level.name,
+                payload,
+                stamp,
+                task.task_id,
+                expected_version,
+            ),
+        )
+        if cursor.rowcount == 1:
+            return
+        raise ConflictError(f"任务 {task.task_id} 的更新没有生效（期望旧版本 {expected_version}）")
 
     def load_task(self, task_id: str) -> TaskRecord | None:
         row = self._connection.execute(
@@ -168,27 +266,10 @@ class Store:
     # ------------------------------------------------------------ 动作
 
     def record_action(self, action: Action, now: datetime | None = None) -> None:
-        """内核要求做的动作先记下来（默认"已发出"），再去执行。"""
+        """单独补记一个动作（正常路径是跟决定一起 commit）。"""
         stamp = (now or _now()).isoformat()
         with self._connection:
-            self._connection.execute(
-                "INSERT INTO actions"
-                " (action_id, task_id, kind, provider, detail, status, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(action_id) DO UPDATE SET"
-                "   status = excluded.status,"
-                "   updated_at = excluded.updated_at",
-                (
-                    action.action_id,
-                    action.task_id,
-                    action.kind.name,
-                    action.provider,
-                    action.detail,
-                    action.status.name,
-                    stamp,
-                    stamp,
-                ),
-            )
+            self._insert_action(action, stamp)
 
     def update_action_status(
         self, action_id: str, status: ActionStatus, now: datetime | None = None
