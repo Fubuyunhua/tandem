@@ -41,6 +41,7 @@ from tests.core.helpers import (
     to_ai_review,
     to_d_ai_review,
     to_error,
+    to_error_before_merge,
     to_merge_ready,
     to_merged,
     to_needs_intervention_by_ci,
@@ -1565,3 +1566,46 @@ def test_row_02_submitted_plan_text_survives_later_transitions() -> None:
     assert record.plan_text == "先加纯函数，再接外壳"
     assert record.plan_version == 1
     assert record.approved_plan_version == 1
+
+
+def test_row_26_retry_reissues_a_new_merge_action() -> None:
+    """核对结果是"没有动作完成"，出问题前在待合并：重新发一个合并动作（新编号）。"""
+    record = to_error_before_merge()
+    assert record.status is TaskStatus.ERROR
+    assert record.status_before_error is TaskStatus.AWAITING_MERGE
+    old_merge_ids = {
+        action.action_id for action in record.actions if action.kind is ActionKind.MERGE
+    }
+
+    decision = run(
+        record,
+        ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED, sha=record.latest_sha),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    issued = actions_of(decision, ActionKind.MERGE)
+    assert len(issued) == 1
+    assert issued[0].action_id not in old_merge_ids  # 新动作编号，不会和上一次撞
+    assert decision.task.approved_sha == decision.task.latest_sha
+    assert decision.task.status_before_error is None
+
+
+def test_row_26_retry_does_not_reissue_merge_without_a_current_approval() -> None:
+    """重新合并仍要过合并守卫：批准的不是当前提交，就不发合并动作，只说明原因。"""
+    from dataclasses import replace
+
+    record = to_error_before_merge()
+    stale = replace(record, approved_sha=SHA_2)
+    decision = run(stale, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    assert not actions_of(decision, ActionKind.MERGE)
+    assert "批准的提交编号" in decision.reason
+
+
+def test_row_26_retry_does_not_reissue_merge_when_ci_is_red() -> None:
+    from dataclasses import replace
+
+    record = to_error_before_merge()
+    red = replace(record, ci_green=False)
+    decision = run(red, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    assert not actions_of(decision, ActionKind.MERGE)
+    assert "CI" in decision.reason

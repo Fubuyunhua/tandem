@@ -9,6 +9,7 @@ from typing import Any
 from tandem.core.model import (
     Action,
     ActionKind,
+    ActionStatus,
     ChangeSet,
     Decision,
     Event,
@@ -258,3 +259,31 @@ class Walker:
         for decision in self.decisions:
             found.extend(actions_of(decision, kind))
         return found
+
+
+def to_error_before_merge(task: TaskRecord | None = None) -> TaskRecord:
+    """在"待合并"时出意外：approved_sha 齐、CI 绿，但合并动作结果未知。"""
+    record = to_merge_ready() if task is None else task
+    assert record.status is TaskStatus.AWAITING_MERGE
+    return run(record, ev(EventKind.INCIDENT, reason="合并请求超时", error_code="G01")).task
+
+
+def cancelled_with_unconfirmed_cleanup() -> tuple[TaskRecord, str]:
+    """取消一个开过 PR 的任务，然后让关 PR 的清理动作停在"结果未知"。
+
+    返回（任务记录, 那个 CLOSE_PR 动作的编号）。
+    """
+    record = to_acceptance(to_working(new_task()))
+    cancelled = run(record, ev(EventKind.CANCEL)).task
+    assert cancelled.status is TaskStatus.CANCELLED
+    cleanup = next(action for action in cancelled.actions if action.kind is ActionKind.CLOSE_PR)
+    stale = replace(
+        cancelled,
+        actions=tuple(
+            replace(action, status=ActionStatus.UNKNOWN)
+            if action.action_id == cleanup.action_id
+            else action
+            for action in cancelled.actions
+        ),
+    )
+    return stale, cleanup.action_id

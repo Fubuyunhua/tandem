@@ -304,7 +304,7 @@ def _dispatch(
         case EventKind.ABANDON:
             return _on_abandon(task, event)
         case EventKind.RETRY:
-            return _on_retry(task, event)
+            return _on_retry(task, event, policy)
         case EventKind.CANCEL:
             return _on_cancel(task)
         case _:  # pragma: no cover - 新增事件类型时 pyright 会在这里报错
@@ -1102,7 +1102,7 @@ def _on_abandon(task: TaskRecord, event: Event) -> Decision:
 # ---------------------------------------------------------------- 第 26–27 条
 
 
-def _on_retry(task: TaskRecord, event: Event) -> Decision:
+def _on_retry(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """26. 异常 → 核对后的状态：外壳先去外部核对，再决定回到哪里。"""
     if task.status is not TaskStatus.ERROR:
         return _ignore(task, "只有异常的任务才会重试")
@@ -1151,6 +1151,34 @@ def _on_retry(task: TaskRecord, event: Event) -> Decision:
                         detail=f"重新请 {reviewer} 审核提交 {task.latest_sha}",
                         provider=reviewer,
                     )
+            if target is TaskStatus.AWAITING_MERGE:
+                # 合并请求没被确认：重新发一个合并动作（动作编号跟着新的版本号走，
+                # 和上一次不同）。仍受合并守卫约束：批准的必须是当前提交、CI 必须绿。
+                # 重试的是既有授权，不是新证据，所以不再核对审核席位（human=True）。
+                blockers = merge_blocker(task, policy, human=True)
+                if blockers:
+                    message = "；".join(blockers)
+                    actions.add(ActionKind.NOTIFY, detail=f"不能重新合并：{message}")
+                    return _transition(
+                        task,
+                        TaskStatus.AWAITING_MERGE,
+                        f"核对后确认合并没有完成，但暂时不能重发合并：{message}",
+                        actions.items,
+                        status_before_error=None,
+                        error_code=None,
+                    )
+                actions.add(
+                    ActionKind.MERGE,
+                    detail=f"核对后确认没有合并成功，重新请求合并 {task.approved_sha}",
+                )
+                return _transition(
+                    task,
+                    TaskStatus.AWAITING_MERGE,
+                    "核对后确认合并没有完成，已重新发出合并请求",
+                    actions.items,
+                    status_before_error=None,
+                    error_code=None,
+                )
             return _transition(
                 task,
                 target,
