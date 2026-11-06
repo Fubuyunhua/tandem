@@ -2,7 +2,8 @@
 
 子命令：
 - ``tandem demo``：用临时数据库和假 Agent 跑两个场景，打印状态路径；
-- ``tandem status``：列出任务和当前状态；
+- ``tandem status`` / ``show``：列出任务或查看完整记录；
+- ``tandem run``：只用假证据驱动本地任务；
 - ``tandem submit`` / ``approve`` / ``reject`` / ``cancel``：对任务做相应操作。
 """
 
@@ -38,6 +39,7 @@ from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.config import load_policy
 from tandem.shell.diff_source import DiffSource, FakeDiffSource, GitDiffSource
 from tandem.shell.executor import Executor
+from tandem.shell.local_run import LocalRun
 from tandem.shell.receipt import Receipt, parse_receipt, render_receipt
 from tandem.shell.runner import Runner, RunnerError
 from tandem.shell.store import Store
@@ -192,6 +194,26 @@ def cmd_submit(args: argparse.Namespace) -> int:
     except RunnerError as error:
         print(f"提交失败：{error}")
         return 1
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------- run
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    policy = load_policy()
+    agents = {provider: FakeAgent(provider=provider) for provider in policy.writer_providers}
+    changes = ChangeSet(
+        paths=tuple(path.strip() for path in args.changes.split(",") if path.strip())
+    )
+    store, runner = _open(
+        _db_path(args), agents=agents, policy=policy, diff_source=FakeDiffSource(changes=changes)
+    )
+    try:
+        return LocalRun(runner, agents, args.agent_script, args.review).run(
+            until_idle=args.until_idle, max_rounds=args.max_rounds
+        )
     finally:
         store.close()
 
@@ -445,6 +467,13 @@ def cmd_demo(_args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- 入口
 
 
+def _positive_rounds(value: str) -> int:
+    rounds = int(value)
+    if rounds < 1:
+        raise argparse.ArgumentTypeError("最大轮数必须大于 0")
+    return rounds
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tandem", description="个人 AI 开发循环系统")
     common = argparse.ArgumentParser(add_help=False)
@@ -454,6 +483,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("demo", parents=[common], help="用临时数据库和假 Agent 跑两个场景")
 
     subparsers.add_parser("status", parents=[common], help="列出任务和当前状态")
+
+    run = subparsers.add_parser("run", parents=[common], help="用假证据推进一轮本地任务")
+    run.add_argument("--agent-script", choices=("ok", "ci-red", "refuse"), default="ok")
+    run.add_argument("--changes", default="src/x.py", help="模拟改动路径，逗号分隔（每轮重算等级）")
+    run.add_argument("--review", choices=("pass", "fail"), default="pass", help="模拟 AI 审核结论")
+    run.add_argument("--until-idle", action="store_true", help="重复运行直到需要人工处理或无进展")
+    run.add_argument(
+        "--max-rounds", type=_positive_rounds, default=10, help="最多运行几轮，默认 10"
+    )
 
     show = subparsers.add_parser("show", parents=[common], help="查看完整任务记录和历史事件")
     show.add_argument("task_id", help="任务编号")
@@ -503,6 +541,7 @@ COMMANDS = {
     "demo": cmd_demo,
     "status": cmd_status,
     "show": cmd_show,
+    "run": cmd_run,
     "submit": cmd_submit,
     "approve": cmd_approve,
     "reject": cmd_reject,
