@@ -23,6 +23,7 @@ from tandem.core.model import (
     Finding,
     Level,
     OpenFinding,
+    PlanEntry,
     Review,
     RevisionCount,
     RunMode,
@@ -156,6 +157,19 @@ def finding_from_dict(data: object) -> Finding:
     )
 
 
+def plan_entry_to_dict(entry: PlanEntry) -> dict[str, object]:
+    return {"version": entry.version, "sha": entry.sha, "text": entry.text}
+
+
+def plan_entry_from_dict(data: object) -> PlanEntry:
+    mapping = _mapping(data, "plan_entry")
+    return PlanEntry(
+        version=_int(mapping.get("version"), "plan_entry.version"),
+        sha=_str(mapping.get("sha", ""), "plan_entry.sha"),
+        text=_str(mapping.get("text", ""), "plan_entry.text"),
+    )
+
+
 def open_finding_to_dict(finding: OpenFinding) -> dict[str, object]:
     return {
         "key": finding.key,
@@ -260,6 +274,8 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "error_code": task.error_code,
         "plan_version": task.plan_version,
         "approved_plan_version": task.approved_plan_version,
+        "plan_history": [plan_entry_to_dict(entry) for entry in task.plan_history],
+        "plan_text": task.plan_text,
         "writer": task.writer,
         "writer_is_human": task.writer_is_human,
         "providers_involved": sorted(task.providers_involved),
@@ -322,6 +338,10 @@ def task_from_dict(data: object) -> TaskRecord:
         error_code=_optional_str(mapping, "error_code"),
         plan_version=_int(mapping.get("plan_version"), "plan_version"),
         approved_plan_version=_optional_int(mapping, "approved_plan_version"),
+        plan_history=tuple(
+            plan_entry_from_dict(entry)
+            for entry in _list(mapping.get("plan_history", []), "plan_history")
+        ),
         writer=_optional_str(mapping, "writer"),
         writer_is_human=_bool(mapping.get("writer_is_human"), "writer_is_human"),
         providers_involved=frozenset(

@@ -271,3 +271,27 @@ def test_open_findings_survive_a_store_roundtrip(store: Store) -> None:
     loaded = store.load_task("t1")
     assert loaded is not None
     assert loaded.open_findings == (finding,)
+
+
+def test_plan_history_survives_a_store_roundtrip(store: Store) -> None:
+    """方案正文要能存下来：note 会被后续转换改掉，方案不能跟着没。"""
+    from tandem.core.model import PlanEntry
+
+    task = _task(
+        2,
+        plan_version=1,
+        approved_plan_version=None,
+        plan_history=(
+            PlanEntry(
+                version=1, sha="c" * 40, text="第 1 版方案：没有文字方案，内容就是提交的改动"
+            ),
+        ),
+        note="后来的原因把 note 覆盖了",
+    )
+    store.commit(task=task)
+    loaded = store.load_task("t1")
+    assert loaded is not None
+    assert loaded.plan_history == task.plan_history
+    assert loaded.plan_text.startswith("第 1 版方案")
+    assert loaded.plan(1) is not None
+    assert loaded.plan(2) is None

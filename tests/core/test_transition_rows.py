@@ -1497,3 +1497,71 @@ def test_any_transition_that_changes_the_sha_drops_stale_evidence() -> None:
     assert decision.task.approved_sha is None
     assert decision.task.reviews == ()
     assert decision.task.designated_reviewers == ()
+
+
+# ------------------------------------------------- 5b 的方案要有内容，并绑定这次提交
+
+SHA_5B = "c3" + "0" * 38
+
+
+def _escalated_to_d_by_real_changes() -> TaskRecord:
+    """C 级任务实际改了 core：第 5b 条重新分级成 D，进"待你批准方案"。"""
+    record = to_working(new_task(Level.C))
+    return run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_5B, changes=CORE_CHANGES),
+    ).task
+
+
+def test_row_05b_plan_records_what_you_are_approving() -> None:
+    """5b 没有文字方案：任务记录里要写清"内容就是这次提交的改动"，并带上底线原因。"""
+    record = _escalated_to_d_by_real_changes()
+    assert record.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert record.plan_version == 1
+
+    entry = record.plan()
+    assert entry is not None
+    assert entry.version == 1
+    assert entry.sha == SHA_5B  # 方案绑定这次交回的提交编号
+    assert record.plan_text == entry.text
+    assert "第 1 版方案" in entry.text
+    assert "没有文字方案" in entry.text
+    assert SHA_5B in entry.text
+    # 底线原因要说清是哪个文件、哪一条
+    assert "src/tandem/core/model.py" in entry.text
+    assert "底线" in entry.text
+
+
+def test_row_03_plan_approval_must_bind_the_plan_sha() -> None:
+    """5b 场景下批准方案也要带提交编号，且必须和这版方案绑定的一致。"""
+    record = _escalated_to_d_by_real_changes()
+
+    missing = run(record, ev(EventKind.PLAN_APPROVED))
+    assert missing.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "提交编号" in missing.reason
+
+    wrong = run(record, ev(EventKind.PLAN_APPROVED, sha=SHA_2))
+    assert wrong.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert not wrong.changed
+
+    matched = run(record, ev(EventKind.PLAN_APPROVED, sha=SHA_5B))
+    assert matched.task.status is TaskStatus.PENDING
+    assert matched.task.approved_plan_version == 1
+
+
+def test_row_02_submitted_plan_text_survives_later_transitions() -> None:
+    """PLAN_SUBMITTED 的正文要存进任务记录，之后不再被 note 覆盖。"""
+    record = to_working(new_task(Level.D))
+    record = run(
+        record,
+        ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="先加纯函数，再接外壳"),
+    ).task
+    assert record.plan_text == "先加纯函数，再接外壳"
+
+    record = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-a")).task
+    record = to_working(record)
+    record = to_acceptance(record, sha=SHA_1, changes=CORE_CHANGES)
+    # note 会被后面的转换改掉，方案正文不能跟着没
+    assert record.plan_text == "先加纯函数，再接外壳"
+    assert record.plan_version == 1
+    assert record.approved_plan_version == 1

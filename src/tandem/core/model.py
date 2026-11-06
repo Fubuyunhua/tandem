@@ -310,6 +310,20 @@ class Action:
 
 
 @dataclass(frozen=True)
+class PlanEntry:
+    """一版方案：版本号、绑定的提交编号、正文。
+
+    ``sha`` 是这版方案对应的提交编号。正常提交方案时是方案回执里的编号；
+    第 5b 条（C 级按真实改动升成 D）没有文字方案，这时 ``sha`` 是那次交回的
+    代码提交，``text`` 会写清"内容就是这次提交的改动"，让批准的人知道自己批了什么。
+    """
+
+    version: int
+    sha: str
+    text: str
+
+
+@dataclass(frozen=True)
 class RevisionCount:
     """修改次数按审核标准版本分开计算，保留历史（第 22、23 条）。"""
 
@@ -334,6 +348,8 @@ class TaskRecord:
     # 方案版本、批准的是哪一版（第 2、3、4、5b 条）
     plan_version: int = 0
     approved_plan_version: int | None = None
+    # 每一版方案的正文和绑定提交编号，只追加；note 会被后续转换改掉，方案正文不能跟着没
+    plan_history: tuple[PlanEntry, ...] = ()
 
     # 写手（提供方名），以及写手是不是你（第 6、14、14b 条）
     writer: str | None = None
@@ -380,6 +396,20 @@ class TaskRecord:
 
     # 最后一次做决定的时间，由外壳作为参数传进来
     updated_at: datetime | None = None
+
+    def plan(self, version: int | None = None) -> PlanEntry | None:
+        """取某一版方案（默认当前这版）。"""
+        target = self.plan_version if version is None else version
+        for entry in self.plan_history:
+            if entry.version == target:
+                return entry
+        return None
+
+    @property
+    def plan_text(self) -> str:
+        """当前这版方案的正文（没有就是空串）。"""
+        entry = self.plan()
+        return "" if entry is None else entry.text
 
     def revision_count(self, standard_version: int) -> int:
         """当前审核标准版本下已经改过几次。"""

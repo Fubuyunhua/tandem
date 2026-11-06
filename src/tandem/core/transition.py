@@ -16,7 +16,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import assert_never
 
-from tandem.core.level import compute_level
+from tandem.core.level import bottom_line_reasons, compute_level
 from tandem.core.model import (
     Action,
     ActionKind,
@@ -27,6 +27,7 @@ from tandem.core.model import (
     Finding,
     Level,
     OpenFinding,
+    PlanEntry,
     Policy,
     QuotaSnapshot,
     Review,
@@ -360,12 +361,18 @@ def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     actions.add(
         ActionKind.NOTIFY, detail=f"{task.level.value} 级需要你先批准第 {plan_version} 版方案"
     )
+    entry = PlanEntry(
+        version=plan_version,
+        sha=event.sha or "",
+        text=event.plan or "",
+    )
     return _transition(
         task,
         TaskStatus.AWAITING_PLAN_APPROVAL,
         f"交回第 {plan_version} 版方案，等你批准",
         actions.items,
         plan_version=plan_version,
+        plan_history=task.plan_history + (entry,),
         latest_sha=event.sha if event.sha is not None else task.latest_sha,
         note=event.plan or task.note,
     )
@@ -375,8 +382,13 @@ def _on_plan_approved(task: TaskRecord, event: Event) -> Decision:
     """3. 待你批准方案 → 待处理：记下批准的是哪一版方案。"""
     if task.status is not TaskStatus.AWAITING_PLAN_APPROVAL:
         return _ignore(task, "只有待你批准方案的任务才会批准方案")
-    if event.sha is not None and task.latest_sha is not None and event.sha != task.latest_sha:
-        return _ignore(task, "你批准的是另一版方案：提交编号和当前的不一致")
+    entry = task.plan()
+    expected_sha = entry.sha if entry is not None and entry.sha else (task.latest_sha or "")
+    if expected_sha and (event.sha is None or event.sha != expected_sha):
+        return _ignore(
+            task,
+            f"你批准方案要带上你看到的那一版方案的提交编号（{expected_sha}），对不上就不生效",
+        )
     actions = _Actions(task, task.state_version + 1)
     # 写手是你时，批准完方案回到"你处理中"，你可以接着提交自己已经写好的代码；
     # 写手是 Agent 时回到"待处理"，等重新派活。
@@ -444,6 +456,17 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
 
     if plan_pending:
         plan_version = task.plan_version + 1
+        # 5b 没有文字方案：把这次交回的代码当作本版方案的内容，
+        # 写清提交编号和命中的底线条目，免得你"批准一个不存在的方案"。
+        reasons = "；".join(bottom_line_reasons(event.changes, policy)) or "无"
+        entry = PlanEntry(
+            version=plan_version,
+            sha=event.sha,
+            text=(
+                f"第 {plan_version} 版方案：没有文字方案，内容就是提交 {event.sha} 的改动，"
+                f"涉及的底线：{reasons}"
+            ),
+        )
         actions.add(ActionKind.NOTIFY, detail="按真实改动算出 D 级，要先批准方案")
         return _transition(
             task,
@@ -451,12 +474,13 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
             f"按真实改动重新算出来是 {new_level.value} 级，方案还没批准",
             actions.items,
             level=new_level,
+            plan_version=plan_version,
+            plan_history=task.plan_history + (entry,),
             latest_sha=event.sha,
             approved_sha=None,
             reviews=(),
             designated_reviewers=(),
             ci_green=False,
-            plan_version=plan_version,
             returned_from_review=False,
         )
 
