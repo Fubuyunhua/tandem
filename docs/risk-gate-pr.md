@@ -74,8 +74,9 @@ JSON 可供同一 job 的后续步骤读取，Markdown 会写入 job summary。
 ## 验证
 
 每次提交前均离线执行 `uv run ruff check`、`uv run ruff format --check`、
-`uv run pyright`、`uv run pytest`；额外显式检查脚本的类型，
-因为项目当前 pyright 默认范围只有 `src` 和 `tests`。
+`uv run pyright`、`uv run pytest`。
+J4 已把 `scripts` 加入 pyright 默认检查范围，与 `src`、`tests` 一起由 CI 检查；
+ruff 的默认文件发现原本就覆盖 `scripts/`，无需另加路径或改掉现有排除规则。
 新增测试使用真实临时 Git 仓库，通过子进程断言标准输出、JSON、摘要和退出码，
 覆盖任务书要求及 PR 默认输入、错误输入、分叉历史和上述既有边界。
 J1 回归覆盖“head 删空底线并改受保护路径仍判 D”、base 规则缺失/损坏拒绝放行，
