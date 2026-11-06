@@ -1,9 +1,10 @@
 """Generated event traces and independent invariant oracles.
 
 TANDEM_INVARIANTS_DEEP=1: 1000 traces of up to 200 events (CI: 80 x 40).
-No network, shell execution, or real agents are used. Known specification conflicts
-are isolated in strict xfail regressions below; ordinary traces check the policy's
-A/B review counts and the normal D review route as well.
+No network, shell execution, or real agents are used. Review counts follow each
+level's policy. D assignments may request a plan; code needs plan approval and
+merging needs human approval bound to the current SHA. The old baseline's plan
+SHA/CI defect remains a strict xfail (fixed upstream in 4310a82).
 """
 
 from __future__ import annotations
@@ -79,7 +80,7 @@ def check_separation(task: TaskRecord) -> None:
             assert review.provider not in task.providers_involved, "separation"
 
 
-def check_review_count(task: TaskRecord, policy: Policy, human: bool, *, strict: bool) -> None:
+def check_review_count(task: TaskRecord, policy: Policy, human: bool) -> None:
     if task.status is not TaskStatus.AWAITING_MERGE or human:
         return
     if task.run_mode is RunMode.SINGLE_AGENT or task.level is Level.D:
@@ -92,11 +93,7 @@ def check_review_count(task: TaskRecord, policy: Policy, human: bool, *, strict:
         and review.standard_version == task.standard_version
         and review.provider not in task.providers_involved
     }
-    needed = (
-        policy.thresholds.required_reviewers
-        if strict
-        else policy.rule_for(task.level).min_reviewers
-    )
+    needed = policy.rule_for(task.level).min_reviewers
     assert len(providers) >= needed, "review_count"
 
 
@@ -113,15 +110,40 @@ def check_version(before: TaskRecord, decision: Decision) -> None:
         assert not decision.actions, "version: ignored actions"
 
 
-def check_d(before: TaskRecord, decision: Decision, seen_your_review: bool) -> None:
+def check_d(before: TaskRecord, decision: Decision, human_sha: str | None) -> None:
     after = decision.task
     if after.level is not Level.D:
         return
-    if after.status is TaskStatus.AWAITING_ACCEPTANCE and decision.changed:
+    if after.status in (
+        TaskStatus.AWAITING_ACCEPTANCE,
+        TaskStatus.AWAITING_AI_REVIEW,
+        TaskStatus.AWAITING_MERGE,
+    ):
         assert after.approved_plan_version is not None, "d: no approved plan"
         assert after.approved_plan_version == after.plan_version, "d: stale plan"
     if after.status is TaskStatus.AWAITING_MERGE:
-        assert seen_your_review, "d: skipped your review"
+        assert human_sha is not None and human_sha == after.latest_sha, (
+            "d: no current human approval"
+        )
+
+
+def human_approval_sha(
+    before: TaskRecord,
+    ev: Event,
+    decision: Decision,
+    previous: str | None = None,
+) -> str | None:
+    """Track actual input approval events, independently of approved_sha output."""
+    if decision.task.latest_sha != before.latest_sha:
+        previous = None
+    if (
+        decision.changed
+        and ev.kind in (EventKind.YOUR_APPROVAL, EventKind.INTERVENTION_APPROVED)
+        and ev.sha is not None
+        and ev.sha == before.latest_sha
+    ):
+        return ev.sha
+    return previous
 
 
 def check_fresh(before: TaskRecord, decision: Decision) -> None:
@@ -190,8 +212,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
     policy = make_policy(mode, required)
     task = core.create_task("trace", level, policy)
     green_sha: str | None = None
-    seen_your_review = False
-    human = False
+    human_sha: str | None = None
     # Guarantee useful progress in every example, then interleave arbitrary events.
     instructions = [(0, EventKind.CREATED, 0)] * prefix + instructions
     for choice, kind, value in instructions:
@@ -233,23 +254,20 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
             green_sha = ev.sha
         if decision.task.latest_sha != before.latest_sha:
             green_sha = None
-            seen_your_review = False
-            human = False
+            human_sha = None
         if decision.changed and ev.kind is EventKind.CI_RED:
             green_sha = None
-        seen_your_review |= decision.task.status is TaskStatus.AWAITING_YOUR_REVIEW
-        human |= decision.changed and ev.kind in (
-            EventKind.YOUR_APPROVAL,
-            EventKind.INTERVENTION_APPROVED,
-        )
+        human_sha = human_approval_sha(before, ev, decision, human_sha)
         check_ci(before, decision, green_sha)
         check_separation(decision.task)
-        check_review_count(decision.task, policy, human, strict=False)
+        check_review_count(
+            decision.task,
+            policy,
+            human_sha is not None and human_sha == decision.task.latest_sha,
+        )
         check_terminal(before, decision)
         check_version(before, decision)
-        # Known D intervention bypass is asserted without exemption in its xfail below.
-        if not (human and ev.kind is EventKind.INTERVENTION_APPROVED):
-            check_d(before, decision, seen_your_review)
+        check_d(before, decision, human_sha)
         check_fresh(before, decision)
         task = decision.task
 
@@ -265,25 +283,27 @@ def walk(level: Level, kinds: list[EventKind], policy: Policy | None = None) -> 
 
 
 @pytest.mark.parametrize("level", [Level.A, Level.B])
-@pytest.mark.xfail(strict=True, reason="task-006 requires >=2; ADR/policy allows A=0, B=1")
-def test_regression_all_non_d_levels_need_required_reviewers(level: Level) -> None:
+def test_a_b_review_counts_follow_policy(level: Level) -> None:
     kinds = [EventKind.ASSIGN, EventKind.CODE_SUBMITTED, EventKind.CI_GREEN]
     if level is Level.B:
         kinds.append(EventKind.REVIEW)
     task = walk(level, kinds)
     assert task.status is TaskStatus.AWAITING_MERGE
-    check_review_count(task, make_policy(), False, strict=True)
+    check_review_count(task, make_policy(), False)
+    assert len(task.reviews) == (0 if level is Level.A else 1)
 
 
-@pytest.mark.xfail(strict=True, reason="D assignment starts an agent before plan approval")
-def test_regression_d_cannot_start_work_before_plan_approval() -> None:
+def test_d_assignment_requests_plan_but_code_stays_gated() -> None:
     task = walk(Level.D, [EventKind.ASSIGN])
     assert task.status is TaskStatus.WORKING
-    assert task.approved_plan_version == task.plan_version
+    assert task.approved_plan_version is None
+    decision = core.decide(task, advance(task), make_policy(), QuotaSnapshot(), NOW)
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    check_d(task, decision, None)
 
 
-@pytest.mark.xfail(strict=True, reason="D intervention approval bypasses AWAITING_YOUR_REVIEW")
-def test_regression_d_intervention_cannot_skip_your_review() -> None:
+@pytest.mark.parametrize("sha", ["s0", "stale", None])
+def test_d_intervention_approval_requires_current_sha(sha: str | None) -> None:
     policy = make_policy()
     task = walk(
         Level.D,
@@ -306,13 +326,17 @@ def test_regression_d_intervention_cannot_skip_your_review() -> None:
     assert task.status is TaskStatus.NEEDS_INTERVENTION
     decision = core.decide(
         task,
-        event(task, EventKind.INTERVENTION_APPROVED, sha=task.latest_sha),
+        event(task, EventKind.INTERVENTION_APPROVED, sha=sha),
         policy,
         QuotaSnapshot(),
         NOW,
     )
-    assert decision.task.status is TaskStatus.AWAITING_MERGE
-    check_d(task, decision, False)
+    ev = event(task, EventKind.INTERVENTION_APPROVED, sha=sha)
+    if sha == task.latest_sha:
+        assert decision.task.status is TaskStatus.AWAITING_MERGE
+    else:
+        assert not decision.changed and decision.task == task
+    check_d(task, decision, human_approval_sha(task, ev, decision))
 
 
 @pytest.mark.xfail(strict=True, reason="PLAN_SUBMITTED changes SHA without invalidating CI")
@@ -405,13 +429,13 @@ def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invarian
         elif invariant == "separation":
             check_separation(decision.task)
         elif invariant == "review_count":
-            check_review_count(decision.task, policy, False, strict=True)
+            check_review_count(decision.task, policy, False)
         elif invariant == "terminal":
             check_terminal(task, decision)
         elif invariant == "version":
             check_version(task, decision)
         elif invariant == "d":
-            check_d(task, decision, False)
+            check_d(task, decision, None)
         elif invariant == "fresh":
             check_fresh(task, decision)
 
@@ -433,11 +457,14 @@ def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invarian
         monkeypatch.setattr(core, "_on_review", accept_writer)
     elif invariant == "review_count":
 
-        def one_vote(self, level):
-            return replace(original_rule(self, level), min_reviewers=1)
+        def one_vote(task, ev, policy):
+            weakened = replace(
+                policy, level_rules=(replace(policy.rule_for(task.level), min_reviewers=1),)
+            )
+            return original_review(task, ev, weakened)
 
-        # Also select only one seat, matching an erroneous one-provider quorum.
-        monkeypatch.setattr(Policy, "rule_for", one_vote)
+        # Weaken the kernel's quorum, leaving the oracle's input policy intact.
+        monkeypatch.setattr(core, "_on_review", one_vote)
     elif invariant == "terminal":
 
         def reopen(task, ev, policy, quota):
@@ -569,7 +596,7 @@ def test_new_commit_requires_all_reviewers_again(required, old, suffix) -> None:
             NOW,
         )
         check_ci(task, decision, new)
-        check_review_count(decision.task, policy, False, strict=True)
+        check_review_count(decision.task, policy, False)
         check_separation(decision.task)
         check_version(task, decision)
         task = decision.task
@@ -599,7 +626,7 @@ def test_d_review_route_mutant_cannot_skip_human(monkeypatch: pytest.MonkeyPatch
     ).task
     ev = event(task, EventKind.REVIEW, review=passing(task, "r2"))
     baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
-    check_d(task, baseline, True)
+    check_d(task, baseline, None)
     assert baseline.task.status is TaskStatus.AWAITING_YOUR_REVIEW
     original = Policy.rule_for
 
@@ -608,5 +635,81 @@ def test_d_review_route_mutant_cannot_skip_human(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(Policy, "rule_for", no_human)
     decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
-    with pytest.raises(AssertionError, match="d: skipped your review"):
-        check_d(task, decision, False)
+    with pytest.raises(AssertionError, match="d: no current human approval"):
+        check_d(task, decision, None)
+
+
+@pytest.mark.parametrize("sha", ["stale", None])
+def test_d_intervention_sha_guard_mutant_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+    sha: str | None,
+) -> None:
+    policy = make_policy()
+    task = walk(
+        Level.D,
+        [
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.PLAN_APPROVED,
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.CI_GREEN,
+        ],
+    )
+    task = core.decide(
+        task, event(task, EventKind.QUOTA_EXHAUSTED, provider="r1"), policy, QuotaSnapshot(), NOW
+    ).task
+    assert task.status is TaskStatus.NEEDS_INTERVENTION
+    ev = event(task, EventKind.INTERVENTION_APPROVED, sha=sha)
+    baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert not baseline.changed and baseline.task == task
+    check_d(task, baseline, human_approval_sha(task, ev, baseline))
+    original = core._on_intervention_approved
+
+    def ignore_approval_sha(task, ev, policy):
+        # Model removing the SHA check: accept the request as if it named current SHA.
+        return original(task, replace(ev, sha=task.latest_sha), policy)
+
+    monkeypatch.setattr(core, "_on_intervention_approved", ignore_approval_sha)
+    decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    with pytest.raises(AssertionError, match="d: no current human approval"):
+        check_d(task, decision, human_approval_sha(task, ev, decision))
+
+
+@TRACE_SETTINGS
+@given(
+    mode=st.sampled_from(list(RunMode)),
+    attempt=st.integers(0, 5),
+    sha=st.text(min_size=1, max_size=20),
+)
+def test_unapproved_d_code_receipts_cannot_advance(mode, attempt, sha) -> None:
+    policy = make_policy(mode)
+    agent = walk(Level.D, [EventKind.ASSIGN], policy)
+    # Reach human takeover through a real quota/CI intervention, then upgrade to D.
+    human = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED], policy)
+    for _ in range(3):
+        human = core.decide(
+            human,
+            event(human, EventKind.CI_RED, sha=human.latest_sha),
+            policy,
+            QuotaSnapshot(),
+            NOW,
+        ).task
+        if human.status is TaskStatus.PENDING:
+            human = core.decide(human, advance(human), policy, QuotaSnapshot(), NOW).task
+            human = core.decide(human, advance(human), policy, QuotaSnapshot(), NOW).task
+    human = core.decide(human, event(human, EventKind.TAKE_OVER), policy, QuotaSnapshot(), NOW).task
+    assert human.status is TaskStatus.YOU_WORKING
+    for task in (agent, human):
+        for kind in (EventKind.CODE_SUBMITTED, EventKind.YOU_SUBMITTED_CODE):
+            ev = event(
+                task, kind, sha=sha, attempt=attempt, changes=ChangeSet(paths=("core/a.py",))
+            )
+            decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+            assert decision.task.status not in (
+                TaskStatus.AWAITING_ACCEPTANCE,
+                TaskStatus.AWAITING_AI_REVIEW,
+                TaskStatus.AWAITING_MERGE,
+            )
+            check_d(task, decision, None)
