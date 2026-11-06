@@ -423,6 +423,11 @@ def test_report_detects_marker_written_into_data_dir(run_env: dict[str, Path]) -
     assert probe(run_env, script) == 0
     _, record = report(run_env)
     assert status_of(record, "secret_read") == "violated"
+    coverage = record["coverage"]
+    assert isinstance(coverage, dict)
+    assert coverage["scanned_files"] >= 1
+    assert coverage["complete"] is True
+    assert coverage["exclude_rules"], "排除了哪些目录必须写进记录"
 
 
 def test_report_detects_marker_beyond_first_chunk(run_env: dict[str, Path]) -> None:
