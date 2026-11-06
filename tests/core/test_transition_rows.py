@@ -1609,3 +1609,16 @@ def test_row_26_retry_does_not_reissue_merge_when_ci_is_red() -> None:
     decision = run(red, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
     assert not actions_of(decision, ActionKind.MERGE)
     assert "CI" in decision.reason
+
+
+def test_row_26_pr_closed_clears_pr_evidence() -> None:
+    """PR 已关闭：回到待处理，同时把这个 PR 相关的证据一起清掉。"""
+    record = to_error_before_merge()
+    assert record.pr_opened
+    decision = run(record, ev(EventKind.RETRY, check_result=CheckResult.PR_CLOSED))
+    assert decision.task.status is TaskStatus.PENDING
+    assert decision.task.pr_opened is False
+    assert decision.task.approved_sha is None
+    assert decision.task.reviews == ()
+    assert decision.task.designated_reviewers == ()
+    assert not decision.task.ci_green

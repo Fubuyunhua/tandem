@@ -75,6 +75,23 @@ def _ignore(task: TaskRecord, why: str) -> Decision:
     return Decision(task=task, actions=[], reason=why, changed=False)
 
 
+def _forget_pr_evidence() -> dict[str, object]:
+    """PR 已关闭（不会再合并）时，挂在那个 PR 上的证据一起作废。
+
+    和 ``_drop_stale_evidence`` 是一个思路，只是触发条件不是"换了提交编号"，
+    而是"这个 PR 不存在了"：CI 绿、你批准的提交、这一轮的审核结论、审核席位、
+    pr_opened 都不能留给下一个 PR 复用。``latest_sha`` 保留——提交本身还在。
+    """
+    return {
+        "pr_opened": False,
+        "ci_green": False,
+        "approved_sha": None,
+        "reviews": (),
+        "designated_reviewers": (),
+        "returned_from_review": False,
+    }
+
+
 def _drop_stale_evidence(task: TaskRecord, changes: dict[str, object]) -> dict[str, object]:
     """换提交编号时，旧提交的证据一律作废。
 
@@ -1127,12 +1144,11 @@ def _on_retry(task: TaskRecord, event: Event, policy: Policy) -> Decision:
             return _transition(
                 task,
                 TaskStatus.PENDING,
-                "核对后确认 PR 已被关闭，回到待处理",
+                "核对后确认 PR 已被关闭，回到待处理（这个 PR 的证据全部作废）",
                 actions.items,
                 status_before_error=None,
                 error_code=None,
-                ci_green=False,
-                reviews=(),
+                **_forget_pr_evidence(),
             )
         case CheckResult.NOT_CONFIRMED:
             before = task.status_before_error
