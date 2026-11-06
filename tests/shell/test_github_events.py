@@ -145,9 +145,13 @@ def test_runner_merge_confirmation_and_failure(tmp_path: Path, fail: bool, dry_r
         runner.store.close()
 
 
-def test_poll_failure_becomes_incident(tmp_path: Path) -> None:
+def test_task_ci_read_failure_becomes_incident(tmp_path: Path) -> None:
+    class BrokenCI(FakeGitHub):
+        def get_ci(self, sha: str) -> CIState:
+            raise GitHubError("gh 命令失败")
+
     runner = make_runner(tmp_path)
-    github = FakeGitHub(fail=True)
+    github = BrokenCI()
     try:
         runner.store.commit(
             task=TaskRecord("gh-7", status=TaskStatus.AWAITING_ACCEPTANCE, latest_sha=SHA)

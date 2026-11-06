@@ -1,5 +1,6 @@
 """Issue、CI 与第 26 条核对的事件来源，不调用模型。"""
 
+import logging
 from dataclasses import dataclass, replace
 
 from tandem.core.model import (
@@ -15,6 +16,8 @@ from tandem.core.model import (
 from tandem.shell.github import CIState, GitHubClient, GitHubError
 from tandem.shell.runner import Runner, RunnerError
 from tandem.shell.store import GitHubSource
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,11 +51,9 @@ class GitHubEvents:
         try:
             issues = self.github.list_issues()
         except GitHubError:
-            for task in store.list_tasks():
-                source = store.github_source(task.task_id)
-                if source is not None and source.repo == self.repo and not task.status.is_terminal:
-                    self._incident(task)
-            raise
+            # 列表读取不属于任何一个任务；固定告警不携带外部响应或凭据。
+            logger.warning("GitHub Issue 列表读取失败，本轮轮询停止，未改变任务状态")
+            raise GitHubError("GitHub Issue 列表读取失败，未改变任务状态") from None
         for issue in issues:
             if issue.state != "open" or "agent" not in issue.labels:
                 continue

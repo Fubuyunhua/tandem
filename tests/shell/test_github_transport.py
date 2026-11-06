@@ -182,8 +182,11 @@ def test_gh_failures_are_sanitized_incidents(
             task=TaskRecord("gh-7", status=TaskStatus.AWAITING_ACCEPTANCE, latest_sha=SHA)
         )
         runner.store.save_github_source(GitHubSource("gh-7", "owner/repo", 7, "", ""))
+        client = GhGitHub("owner/repo")
+        # 固定列表读取成功，把进程故障注入该任务的 CI 读取，仍须生成异常事件。
+        monkeypatch.setattr(client, "list_issues", lambda: ())
         with pytest.raises(GitHubError) as error:
-            GitHubEvents(runner, GhGitHub("owner/repo"), "owner/repo").poll()
+            GitHubEvents(runner, client, "owner/repo").poll()
         assert "secret-token" not in str(error.value)
         assert required(runner.store.load_task("gh-7")).status is TaskStatus.ERROR
         assert runner.store.list_events()[0].kind is EventKind.INCIDENT
