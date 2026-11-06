@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from tandem.shell.cli import main
+from tandem.shell.diff_source import FakeDiffSource
+from tandem.shell.receipt import parse_receipt
 from tandem.shell.store import Store
 
 
@@ -374,3 +376,43 @@ def test_approve_with_veto_requires_every_finding(
         == 0
     )
     assert "待合并" in capsys.readouterr().out
+
+
+def test_approve_d_level_task_from_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """F8：单 Agent 模式下 D 级任务也要能从 CLI 放行（CI 绿 + 审核都过）。"""
+    from tandem.core.model import Event, EventKind, Level, RunMode, TaskStatus
+    from tests.core.helpers import CORE_CHANGES, SHA_2
+    from tests.shell.shell_helpers import code_receipt, make_runner, plan_receipt
+
+    db = tmp_path / "tandem.sqlite3"
+    runner = make_runner(
+        db,
+        [plan_receipt("t1"), code_receipt("t1", attempt=2, sha=SHA_2)],
+        run_mode=RunMode.SINGLE_AGENT,
+        # D 级任务改的是 core：采集器说真实改动就是 core
+        diff_source=FakeDiffSource(changes=CORE_CHANGES),
+    )
+    runner.submit("t1", Level.D)
+    started = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    plan = parse_receipt(started.receipts[0])
+    runner.handle(Event(kind=EventKind.PLAN_SUBMITTED, task_id="t1", sha=plan.sha, plan=plan.plan))
+    runner.handle(Event(kind=EventKind.PLAN_APPROVED, task_id="t1", sha=plan.sha))
+    started = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    receipt = parse_receipt(started.receipts[0])
+    task = runner.store.load_task("t1")
+    assert task is not None
+    runner.handle(runner.code_event(task, receipt))
+    runner.handle(Event(kind=EventKind.CI_GREEN, task_id="t1", sha=receipt.sha))
+    task = runner.store.load_task("t1")
+    assert task is not None
+    assert task.status is TaskStatus.AWAITING_YOUR_REVIEW
+    assert task.level is Level.D
+    assert task.designated_reviewers == ()  # 单 Agent 模式没有 AI 审核
+    runner.store.close()
+
+    assert main(["approve", "--db", str(db), "--task-id", "t1", "--sha", receipt.sha]) == 0
+    capsys.readouterr()
+    with Store(db) as store:
+        loaded = store.load_task("t1")
+        assert loaded is not None
+        assert loaded.status is TaskStatus.AWAITING_MERGE
