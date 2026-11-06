@@ -650,14 +650,43 @@ def test_merge_action_is_only_produced_with_green_ci() -> None:
     assert any(action.kind is ActionKind.MERGE for action in approved.actions)
 
 
-def test_merge_guard_checks_the_approved_sha() -> None:
-    """批准的提交编号和当前的不一致时，不能合并。"""
+def test_merge_guard_checks_the_approved_sha_on_the_ai_entry() -> None:
+    """最后一个 AI 通过（第 12 条）这条入口也要核对批准的提交编号。"""
     from dataclasses import replace
 
-    record = to_merge_ready()
-    tampered = replace(record, approved_sha=SHA_2)
-    decision = run(tampered, review_event(tampered, "codex"))
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex")).task
+    # 记录里还挂着一个针对旧提交的批准
+    stale = replace(record, approved_sha=SHA_2)
+    decision = run(stale, review_event(stale, "opencode-go"))
+    # 事件确实到了"全过→放行"这条分支：结论被记下了，不是被状态拦掉
+    assert decision.task.reviews
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
     assert not any(action.kind is ActionKind.MERGE for action in decision.actions)
+    assert "批准的提交编号" in decision.reason
+
+
+def test_merge_guard_checks_the_approved_sha_on_the_human_entry() -> None:
+    """人工批准（第 20 条）这条入口也要核对批准的提交编号。"""
+    from dataclasses import replace
+
+    record = to_needs_intervention_by_reviewers()
+    stale = replace(record, approved_sha=SHA_2)
+    decision = run(
+        stale, ev(EventKind.INTERVENTION_APPROVED, sha=record.latest_sha, reason="我看过了")
+    )
+    assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert not decision.changed
+    assert "批准的提交编号" in decision.reason
+
+
+def test_merge_guard_reaches_the_merge_branch_when_everything_is_fine() -> None:
+    """正例：同样的入口，批准编号和当前一致时确实产生 MERGE。"""
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex")).task
+    decision = run(record, review_event(record, "opencode-go"))
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    assert actions_of(decision, ActionKind.MERGE)
 
 
 # ------------------------------------------------- F3：审核者按提供方去重、绑定席位

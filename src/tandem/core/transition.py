@@ -140,8 +140,14 @@ def _reviews_by_provider(reviews: tuple[Review, ...]) -> dict[str, Review]:
     return grouped
 
 
-def merge_blocker(task: TaskRecord, policy: Policy) -> tuple[str, ...]:
+def merge_blocker(task: TaskRecord, policy: Policy, *, human: bool = False) -> tuple[str, ...]:
     """放行的统一不变量：任何产生 MERGE 动作的路径都要先过这里。
+
+    检查用的是"进入这一条转换之前的记录"，所以：
+    - 已挂着的批准必须是给当前提交编号的（不是某一版旧提交的）；
+    - ``human=False`` 表示凭 AI 审核证据放行，此时席位里不能有写过这次代码的人；
+      ``human=True`` 表示你明确的人工批准，席位不作为证据核对，
+      但"写过代码的不能投审核票"这条在接收结论时照旧生效。
 
     返回非空表示不允许合并，元组里是原因（写进日志）。
     """
@@ -152,7 +158,7 @@ def merge_blocker(task: TaskRecord, policy: Policy) -> tuple[str, ...]:
         reasons.append("任务没有提交编号")
     if task.approved_sha is not None and task.approved_sha != task.latest_sha:
         reasons.append("批准的提交编号和当前的不一致")
-    if task.latest_sha is not None:
+    if task.latest_sha is not None and not human:
         intruders = set(task.designated_reviewers) & task.providers_involved
         if intruders:
             reasons.append(f"审核者里有人写过这次代码：{'、'.join(sorted(intruders))}")
@@ -165,15 +171,20 @@ def _merge(
     reason: str,
     actions: _Actions,
     blocked_record: TaskRecord | None = None,
+    *,
+    human: bool = False,
     **changes: object,
 ) -> Decision:
     """唯一产生 MERGE 动作的出口。
+
+    守卫看的是传进来的 ``task``（进入这条转换之前的记录），而不是加完
+    ``changes`` 之后的样子，否则"这次刚写进去的 approved_sha"会把自己检查掉。
 
     守卫不过时：默认把这个事件当作没生效（忽略），
     传了 ``blocked_record`` 就把"审核结论"记下来、状态留在原地（第 12 条用）。
     """
     candidate = replace(task, **changes)
-    blockers = merge_blocker(candidate, policy)
+    blockers = merge_blocker(task, policy, human=human)
     if blockers:
         message = "；".join(blockers)
         if blocked_record is None:
@@ -624,11 +635,10 @@ def _on_ci_green(task: TaskRecord, event: Event, policy: Policy, quota: QuotaSna
     rule = policy.rule_for(task.level)
     if not rule.requires_ai_review:
         return _merge(
-            task,
+            replace(task, ci_green=True),
             policy,
             f"CI 绿，{task.level.value} 级不需要 AI 审核",
             actions,
-            ci_green=True,
             approved_sha=task.latest_sha,
         )
 
@@ -828,6 +838,7 @@ def _on_your_approval(task: TaskRecord, event: Event, policy: Policy) -> Decisio
         policy,
         f"你批准了提交 {approved_sha}",
         actions,
+        human=True,
         approved_sha=approved_sha,
         note=event.reason or task.note,
     )
@@ -885,6 +896,7 @@ def _on_intervention_approved(task: TaskRecord, event: Event, policy: Policy) ->
         policy,
         f"你人工审核通过了提交 {task.latest_sha}",
         actions,
+        human=True,
         approved_sha=task.latest_sha,
         note=event.reason or task.note,
     )
