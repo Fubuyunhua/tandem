@@ -146,3 +146,102 @@ def test_code_receipt_used_by_shell_helpers_has_no_changes() -> None:
     receipt = parse_receipt(code_receipt("t1"))
     assert receipt.sha
     assert not hasattr(receipt, "changes")
+
+
+# ------------------------------------------------- H1：Git 的引号/转义路径要按 -z 解码
+
+
+def _make_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "repo-h1"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "test")
+    (root / "README.md").write_text("初始\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "base")
+    return root
+
+
+def _create_files(root: Path, names: list[str]) -> list[str]:
+    """按给定的名字建文件，返回确实落地（没有被文件系统改名）的那些。"""
+    created: list[str] = []
+    for name in names:
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.write_text("内容\n", encoding="utf-8")
+        except OSError:  # pragma: no cover - 平台不允许这种文件名
+            continue
+        if target.exists():
+            created.append(name)
+    return created
+
+
+def test_git_diff_source_decodes_chinese_paths(tmp_path: Path) -> None:
+    """含中文的路径 Git 默认会加引号转义；按 -z 解析以后必须是真实路径，等级按底线判 D。"""
+    root = _make_repo(tmp_path)
+    name = ".github/workflows/中.yml"
+    assert _create_files(root, [name]) == [name]
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add chinese workflow")
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+    assert name in collected.changes.paths
+    assert all('"' not in path for path in collected.changes.paths)
+    from tandem.core.level import compute_level
+    from tests.core.helpers import policy
+
+    assert compute_level(collected.changes, policy()) is Level.D
+
+
+def test_git_diff_source_decodes_special_file_names(tmp_path: Path) -> None:
+    """制表符、双引号这些字符也不能让路径变形（文件系统不允许时跳过）。"""
+    root = _make_repo(tmp_path)
+    wanted = ["tab\tname.txt", 'quote"name.txt', "空格 名字.txt"]
+    created = _create_files(root, wanted)
+    if len(created) < len(wanted):  # pragma: no cover - Windows 不允许 " 等字符
+        pytest.skip(f"这个平台无法创建全部文件名，只测到 {created}")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add special names")
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+    assert set(created) <= set(collected.changes.paths)
+
+
+def test_git_diff_source_decodes_chinese_renames(tmp_path: Path) -> None:
+    root = _make_repo(tmp_path)
+    before = "文档/说明.md"
+    assert _create_files(root, [before]) == [before]
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add doc")
+    after = "文档/新说明.md"
+    _git(root, "mv", before, after)
+    _git(root, "commit", "-q", "-m", "rename doc")
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+    assert collected.changes.renames == ((before, after),)
+
+
+def test_parse_name_status_z_handles_every_entry_type() -> None:
+    """-z 的格式：状态 NUL 路径 NUL；改名多一个路径。"""
+    from tandem.shell.diff_source import parse_name_status_z
+
+    payload = (
+        b"M\0docs/a.md\0"
+        b"R100\0old.py\0new.py\0"
+        b"D\0gone.py\0"
+        b"A\0.github/workflows/\xe4\xb8\xad.yml\0"
+        b"C75\0src/a.py\0src/b.py\0"
+    )
+    paths, deleted, renames = parse_name_status_z(payload)
+    assert paths == ["docs/a.md", ".github/workflows/中.yml", "src/b.py"]
+    assert deleted == ["gone.py"]
+    assert renames == [("old.py", "new.py")]
+
+
+def test_parse_name_status_z_rejects_truncated_output() -> None:
+    from tandem.shell.diff_source import DiffError, parse_name_status_z
+
+    with pytest.raises(DiffError):
+        parse_name_status_z(b"M\0")

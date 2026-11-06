@@ -85,6 +85,48 @@ class FakeDiffSource:
         )
 
 
+def parse_name_status_z(payload: bytes) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """解析 `git diff --name-status -z -M` 的输出。
+
+    `-z` 的格式是“状态 NUL 路径 NUL”，改名/复制条目多一个路径：
+    ``R100 NUL 旧路径 NUL 新路径 NUL``。路径按 UTF-8 原样解码，不做 Git 的引号转义。
+    """
+    fields = payload.decode("utf-8", "surrogateescape").split("\0")
+    paths: list[str] = []
+    deleted: list[str] = []
+    renames: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        if not status:
+            index += 1
+            continue
+        if status[0] in {"R", "C"}:
+            if index + 2 >= len(fields):
+                raise DiffError(f"git diff 输出被截断：{status}")
+            before, after = fields[index + 1], fields[index + 2]
+            if not before or not after:
+                raise DiffError(f"git diff 输出被截断：{status}")
+            if status[0] == "R":
+                renames.append((before, after))
+            else:
+                # 复制出来的文件对新路径来说是一处新增
+                paths.append(after)
+            index += 3
+            continue
+        if index + 1 >= len(fields):
+            raise DiffError(f"git diff 输出被截断：{status}")
+        path = fields[index + 1]
+        if not path:
+            raise DiffError(f"git diff 输出被截断：{status}")
+        if status[0] == "D":
+            deleted.append(path)
+        else:
+            paths.append(path)
+        index += 2
+    return paths, deleted, renames
+
+
 @dataclass(frozen=True)
 class GitDiffSource:
     """真实实现：`git diff --name-status -M base...sha`，再数一遍断言的变化。"""
@@ -93,22 +135,9 @@ class GitDiffSource:
     scanner: SecretScanner = NoSecretScan()
 
     def collect(self, base: str, sha: str) -> CollectedDiff:
-        listing = self._git("diff", "--name-status", "-M", f"{base}...{sha}")
-        paths: list[str] = []
-        deleted: list[str] = []
-        renames: list[tuple[str, str]] = []
-        for line in listing.splitlines():
-            if not line.strip():
-                continue
-            fields = line.split("\t")
-            status = fields[0]
-            if status.startswith("R") and len(fields) >= 3:
-                renames.append((fields[1], fields[2]))
-            elif status.startswith("D") and len(fields) >= 2:
-                deleted.append(fields[1])
-            elif len(fields) >= 2:
-                paths.append(fields[1])
-
+        # -z：用 NUL 分隔并且**不做**引号转义，中文、制表符、双引号都能原样拿到
+        payload = self._git_bytes("diff", "--name-status", "-z", "-M", f"{base}...{sha}")
+        paths, deleted, renames = parse_name_status_z(payload)
         changed = tuple(paths)
         before, after = self._assertion_totals(base, sha, changed)
         scan = self.scanner.scan((*changed, *deleted, *(pair[1] for pair in renames)))
@@ -147,11 +176,25 @@ class GitDiffSource:
             cwd=self.cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
             check=False,
         )
         if completed.returncode != 0:
             # 新增的文件在旧提交里不存在，按 0 算
             return ""
+        return completed.stdout
+
+    def _git_bytes(self, *args: str) -> bytes:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=self.cwd,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace").strip()
+            raise DiffError(f"git {' '.join(args)} 失败：{detail}")
         return completed.stdout
 
     def _git(self, *args: str) -> str:
