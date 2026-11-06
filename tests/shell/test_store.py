@@ -13,6 +13,7 @@ from tandem.core.model import (
     Action,
     ActionKind,
     ActionStatus,
+    CheckResult,
     Event,
     EventKind,
     Level,
@@ -295,3 +296,31 @@ def test_plan_history_survives_a_store_roundtrip(store: Store) -> None:
     assert loaded.plan_text.startswith("第 1 版方案")
     assert loaded.plan(1) is not None
     assert loaded.plan(2) is None
+
+
+def test_cleanup_record_and_abandoned_action_roundtrip(store: Store) -> None:
+    """清理核对的结果要能存下来：cleanup_checked、已放弃的动作、事件里的动作编号。"""
+    abandoned = Action(
+        action_id="t1:5:1",
+        kind=ActionKind.CLOSE_PR,
+        task_id="t1",
+        detail="关闭 PR",
+        status=ActionStatus.ABANDONED,
+    )
+    task = _task(5, status=TaskStatus.CANCELLED, cleanup_checked=True, actions=(abandoned,))
+    event = Event(
+        kind=EventKind.CLEANUP_CHECKED,
+        task_id="t1",
+        check_result=CheckResult.NOT_CONFIRMED,
+        action_ids=("t1:5:1",),
+    )
+    store.commit(task=task, events=[event])
+
+    loaded = store.load_task("t1")
+    assert loaded is not None
+    assert loaded.cleanup_checked is True
+    assert loaded.actions[0].status is ActionStatus.ABANDONED
+    assert store.unconfirmed_actions("t1") == []  # 放弃以后不再算未确认
+    stored_event = store.list_events("t1")[0]
+    assert stored_event.action_ids == ("t1:5:1",)
+    assert stored_event.check_result is CheckResult.NOT_CONFIRMED

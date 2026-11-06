@@ -9,6 +9,7 @@ import pytest
 
 from tandem.core.model import (
     ActionKind,
+    ActionStatus,
     CheckResult,
     EventKind,
     Finding,
@@ -30,6 +31,7 @@ from tests.core.helpers import (
     SOME_FINDINGS,
     Walker,
     actions_of,
+    cancelled_with_unconfirmed_cleanup,
     ev,
     new_task,
     policy,
@@ -1622,3 +1624,72 @@ def test_row_26_pr_closed_clears_pr_evidence() -> None:
     assert decision.task.reviews == ()
     assert decision.task.designated_reviewers == ()
     assert not decision.task.ci_green
+
+
+def test_cleanup_checked_confirms_close_pr_without_leaving_cancelled() -> None:
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    version = record.state_version
+    decision = run(
+        record,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(action_id,)),
+    )
+    assert decision.task.status is TaskStatus.CANCELLED  # 终点状态不变
+    assert decision.task.state_version == version + 1  # 记录还是往前走一版
+    statuses = {action.action_id: action.status for action in decision.task.actions}
+    assert statuses[action_id] is ActionStatus.DONE
+    assert "清理" in decision.reason
+    assert decision.task.cleanup_checked is True
+
+
+def test_cleanup_checked_can_abandon_a_cleanup_action() -> None:
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    decision = run(
+        record,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(action_id,),
+        ),
+    )
+    assert decision.task.status is TaskStatus.CANCELLED
+    statuses = {action.action_id: action.status for action in decision.task.actions}
+    assert statuses[action_id] is ActionStatus.ABANDONED
+    assert not statuses[action_id].is_unconfirmed  # 放弃以后不再算"未确认"
+    assert "放弃" in decision.reason
+
+
+def test_cleanup_checked_only_touches_cleanup_actions() -> None:
+    record, close_id = cancelled_with_unconfirmed_cleanup()
+    start_id = next(
+        action.action_id for action in record.actions if action.kind is ActionKind.START_AGENT
+    )
+    decision = run(
+        record,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.PR_CLOSED,
+            action_ids=(start_id,),
+        ),
+    )
+    assert not decision.changed
+    assert "清理动作" in decision.reason
+
+
+def test_cleanup_checked_is_ignored_for_non_terminal_tasks() -> None:
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    from dataclasses import replace
+
+    running = replace(record, status=TaskStatus.AWAITING_ACCEPTANCE)
+    decision = run(
+        running,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(action_id,)),
+    )
+    assert not decision.changed
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+
+
+def test_cleanup_checked_needs_action_ids() -> None:
+    record, _ = cancelled_with_unconfirmed_cleanup()
+    decision = run(record, ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED))
+    assert not decision.changed
+    assert "动作" in decision.reason

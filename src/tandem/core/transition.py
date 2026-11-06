@@ -20,6 +20,7 @@ from tandem.core.level import bottom_line_reasons, compute_level
 from tandem.core.model import (
     Action,
     ActionKind,
+    ActionStatus,
     CheckResult,
     Decision,
     Event,
@@ -275,6 +276,9 @@ def _dispatch(
             f"事件带的版本号 {event.state_version} 和任务当前的 {task.state_version} 不一致",
         )
     if task.status.is_terminal:
+        # 唯一的例外：清理核对只更新已经发出的清理动作，不改变终点状态。
+        if event.kind is EventKind.CLEANUP_CHECKED:
+            return _on_cleanup_checked(task, event)
         return _ignore(task, f"任务已经结束（{task.status.value}），事件直接丢弃")
 
     match event.kind:
@@ -324,6 +328,8 @@ def _dispatch(
             return _on_retry(task, event, policy)
         case EventKind.CANCEL:
             return _on_cancel(task)
+        case EventKind.CLEANUP_CHECKED:
+            return _ignore(task, "只有终点任务的清理动作才能这样做核对")
         case _:  # pragma: no cover - 新增事件类型时 pyright 会在这里报错
             assert_never(event.kind)
 
@@ -1279,6 +1285,63 @@ def _reviewers_without_conclusion(task: TaskRecord) -> tuple[str, ...]:
     """还没给出当前提交编号结论的审核者（重试时要重新发审核请求）。"""
     answered = {review.provider for review in _current_reviews(task)}
     return tuple(seat for seat in task.designated_reviewers if seat not in answered)
+
+
+# 终止清理时可以核对的动作类型：取消时外壳发出的那几条清理动作
+CLEANUP_ACTION_KINDS = frozenset(
+    {ActionKind.CLOSE_PR, ActionKind.STOP_AGENT, ActionKind.PUSH_BRANCH}
+)
+
+
+def _on_cleanup_checked(task: TaskRecord, event: Event) -> Decision:
+    """终点任务的清理核对：只改动作状态，不动状态机。
+
+    为什么这不违反"终点不可逆"：状态机的终点是"没有出边"，这里的状态没有变，
+    也不会有任何后续转换；变的只是"已经发出的动作到底完成了没有"这条事实。
+    状态版本号照样 +1，因为任务记录的每一次变化都要留一版（重放要对得上）。
+    ``CLEANUP_CHECKED`` 也只能落在这个窄口上：其他事件碰到终点任务一律丢弃。
+    """
+    outcome = event.check_result
+    if outcome is not CheckResult.PR_CLOSED and outcome is not CheckResult.NOT_CONFIRMED:
+        return _ignore(task, "清理核对只接受「外部已确认」或「无法确认」两种结果")
+    wanted = tuple(dict.fromkeys(event.action_ids))
+    if not wanted:
+        return _ignore(task, "清理核对要带上要核对的动作编号")
+
+    known = {action.action_id: action for action in task.actions}
+    targets: list[Action] = []
+    for action_id in wanted:
+        action = known.get(action_id)
+        if action is None:
+            return _ignore(task, f"任务里没有动作 {action_id}")
+        if action.kind not in CLEANUP_ACTION_KINDS:
+            return _ignore(task, f"{action.kind.value}不是清理动作，清理核对只能核对清理动作")
+        targets.append(action)
+
+    new_status = ActionStatus.DONE if outcome is CheckResult.PR_CLOSED else ActionStatus.ABANDONED
+    updated_ids = set(wanted)
+    if all(action.status is new_status for action in targets):
+        return _ignore(task, f"这些清理动作已经是{new_status.value}，不用再核对")
+
+    patched = tuple(
+        replace(action, status=new_status) if action.action_id in updated_ids else action
+        for action in task.actions
+    )
+    names = "、".join(f"{action.kind.value}({action.action_id})" for action in targets)
+    if outcome is CheckResult.PR_CLOSED:
+        reason = f"清理核对：{names} 外部已确认完成"
+        note = f"{task.note}｜清理已核对：{names} 已确认完成"
+    else:
+        reason = f"清理核对：{names} 无法确认，已放弃"
+        note = f"{task.note}｜清理未完成：{names} 已放弃（外部无法确认）"
+    return _transition(
+        replace(task, actions=patched),
+        task.status,
+        reason,
+        [],
+        cleanup_checked=True,
+        note=note,
+    )
 
 
 def _on_cancel(task: TaskRecord) -> Decision:
