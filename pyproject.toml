@@ -19,9 +19,12 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 让 tests/ 能 import scripts 下的模块（诱饵测试的判断逻辑）
+pythonpath = ["."]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
+extraPaths = ["."]
 strict = ["src"]
 pythonVersion = "3.13"
 
