@@ -48,10 +48,19 @@ def _pattern_hits(pattern: str, path: str) -> bool:
     ``src/tandem/core/model.py``，符合 ADR 里 ``core/**``、``**/migrations/**``
     这种写法。
     """
+    # 跨平台采用保守的一致语义，Linux 上也不允许大小写变体逃过底线。
+    pattern, path = pattern.casefold(), path.casefold()
+    patterns = [pattern]
+    if pattern.startswith("**/"):
+        patterns.append(pattern[3:])
     candidates = [path]
     parts = path.split("/")
     candidates.extend("/".join(parts[index:]) for index in range(1, len(parts)))
-    return any(fnmatchcase(candidate, pattern) for candidate in candidates)
+    return any(
+        fnmatchcase(candidate, glob) or (glob.endswith("/**") and candidate == glob[:-3])
+        for candidate in candidates
+        for glob in patterns
+    )
 
 
 def _matches_any(patterns: tuple[str, ...], path: str) -> bool:
