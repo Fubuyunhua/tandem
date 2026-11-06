@@ -198,17 +198,23 @@ class LocalRun:
             TaskStatus.AWAITING_YOUR_REVIEW,
             TaskStatus.NEEDS_INTERVENTION,
         }:
-            if task.latest_sha and (
-                task.status is TaskStatus.AWAITING_PLAN_APPROVAL or task.ci_green
-            ):
+            plan = task.plan()
+            approval_sha = (
+                (plan.sha if plan is not None else None)
+                if task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+                else task.latest_sha
+            )
+            if approval_sha and (task.status is TaskStatus.AWAITING_PLAN_APPROVAL or task.ci_green):
                 vetoes = "".join(
                     f" --veto {_quote(finding.key + '=填写这条意见的理由')}"
                     for finding in task.open_findings
                 )
                 print(
                     f"  核对后：uv run tandem approve --task-id {task_id} {db}"
-                    f" --sha {_quote(task.latest_sha)}{vetoes}"
+                    f" --sha {_quote(approval_sha)}{vetoes}"
                 )
+            elif task.status is TaskStatus.AWAITING_PLAN_APPROVAL:
+                print("  缺少当前方案的提交编号，请先核对方案记录；不能用代码编号代替。")
             else:
                 print("  CI 尚未通过，不能批准；本轮未提供介入后的重做命令。")
         elif task.status is TaskStatus.PENDING:

@@ -9,6 +9,7 @@ from tandem.core.model import (
     ActionKind,
     ActionStatus,
     EventKind,
+    PlanEntry,
     QuotaState,
     TaskRecord,
     TaskStatus,
@@ -122,6 +123,44 @@ def test_real_changes_can_upgrade_c_to_d(tmp_path: Path) -> None:
     assert _run(db, "--changes", "src/tandem/core/model.py") == 1
     assert _task(db).status is TaskStatus.AWAITING_PLAN_APPROVAL
     assert _task(db).level.value == "D"
+
+
+def test_upgraded_plan_is_visible_and_wrong_sha_cannot_approve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "tasks.sqlite3"
+    _submit(db)
+    assert _run(db, "--changes", "src/tandem/core/model.py") == 1
+    plan = _task(db)
+    entry = plan.plan()
+    assert entry is not None
+    assert main(["show", "t1", "--db", str(db)]) == 0
+    summary = capsys.readouterr().out.split("完整任务记录")[0]
+    assert f"没有文字方案，内容就是提交 {entry.sha}" in summary
+    assert f"方案提交编号：{entry.sha}" in summary
+    assert main(["approve", "--task-id", "t1", "--db", str(db), "--sha", "wrong"]) == 2
+    assert _task(db) == plan
+    _approve(db, plan)
+    assert _task(db).approved_plan_version == plan.plan_version
+
+
+def test_plan_hint_uses_plan_sha_instead_of_latest_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "tasks.sqlite3"
+    with Store(db) as store:
+        store.commit(
+            task=TaskRecord(
+                "t1",
+                status=TaskStatus.AWAITING_PLAN_APPROVAL,
+                latest_sha="b" * 40,
+                plan_version=1,
+                plan_history=(PlanEntry(1, "a" * 40, "方案正文"),),
+            )
+        )
+    assert _run(db) == 1
+    hint = next(line for line in capsys.readouterr().out.splitlines() if "tandem approve" in line)
+    assert "a" * 40 in hint and "b" * 40 not in hint
 
 
 @pytest.mark.parametrize(

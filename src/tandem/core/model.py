@@ -182,10 +182,27 @@ class QuotaSnapshot:
 
 
 @dataclass(frozen=True)
+class AssertionDrop:
+    """某个测试文件的断言数减少了（底线条目）。
+
+    ``path`` 是受审提交里的路径（被删掉的测试文件就是它原来的路径）；
+    改名时 ``previous_path`` 记旧路径，报告的时能说清"哪个文件挪到了哪里"。
+    """
+
+    path: str
+    before: int
+    after: int
+    previous_path: str | None = None
+
+
+@dataclass(frozen=True)
 class ChangeSet:
     """真实改动。由外壳从 diff 收集，内核据此算等级。
 
     断言数量由外壳在测试文件里数 ``assert`` / ``expect(`` 的个数得到。
+    ``assertion_drops`` 是逐个文件的减少记录：底线条目按**文件**判断，
+    一个文件少了断言、另一个文件多了断言，合计持平也照样是 D。
+    ``assertions_before`` / ``assertions_after`` 只用于报告总体情况。
     """
 
     paths: tuple[str, ...] = ()
@@ -193,6 +210,7 @@ class ChangeSet:
     renames: tuple[tuple[str, str], ...] = ()
     assertions_before: int | None = None
     assertions_after: int | None = None
+    assertion_drops: tuple[AssertionDrop, ...] = ()
     secret_scan_hit: bool = False
 
     @property
@@ -212,6 +230,12 @@ class ChangeSet:
 
     @property
     def assertions_decreased(self) -> bool:
+        """有没有测试文件的断言减少。
+
+        以逐个文件的记录为准；只有合计数字时（旧数据）退回比较合计。
+        """
+        if self.assertion_drops:
+            return True
         if self.assertions_before is None or self.assertions_after is None:
             return False
         return self.assertions_after < self.assertions_before
@@ -239,6 +263,14 @@ class OpenFinding:
     standard_version: int
     local_id: str
     text: str
+
+    @property
+    def short_key(self) -> str:
+        """给人看的短键：提交编号只留前 8 位。
+
+        只用于展示；``key`` 里是完整提交编号，否决时要引用 ``key``。
+        """
+        return f"{self.provider}:{self.local_id}@{self.sha[:8]}:v{self.standard_version}"
 
 
 @dataclass(frozen=True)
@@ -278,6 +310,20 @@ class Action:
 
 
 @dataclass(frozen=True)
+class PlanEntry:
+    """一版方案：版本号、绑定的提交编号、正文。
+
+    ``sha`` 是这版方案对应的提交编号。正常提交方案时是方案回执里的编号；
+    第 5b 条（C 级按真实改动升成 D）没有文字方案，这时 ``sha`` 是那次交回的
+    代码提交，``text`` 会写清"内容就是这次提交的改动"，让批准的人知道自己批了什么。
+    """
+
+    version: int
+    sha: str
+    text: str
+
+
+@dataclass(frozen=True)
 class RevisionCount:
     """修改次数按审核标准版本分开计算，保留历史（第 22、23 条）。"""
 
@@ -302,6 +348,8 @@ class TaskRecord:
     # 方案版本、批准的是哪一版（第 2、3、4、5b 条）
     plan_version: int = 0
     approved_plan_version: int | None = None
+    # 每一版方案的正文和绑定提交编号，只追加；note 会被后续转换改掉，方案正文不能跟着没
+    plan_history: tuple[PlanEntry, ...] = ()
 
     # 写手（提供方名），以及写手是不是你（第 6、14、14b 条）
     writer: str | None = None
@@ -348,6 +396,20 @@ class TaskRecord:
 
     # 最后一次做决定的时间，由外壳作为参数传进来
     updated_at: datetime | None = None
+
+    def plan(self, version: int | None = None) -> PlanEntry | None:
+        """取某一版方案（默认当前这版）。"""
+        target = self.plan_version if version is None else version
+        for entry in self.plan_history:
+            if entry.version == target:
+                return entry
+        return None
+
+    @property
+    def plan_text(self) -> str:
+        """当前这版方案的正文（没有就是空串）。"""
+        entry = self.plan()
+        return "" if entry is None else entry.text
 
     def revision_count(self, standard_version: int) -> int:
         """当前审核标准版本下已经改过几次。"""

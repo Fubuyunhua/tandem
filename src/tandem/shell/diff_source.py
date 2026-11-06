@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
-from tandem.core.model import ChangeSet
+from tandem.core.model import AssertionDrop, ChangeSet
 
 # 数断言用的近似写法：Python 的 assert、JS 的 expect(
 ASSERTION_PATTERN = re.compile(r"(?<![\w.])(assert\b|expect\s*\()")
@@ -141,7 +141,7 @@ class GitDiffSource:
         payload = self._git_bytes("diff", "--name-status", "-z", "-M", merge_base, sha)
         paths, deleted, renames = parse_name_status_z(payload)
         changed = tuple(paths)
-        before, after = self._assertion_totals(merge_base, sha, paths, deleted, renames)
+        before, after, drops = self._assertion_changes(merge_base, sha, paths, deleted, renames)
         scan = self.scanner.scan((*changed, *deleted, *(pair[1] for pair in renames)))
         return CollectedDiff(
             changes=ChangeSet(
@@ -150,6 +150,7 @@ class GitDiffSource:
                 renames=tuple(renames),
                 assertions_before=before,
                 assertions_after=after,
+                assertion_drops=drops,
                 secret_scan_hit=scan is SecretScanState.HIT,
             ),
             base=base,
@@ -174,42 +175,64 @@ class GitDiffSource:
             )
         return merged.stdout.strip()
 
-    def _assertion_totals(
+    def _assertion_changes(
         self,
         merge_base: str,
         sha: str,
         paths: list[str],
         deleted: list[str],
         renames: list[tuple[str, str]],
-    ) -> tuple[int | None, int | None]:
-        """只在测试文件里数断言。
+    ) -> tuple[int | None, int | None, tuple[AssertionDrop, ...]]:
+        """按文件统计断言变化，返回（合计之前、合计之后、逐个文件的减少记录）。
 
-        "之前"取 diff 左端（共同祖先）的内容，"之后"取 diff 右端（受审提交）的内容；
-        改名用旧路径数之前、新路径数之后，不能把改名漏掉。
+        底线条目是"测试文件里的断言数量减少"，必须**逐个文件**判断：
+        一个文件少了一条、另一个文件多了一条，合计持平也不能算没减少。
+        - 普通增改：同一路径比两端；
+        - 改名：旧路径数之前、新路径数之后，配成一对；
+        - 删除：删除前有断言就算减少（之后按 0）。
+        新增文件只会让断言变多，不能抵消别的文件的减少。
         """
-        before = 0
-        after = 0
+        before_total = 0
+        after_total = 0
+        drops: list[AssertionDrop] = []
         counted = False
+
         for path in paths:
             if not TEST_FILE_PATTERN.search(path):
                 continue
-            before += self._count_assertions(merge_base, path)
-            after += self._count_assertions(sha, path)
+            before = self._count_assertions(merge_base, path)
+            after = self._count_assertions(sha, path)
+            before_total += before
+            after_total += after
             counted = True
+            if after < before:
+                drops.append(AssertionDrop(path=path, before=before, after=after))
+
         for path in deleted:
             if not TEST_FILE_PATTERN.search(path):
                 continue
-            before += self._count_assertions(merge_base, path)
+            before = self._count_assertions(merge_base, path)
+            before_total += before
             counted = True
+            if before > 0:
+                drops.append(AssertionDrop(path=path, before=before, after=0))
+
         for old_path, new_path in renames:
             if not (TEST_FILE_PATTERN.search(old_path) or TEST_FILE_PATTERN.search(new_path)):
                 continue
-            before += self._count_assertions(merge_base, old_path)
-            after += self._count_assertions(sha, new_path)
+            before = self._count_assertions(merge_base, old_path)
+            after = self._count_assertions(sha, new_path)
+            before_total += before
+            after_total += after
             counted = True
+            if after < before:
+                drops.append(
+                    AssertionDrop(path=new_path, before=before, after=after, previous_path=old_path)
+                )
+
         if not counted:
-            return None, None
-        return before, after
+            return None, None, ()
+        return before_total, after_total, tuple(drops)
 
     def _count_assertions(self, revision: str, path: str) -> int:
         text = self._git_show(revision, path)

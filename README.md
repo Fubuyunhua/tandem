@@ -63,7 +63,7 @@ uv run tandem submit --db data/manual-multi.sqlite3 --task-id multi-demo --mode 
 uv run tandem run --db data/manual-multi.sqlite3 --changes src/tandem/core/model.py
 # 停在“待你批准方案”；记录中显示本次模拟改动路径和方案。
 uv run tandem show multi-demo --db data/manual-multi.sqlite3
-$planSha = Read-Host '粘贴方案的完整提交编号'
+$planSha = Read-Host '粘贴 show 摘要中“方案提交编号”的完整编号'
 uv run tandem approve --db data/manual-multi.sqlite3 --task-id multi-demo --sha $planSha
 uv run tandem run --db data/manual-multi.sqlite3 --changes src/tandem/core/model.py --review pass
 # 两家模拟审核通过后，D 级停在“待你审核”。代码编号与方案编号不同。
@@ -114,6 +114,8 @@ uv run tandem run --db data/manual-review.sqlite3 --changes src/x.py --review pa
 - `show <任务编号>` 输出完整任务 JSON 和按顺序记录的历史事件，包含完整提交编号、
   审核正文、待回应意见键、版本、原因、动作状态；不对真实代码或真实 CI 作证明。
   头部先摘要展示 CI、已批准 SHA 与当前是否一致、本轮审核、待回应意见数和方案批准状态。
+  当前方案正文和方案提交编号独立展示，批准方案应使用该方案编号；代码编号可能不同。
+  C 级按实际改动升成 D 时，方案正文会明确显示“没有文字方案，内容就是提交 …”。
   当前内核仅保存 CI 绿灯布尔值，False 展示为“未通过或未知”，不把缺失证据当作已知红灯。
 - 运行时提示中的命令参数按平台转义：Windows 使用 PowerShell 单引号，其他平台使用
   POSIX shell（shlex）规则；上面的 PowerShell 示例在其他 shell 中需相应调整变量语法。

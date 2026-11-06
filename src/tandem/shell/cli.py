@@ -162,6 +162,9 @@ def _print_summary(task: TaskRecord) -> None:
     else:
         approved = task.approved_plan_version == task.plan_version
         print(f"方案：第 {task.plan_version} 版{'已批准' if approved else '待批准'}")
+        plan = task.plan()
+        print(f"方案提交编号：{plan.sha if plan is not None else '无（旧记录未保存）'}")
+        print(f"方案正文：{task.plan_text or '无（旧记录未保存）'}")
 
 
 def cmd_show(args: argparse.Namespace) -> int:

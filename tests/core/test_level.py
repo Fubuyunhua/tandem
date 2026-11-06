@@ -199,3 +199,63 @@ def test_normalize_path_helper() -> None:
     assert normalize_path("/abs/path") is None
     assert normalize_path("docs/../x") is None
     assert normalize_path("") is None
+
+
+# ------------------------------------------------- 断言减少要按文件判断
+
+
+def test_single_file_drop_is_d_even_when_totals_are_flat(policy: Policy) -> None:
+    """一个文件少了断言、另一个文件多了断言：合计不变，但仍然是底线 D。"""
+    from tandem.core.model import AssertionDrop
+
+    changes = ChangeSet(
+        paths=("tests/test_app.py", "tests/test_new.py"),
+        assertions_before=2,
+        assertions_after=2,  # 合计没变
+        assertion_drops=(AssertionDrop(path="tests/test_app.py", before=2, after=1),),
+    )
+    assert changes.assertions_decreased
+    assert compute_level(changes, policy) is Level.D
+
+
+def test_bottom_line_reasons_name_the_file_that_lost_assertions(policy: Policy) -> None:
+    """底线报告要能说出是哪个文件减少了，供 tandem show / risk-gate 用。"""
+    from tandem.core.level import bottom_line_reasons
+    from tandem.core.model import AssertionDrop
+
+    changes = ChangeSet(
+        paths=("tests/test_app.py", "tests/test_new.py"),
+        assertions_before=2,
+        assertions_after=2,
+        assertion_drops=(AssertionDrop(path="tests/test_app.py", before=2, after=1),),
+    )
+    reasons = bottom_line_reasons(changes, policy)
+    assert any("tests/test_app.py" in reason for reason in reasons)
+    assert any("断言" in reason for reason in reasons)
+
+
+def test_rename_drop_reason_mentions_both_paths(policy: Policy) -> None:
+    from tandem.core.level import bottom_line_reasons
+    from tandem.core.model import AssertionDrop
+
+    changes = ChangeSet(
+        renames=(("tests/test_a.py", "tests/test_b.py"),),
+        assertion_drops=(
+            AssertionDrop(
+                path="tests/test_b.py",
+                previous_path="tests/test_a.py",
+                before=3,
+                after=2,
+            ),
+        ),
+    )
+    reasons = bottom_line_reasons(changes, policy)
+    joined = "；".join(reasons)
+    assert "tests/test_a.py" in joined and "tests/test_b.py" in joined
+    assert compute_level(changes, policy) is Level.D
+
+
+def test_totals_still_count_as_a_drop_when_no_per_file_detail(policy: Policy) -> None:
+    """兼容旧数据：只有合计数字时，合计减少照旧算命中底线。"""
+    changes = ChangeSet(paths=("tests/test_app.py",), assertions_before=5, assertions_after=4)
+    assert compute_level(changes, policy) is Level.D
