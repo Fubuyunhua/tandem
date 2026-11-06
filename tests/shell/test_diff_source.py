@@ -245,3 +245,91 @@ def test_parse_name_status_z_rejects_truncated_output() -> None:
 
     with pytest.raises(DiffError):
         parse_name_status_z(b"M\0")
+
+
+# ------------------------------------------------- H2：断言要按 diff 两端统计，改名的配对
+
+
+def _commit_file(root: Path, path: str, text: str, message: str) -> None:
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", message)
+
+
+def test_git_diff_source_counts_assertions_in_a_renamed_test_file(tmp_path: Path) -> None:
+    """改名后的测试文件也要数断言：3 条减成 2 条仍然算 D。"""
+    from tandem.core.level import compute_level
+    from tests.core.helpers import policy
+
+    root = _make_repo(tmp_path)
+    _commit_file(
+        root,
+        "tests/test_a.py",
+        "def test_a():\n    assert 1\n    assert 2\n    assert 3\n",
+        "add tests",
+    )
+    _git(root, "mv", "tests/test_a.py", "tests/test_b.py")
+    _commit_file(
+        root, "tests/test_b.py", "def test_a():\n    assert 1\n    assert 2\n", "rename and trim"
+    )
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+    assert collected.changes.renames == (("tests/test_a.py", "tests/test_b.py"),)
+    # 之前取旧路径、之后取新路径
+    assert collected.changes.assertions_before == 3
+    assert collected.changes.assertions_after == 2
+    assert collected.changes.assertions_decreased
+    assert compute_level(collected.changes, policy()) is Level.D
+
+
+def test_git_diff_source_uses_the_merge_base_for_the_before_side(tmp_path: Path) -> None:
+    """两条分支各自往前走：之前的内容要取共同祖先，不是 base 分支的最新内容。"""
+    from tandem.core.level import compute_level
+    from tests.core.helpers import policy
+
+    root = _make_repo(tmp_path)
+    _git(root, "checkout", "-q", "-b", "work")
+    _commit_file(
+        root,
+        "tests/test_a.py",
+        "def test_a():\n    assert 1\n    assert 2\n    assert 3\n",
+        "ancestor",
+    )
+    _git(root, "checkout", "-q", "-b", "base-branch")
+    _commit_file(root, "tests/test_a.py", "def test_a():\n    assert 1\n", "base side")
+    _git(root, "checkout", "-q", "work")
+    _commit_file(
+        root, "tests/test_a.py", "def test_a():\n    assert 1\n    assert 2\n", "review side"
+    )
+
+    collected = GitDiffSource(cwd=root).collect("base-branch", "work")
+    # 共同祖先是 3 条断言，受审分支是 2 条 → 减少，判 D
+    assert collected.changes.assertions_before == 3
+    assert collected.changes.assertions_after == 2
+    assert compute_level(collected.changes, policy()) is Level.D
+
+
+def test_git_diff_source_counts_deleted_test_files(tmp_path: Path) -> None:
+    root = _make_repo(tmp_path)
+    _commit_file(root, "tests/test_gone.py", "def test_a():\n    assert 1\n", "add test")
+    _git(root, "rm", "-q", "tests/test_gone.py")
+    _git(root, "commit", "-q", "-m", "drop test")
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+    assert collected.changes.deleted_paths == ("tests/test_gone.py",)
+    assert collected.changes.assertions_before == 1
+    assert collected.changes.assertions_after == 0
+
+
+def test_git_diff_source_rejects_unrelated_histories(tmp_path: Path) -> None:
+    """没有共同祖先时不能瞎猜"之前"的内容。"""
+    from tandem.shell.diff_source import DiffError
+
+    root = _make_repo(tmp_path)
+    _git(root, "checkout", "-q", "--orphan", "other")
+    _commit_file(root, "docs/x.md", "另一个历史\n", "orphan")
+
+    with pytest.raises(DiffError):
+        GitDiffSource(cwd=root).collect("main", "other")

@@ -135,11 +135,13 @@ class GitDiffSource:
     scanner: SecretScanner = NoSecretScan()
 
     def collect(self, base: str, sha: str) -> CollectedDiff:
+        # 先求共同祖先，再看"受审分支相对共同祖先"改了什么
+        merge_base = self._merge_base(base, sha)
         # -z：用 NUL 分隔并且**不做**引号转义，中文、制表符、双引号都能原样拿到
-        payload = self._git_bytes("diff", "--name-status", "-z", "-M", f"{base}...{sha}")
+        payload = self._git_bytes("diff", "--name-status", "-z", "-M", merge_base, sha)
         paths, deleted, renames = parse_name_status_z(payload)
         changed = tuple(paths)
-        before, after = self._assertion_totals(base, sha, changed)
+        before, after = self._assertion_totals(merge_base, sha, paths, deleted, renames)
         scan = self.scanner.scan((*changed, *deleted, *(pair[1] for pair in renames)))
         return CollectedDiff(
             changes=ChangeSet(
@@ -155,15 +157,58 @@ class GitDiffSource:
             secret_scan=scan,
         )
 
+    def _merge_base(self, base: str, sha: str) -> str:
+        """两条历史的分叉点。没有共同祖先时不猜"之前"是什么。"""
+        merged = subprocess.run(
+            ["git", "merge-base", base, sha],
+            cwd=self.cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            check=False,
+        )
+        if merged.returncode != 0:
+            raise DiffError(
+                f"{base} 和 {sha} 没有共同祖先，算不出'之前'的内容：{merged.stderr.strip()}"
+            )
+        return merged.stdout.strip()
+
     def _assertion_totals(
-        self, base: str, sha: str, paths: tuple[str, ...]
+        self,
+        merge_base: str,
+        sha: str,
+        paths: list[str],
+        deleted: list[str],
+        renames: list[tuple[str, str]],
     ) -> tuple[int | None, int | None]:
-        """只在测试文件里数断言，统计增加前后的总数。"""
-        tests = [path for path in paths if TEST_FILE_PATTERN.search(path)]
-        if not tests:
+        """只在测试文件里数断言。
+
+        "之前"取 diff 左端（共同祖先）的内容，"之后"取 diff 右端（受审提交）的内容；
+        改名用旧路径数之前、新路径数之后，不能把改名漏掉。
+        """
+        before = 0
+        after = 0
+        counted = False
+        for path in paths:
+            if not TEST_FILE_PATTERN.search(path):
+                continue
+            before += self._count_assertions(merge_base, path)
+            after += self._count_assertions(sha, path)
+            counted = True
+        for path in deleted:
+            if not TEST_FILE_PATTERN.search(path):
+                continue
+            before += self._count_assertions(merge_base, path)
+            counted = True
+        for old_path, new_path in renames:
+            if not (TEST_FILE_PATTERN.search(old_path) or TEST_FILE_PATTERN.search(new_path)):
+                continue
+            before += self._count_assertions(merge_base, old_path)
+            after += self._count_assertions(sha, new_path)
+            counted = True
+        if not counted:
             return None, None
-        before = sum(self._count_assertions(base, path) for path in tests)
-        after = sum(self._count_assertions(sha, path) for path in tests)
         return before, after
 
     def _count_assertions(self, revision: str, path: str) -> int:
