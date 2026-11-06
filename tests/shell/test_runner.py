@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,51 +14,14 @@ from tandem.core.model import (
     Level,
     QuotaState,
     Review,
-    RunMode,
     TaskStatus,
     Verdict,
 )
 from tandem.shell.agents.claude_cli import ClaudeCliAgent
-from tandem.shell.agents.fake import FakeAgent
-from tandem.shell.config import load_policy
-from tandem.shell.executor import Executor
-from tandem.shell.receipt import parse_receipt, render_receipt
-from tandem.shell.runner import QuotaTracker, Runner, RunnerError
-from tandem.shell.serde import changes_to_dict
-from tandem.shell.store import Store
-from tests.core.helpers import CODE_CHANGES, SHA_1
-
-NOW = datetime(2026, 11, 7, 9, 30, tzinfo=UTC)
-
-
-def code_receipt(task_id: str = "t1", attempt: int = 1, sha: str = SHA_1) -> str:
-    return render_receipt(
-        "DONE：写完了",
-        {
-            "task_id": task_id,
-            "attempt": attempt,
-            "sha": sha,
-            "changes": changes_to_dict(CODE_CHANGES),
-        },
-    )
-
-
-def make_runner(
-    tmp_path: Path,
-    script: list[str] | None = None,
-    *,
-    dry_run: bool = True,
-    agents: dict[str, object] | None = None,
-) -> Runner:
-    agent = FakeAgent(provider="claude", script=script if script is not None else [])
-    store = Store(tmp_path / "tandem.sqlite3")
-    executor = Executor(
-        agents={"claude": agent} if agents is None else agents,  # type: ignore[arg-type]
-        dry_run=dry_run,
-    )
-    # 端到端测试走多 Agent 流程；risk.yml 的默认值是单 Agent 模式
-    policy = replace(load_policy(), run_mode=RunMode.MULTI_AGENT)
-    return Runner(store=store, policy=policy, executor=executor, clock=lambda: NOW)
+from tandem.shell.receipt import parse_receipt
+from tandem.shell.runner import QuotaTracker, RunnerError
+from tests.core.helpers import SHA_1
+from tests.shell.shell_helpers import NOW, code_receipt, make_runner
 
 
 def test_submit_creates_pending_task(tmp_path: Path) -> None:
@@ -88,7 +49,6 @@ def test_assign_runs_fake_agent_and_returns_receipt(tmp_path: Path) -> None:
     assert len(result.receipts) == 1
     receipt = parse_receipt(result.receipts[0])
     assert receipt.sha == SHA_1
-    assert receipt.changes is not None
     actions = runner.store.list_actions("t1")
     assert [action.kind for action in actions] == [ActionKind.START_AGENT]
     assert actions[0].status is ActionStatus.DONE
@@ -100,15 +60,9 @@ def test_full_c_loop_reaches_merged(tmp_path: Path) -> None:
 
     started = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
     receipt = parse_receipt(started.receipts[0])
-    received = runner.handle(
-        Event(
-            kind=EventKind.CODE_SUBMITTED,
-            task_id="t1",
-            attempt=receipt.attempt,
-            sha=receipt.sha,
-            changes=receipt.changes,
-        )
-    )
+    task = runner.store.load_task("t1")
+    assert task is not None
+    received = runner.handle(runner.code_event(task, receipt))
     assert received.decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
 
     reviewed = runner.handle(Event(kind=EventKind.CI_GREEN, task_id="t1", sha=SHA_1))

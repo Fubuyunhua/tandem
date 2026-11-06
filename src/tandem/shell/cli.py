@@ -32,10 +32,10 @@ from tandem.core.model import (
 )
 from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.config import load_policy
+from tandem.shell.diff_source import DiffSource, FakeDiffSource, GitDiffSource
 from tandem.shell.executor import Executor
 from tandem.shell.receipt import Receipt, parse_receipt, render_receipt
 from tandem.shell.runner import Runner, RunnerError
-from tandem.shell.serde import changes_to_dict
 from tandem.shell.store import Store
 
 DEFAULT_DB = Path("data") / "tandem.sqlite3"
@@ -67,6 +67,7 @@ def _open(
     db: Path,
     agents: dict[str, FakeAgent] | None = None,
     policy: Policy | None = None,
+    diff_source: DiffSource | None = None,
 ) -> tuple[Store, Runner]:
     store = Store(db)
     executor = Executor(agents=agents if agents is not None else {}, dry_run=True)
@@ -74,6 +75,7 @@ def _open(
         store=store,
         policy=policy if policy is not None else load_policy(),
         executor=executor,
+        diff_source=diff_source if diff_source is not None else GitDiffSource(),
         clock=_clock,
     )
 
@@ -203,14 +205,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- demo
 
 
-def _demo_receipt(task_id: str, attempt: int, changes: ChangeSet, conclusion: str) -> str:
+def _demo_receipt(task_id: str, attempt: int, conclusion: str) -> str:
+    """demo 的回执：只带必填字段。改动由采集器给，回执里写 changes 会被忽略。"""
     return render_receipt(
         conclusion,
         {
             "task_id": task_id,
             "attempt": attempt,
             "sha": f"demo-{task_id}-{attempt}",
-            "changes": changes_to_dict(changes),
         },
     )
 
@@ -260,16 +262,13 @@ def run_demo(policy_: Policy | None = None) -> int:
         claude = FakeAgent(
             provider="claude",
             script=[
-                _demo_receipt(
-                    "demo-c",
-                    1,
-                    ChangeSet(paths=("src/tandem/shell/cli.py",)),
-                    "DONE：写完了 C 级任务",
-                ),
+                _demo_receipt("demo-c", 1, "DONE：写完了 C 级任务"),
                 _demo_plan_receipt("demo-d", 1, "先改 core 里的 decide，再接外壳"),
             ],
         )
-        store, runner = _open(db, {"claude": claude}, demo_policy)
+        # demo 用假采集器：声称这次真实改动是改了一个外壳文件
+        diff_source = FakeDiffSource(changes=ChangeSet(paths=("src/tandem/shell/cli.py",)))
+        store, runner = _open(db, {"claude": claude}, demo_policy, diff_source)
         try:
             # 场景 1：C 级任务，多 Agent 模式，走到已合并（dry-run）
             path_c: list[TaskStatus] = [TaskStatus.PENDING]
@@ -279,15 +278,10 @@ def run_demo(policy_: Policy | None = None) -> int:
             )
             path_c.append(started.decision.task.status)
             receipt: Receipt = parse_receipt(started.receipts[0])
-            received = runner.handle(
-                Event(
-                    kind=EventKind.CODE_SUBMITTED,
-                    task_id="demo-c",
-                    attempt=receipt.attempt,
-                    sha=receipt.sha,
-                    changes=receipt.changes,
-                )
-            )
+            task_c_pending = runner.store.load_task("demo-c")
+            if task_c_pending is None:  # pragma: no cover - 刚提交过，不可能没有
+                raise RunnerError("场景 1 没有留下任务记录")
+            received = runner.handle(runner.code_event(task_c_pending, receipt))
             path_c.append(received.decision.task.status)
 
             ci = runner.handle(Event(kind=EventKind.CI_GREEN, task_id="demo-c", sha=receipt.sha))

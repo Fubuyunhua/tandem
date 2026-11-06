@@ -24,7 +24,9 @@ from tandem.core.model import (
     TaskStatus,
 )
 from tandem.core.transition import create_task, decide
+from tandem.shell.diff_source import DiffSource
 from tandem.shell.executor import ExecutedAction, Executor
+from tandem.shell.receipt import Receipt
 from tandem.shell.store import Store
 
 
@@ -71,17 +73,40 @@ class Runner:
     store: Store
     policy: Policy
     executor: Executor
+    diff_source: DiffSource
     quota: QuotaTracker = field(default_factory=QuotaTracker)
     clock: Callable[[], datetime] = _utc_now
 
-    def submit(self, task_id: str, level: Level) -> TaskRecord:
+    def submit(self, task_id: str, level: Level, *, base_sha: str = "main") -> TaskRecord:
         """建一个新任务。等级由提交时收集到的真实改动算好传进来。"""
         if self.store.load_task(task_id) is not None:
             raise RunnerError(f"任务 {task_id} 已经存在")
         now = self.clock()
-        task = replace(create_task(task_id, level, self.policy), updated_at=now)
+        task = replace(create_task(task_id, level, self.policy), updated_at=now, base_sha=base_sha)
         self.store.save_task(task, now)
         return task
+
+    def code_event(self, task: TaskRecord, receipt: Receipt, *, base: str | None = None) -> Event:
+        """Agent 交回代码。
+
+        改动一律来自 `DiffSource`：回执只提供任务编号、尝试次数和提交编号，
+        Agent 自报的 changes 已经被回执解析丢掉了（回执只是自述，不是证据）。
+        """
+        collected = self.diff_source.collect(
+            base if base is not None else (task.base_sha or "main"), receipt.sha
+        )
+        reason = collected.describe()
+        if receipt.warnings:
+            reason = f"{reason}；{'；'.join(receipt.warnings)}"
+        return Event(
+            kind=EventKind.CODE_SUBMITTED,
+            task_id=task.task_id,
+            state_version=task.state_version,
+            attempt=receipt.attempt,
+            sha=receipt.sha,
+            changes=collected.changes,
+            reason=reason,
+        )
 
     def handle(self, event: Event) -> RunResult:
         """处理一个事件：先保存，再执行。"""

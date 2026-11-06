@@ -23,14 +23,6 @@ def test_valid_receipt() -> None:
                 "learn": "底线为什么要先查",
                 "level": "C",
             },
-            "changes": {
-                "paths": ["src/tandem/core/level.py"],
-                "deleted_paths": [],
-                "renames": [],
-                "assertions_before": 1,
-                "assertions_after": 3,
-                "secret_scan_hit": False,
-            },
         },
     )
     receipt = parse_receipt(text)
@@ -41,14 +33,14 @@ def test_valid_receipt() -> None:
     assert receipt.plan == "先写内核"
     assert receipt.brief is not None
     assert receipt.brief.what == "加了等级计算"
-    assert receipt.changes is not None
-    assert receipt.changes.paths == ("src/tandem/core/level.py",)
-    assert receipt.changes.assertions_after == 3
+    # 这份回执没有 changes 字段，所以没有警告
+    assert not hasattr(receipt, "changes")
+    assert receipt.warnings == ()
 
 
 def test_receipt_without_changes_is_valid() -> None:
     receipt = parse_receipt('DONE\n{"task_id": "t", "attempt": 1, "sha": "abc"}')
-    assert receipt.changes is None
+    assert receipt.warnings == ()
     assert receipt.brief is None
 
 
@@ -96,8 +88,9 @@ def test_blank_sha_is_invalid() -> None:
         parse_receipt('DONE\n{"task_id": "t", "attempt": 1, "sha": "  "}')
 
 
-def test_bad_changes_block_is_invalid() -> None:
-    with pytest.raises(ReceiptError):
-        parse_receipt(
-            'DONE\n{"task_id": "t", "attempt": 1, "sha": "abc", "changes": {"paths": "不是列表"}}'
-        )
+def test_bad_changes_block_is_ignored_too() -> None:
+    """连格式不对的 changes 也不报错：这个字段本来就不采用了。"""
+    receipt = parse_receipt(
+        'DONE\n{"task_id": "t", "attempt": 1, "sha": "abc", "changes": {"paths": "不是列表"}}'
+    )
+    assert receipt.warnings

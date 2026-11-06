@@ -195,6 +195,7 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "ci_green": task.ci_green,
         "pr_opened": task.pr_opened,
         "attempt": task.attempt,
+        "base_sha": task.base_sha,
         "returned_from_review": task.returned_from_review,
         "actions": [action_to_dict(action) for action in task.actions],
         "reason": task.reason,
@@ -259,6 +260,7 @@ def task_from_dict(data: object) -> TaskRecord:
         ci_green=_bool(mapping.get("ci_green"), "ci_green"),
         pr_opened=_bool(mapping.get("pr_opened"), "pr_opened"),
         attempt=_int(mapping.get("attempt"), "attempt"),
+        base_sha=_str(mapping.get("base_sha", ""), "base_sha"),
         returned_from_review=_bool(mapping.get("returned_from_review"), "returned_from_review"),
         actions=tuple(
             action_from_dict(entry) for entry in _list(mapping.get("actions", []), "actions")

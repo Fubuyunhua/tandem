@@ -2,8 +2,10 @@
 
 回执格式（PRD F4）：第一行写结论，后面附 JSON。
 JSON 必须包含 ``task_id``、``attempt``、``sha``，缺任何一个都算无效回执。
-另外支持 PRD 里的 ``brief``（what / why / verify / rollback / learn / level）
-和外壳收集好的 ``changes``（真实改动，用来重新算等级）。
+另外支持 PRD 里的 ``brief``（what / why / verify / rollback / learn / level）。
+
+回执里的 ``changes`` 字段一律忽略：回执只是自述，等级必须按外壳从版本库
+采集到的真实改动算。看到这个字段就记一条警告。
 """
 
 from __future__ import annotations
@@ -11,9 +13,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import cast
-
-from tandem.core.model import ChangeSet
-from tandem.shell.serde import SerializationError, changes_from_dict
 
 REQUIRED_FIELDS = ("task_id", "attempt", "sha")
 
@@ -44,8 +43,8 @@ class Receipt:
     sha: str
     plan: str = ""
     brief: Brief | None = None
-    changes: ChangeSet | None = None
     body: str = ""
+    warnings: tuple[str, ...] = ()
 
 
 def _text(value: object, name: str) -> str:
@@ -116,12 +115,9 @@ def parse_receipt(text: str) -> Receipt:
     if not isinstance(plan, str):
         raise ReceiptError("plan 必须是字符串")
 
-    changes: ChangeSet | None = None
-    if payload.get("changes") is not None:
-        try:
-            changes = changes_from_dict(payload["changes"])
-        except SerializationError as error:
-            raise ReceiptError(f"回执里的 changes 不合法：{error}") from error
+    warnings: tuple[str, ...] = ()
+    if "changes" in payload:
+        warnings = ("回执里的 changes 一律忽略：等级按采集器读到的真实改动算",)
 
     brief = _parse_brief(payload["brief"]) if payload.get("brief") is not None else None
 
@@ -132,8 +128,8 @@ def parse_receipt(text: str) -> Receipt:
         sha=sha,
         plan=plan,
         brief=brief,
-        changes=changes,
         body=body,
+        warnings=warnings,
     )
 
 

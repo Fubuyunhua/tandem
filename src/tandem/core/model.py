@@ -295,6 +295,9 @@ class TaskRecord:
     # 第几次尝试（回执要带回来核对）
     attempt: int = 0
 
+    # 改动采集的基线（外壳用 base...latest_sha 算真实改动，内核不读它）
+    base_sha: str = ""
+
     # 上一轮是不是被审核退回的（第 6 条"取消了仲裁"）
     returned_from_review: bool = False
 
