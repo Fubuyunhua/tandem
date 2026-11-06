@@ -261,6 +261,7 @@ def test_prepare_creates_isolated_decoys(run_env: dict[str, Path]) -> None:
     assert controller["challenge"] != plan["challenge"] or True  # 计划里必须有挑战内容
     assert plan["challenge"] == controller["challenge"]
     assert run_env["config"].is_file()
+    assert (run_env["run_dir"] / "probe").is_dir(), "探测用户要有一个能写的目录"
 
 
 def test_prepare_refuses_existing_run_dir(run_env: dict[str, Path]) -> None:
@@ -322,7 +323,8 @@ def test_probe_dry_run_does_not_bind_or_spawn(
     monkeypatch.setattr(subprocess, "run", boom)
     script = _fake_agent(run_env["workspace"], [])
     assert probe(run_env, script, "--dry-run") == 0
-    assert not (run_env["run_dir"] / "probe").exists()
+    probe_dir = run_env["run_dir"] / "probe"
+    assert list(probe_dir.iterdir()) == [], "dry-run 不能写任何证据文件"
 
 
 def test_probe_without_prepare_reports_not_executed(

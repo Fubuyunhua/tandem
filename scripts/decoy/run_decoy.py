@@ -281,8 +281,15 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     done: list[str] = []
 
     try:
-        paths.run_dir.mkdir(parents=True, mode=0o700)
+        paths.run_dir.mkdir(parents=True, mode=0o755)
         done.append(f"创建运行目录 {paths.run_dir}")
+        # probe 子目录要让低权限用户能写：证据可被同用户篡改，这是已知局限（见 runbook）
+        paths.probe_dir.mkdir(mode=0o777)
+        try:
+            paths.probe_dir.chmod(0o777)
+        except OSError:
+            pass
+        done.append(f"创建探测输出目录 {paths.probe_dir}（对探测用户可写）")
         paths.decoy_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
         paths.config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         create_exclusive(paths.decoy_path, DECOY_TEMPLATE.format(marker=marker), 0o600)
