@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 
+from tandem.core.level import compute_level
 from tandem.core.model import Event, EventKind, Finding, Review, TaskRecord, TaskStatus, Verdict
 from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.receipt import parse_receipt, render_receipt
@@ -33,6 +34,7 @@ class LocalRun:
     agents: dict[str, FakeAgent]
     agent_script: str = "ok"
     review: str = "pass"
+    allow_level_drop: bool = False
 
     def _event(self, task: TaskRecord, kind: EventKind, **fields: object) -> Event:
         return Event(
@@ -72,6 +74,18 @@ class LocalRun:
         return render_receipt("DONE：模拟写手交回代码", payload)
 
     def _assign(self, task: TaskRecord) -> TaskRecord:
+        # 在派活、产生回执和保存事件前核对，拒绝降级时任务完全不变。
+        changes = self.runner.diff_source.collect(task.base_sha, "simulation").changes
+        new_level = compute_level(changes, self.runner.policy)
+        if new_level.rank < task.level.rank:
+            print(
+                f"【等级下降{'已允许' if self.allow_level_drop else '已阻止'}】"
+                f"{task.task_id}：{task.level.value} → {new_level.value}。"
+                "模拟证据不能证明这次真的只改了低风险文件；可能减少审核或人工关口。"
+            )
+            if not self.allow_level_drop:
+                print("  已停止此任务；确认后必须显式传入 --allow-level-drop 才能继续。")
+                return task
         provider = self.runner.policy.default_writer
         agent = self.agents[provider]
         # 派活同步完成；被内核拒绝派活时，不把未使用的回执留给别的任务。

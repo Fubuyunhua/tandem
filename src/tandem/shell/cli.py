@@ -202,18 +202,26 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    db = _db_path(args)
+    if not db.is_file():
+        print(f"还没有数据库：{db}（请先 submit）")
+        return 1
     policy = load_policy()
     agents = {provider: FakeAgent(provider=provider) for provider in policy.writer_providers}
     changes = ChangeSet(
         paths=tuple(path.strip() for path in args.changes.split(",") if path.strip())
     )
     store, runner = _open(
-        _db_path(args), agents=agents, policy=policy, diff_source=FakeDiffSource(changes=changes)
+        db, agents=agents, policy=policy, diff_source=FakeDiffSource(changes=changes)
     )
     try:
-        return LocalRun(runner, agents, args.agent_script, args.review).run(
-            until_idle=args.until_idle, max_rounds=args.max_rounds
-        )
+        return LocalRun(
+            runner,
+            agents,
+            args.agent_script,
+            args.review,
+            allow_level_drop=args.allow_level_drop,
+        ).run(until_idle=args.until_idle, max_rounds=args.max_rounds)
     finally:
         store.close()
 
@@ -474,6 +482,13 @@ def _positive_rounds(value: str) -> int:
     return rounds
 
 
+def _nonempty_changes(value: str) -> str:
+    """不能用空的模拟改动把任务变成无需审核的 A 级。"""
+    if not any(path.strip() for path in value.split(",")):
+        raise argparse.ArgumentTypeError("--changes 不能为空，必须提供至少一个模拟改动路径")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tandem", description="个人 AI 开发循环系统")
     common = argparse.ArgumentParser(add_help=False)
@@ -486,7 +501,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", parents=[common], help="用假证据推进一轮本地任务")
     run.add_argument("--agent-script", choices=("ok", "ci-red", "refuse"), default="ok")
-    run.add_argument("--changes", default="src/x.py", help="模拟改动路径，逗号分隔（每轮重算等级）")
+    run.add_argument(
+        "--changes",
+        required=True,
+        type=_nonempty_changes,
+        help="模拟改动路径，逗号分隔，必填且非空（每轮重算等级）",
+    )
+    run.add_argument(
+        "--allow-level-drop",
+        action="store_true",
+        help="明确允许模拟改动降低任务等级，可能减少审核或人工关口",
+    )
     run.add_argument("--review", choices=("pass", "fail"), default="pass", help="模拟 AI 审核结论")
     run.add_argument("--until-idle", action="store_true", help="重复运行直到需要人工处理或无进展")
     run.add_argument(

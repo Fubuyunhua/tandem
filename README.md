@@ -96,9 +96,12 @@ uv run tandem run --db data/manual-review.sqlite3 --changes src/x.py --review pa
 - `--agent-script ok|ci-red|refuse` 默认 `ok`；`ci-red` 模拟 CI 失败。
   `refuse` 在任务上一轮被 AI 审核退回后模拟拒绝修改、进入“待你介入”；其他情况下
   按正常回执处理，D 级未批方案时仍先交方案。
-- `--changes` 是本次模拟采集到的路径（逗号分隔，默认 `src/x.py`），对本轮所有任务
+- `--changes` 是本次模拟采集到的路径（逗号分隔，必填且不能全空），对本轮所有任务
   生效。`submit --paths` 只是初始分级输入，**后续 run 不会记住它**；请像例子一样，
   每次提供一致的 `--changes`，尤其是在 D 级方案批准后。每次代码回执都会重新分级。
+  如果新等级低于任务原等级，run 会在派活前醒目提示并停止该任务，不写入推进事件。
+  只有确认接受审核或人工关口可能减少后，显式加 `--allow-level-drop` 才会继续。
+- 数据库不存在时，`run` 返回 1，不创建空库或父目录；先用 `submit` 建立任务。
 - `--review pass|fail` 默认 `pass`，只控制 AI 审核阶段；单 Agent 仍由你审核。
 - 停在“待你批准方案”“待你审核”“待你介入”时会给出 `show` 和适用的 `approve`
   命令。否决意见需要 `--veto '完整复合键=你的理由'`，每项分别填写。
