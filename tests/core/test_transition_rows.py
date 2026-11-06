@@ -93,7 +93,7 @@ def test_row_01_single_agent_mode_needs_no_reviewer() -> None:
 
 def test_row_02_d_level_plan_waits_for_you() -> None:
     record = to_working(new_task(Level.D))
-    decision = run(record, ev(EventKind.PLAN_SUBMITTED, plan="先改 decide 的签名"))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, sha=SHA_1, plan="先改 decide 的签名"))
     assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
     assert decision.task.plan_version == 1
     assert ActionKind.NOTIFY in [action.kind for action in decision.actions]
@@ -101,15 +101,15 @@ def test_row_02_d_level_plan_waits_for_you() -> None:
 
 def test_row_02_c_level_plan_is_only_a_note() -> None:
     record = to_working(new_task(Level.C))
-    decision = run(record, ev(EventKind.PLAN_SUBMITTED, plan="随便写点"))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, sha=SHA_1, plan="随便写点"))
     assert decision.task.status is TaskStatus.WORKING
     assert not decision.changed
 
 
 def test_row_03_you_approve_the_plan() -> None:
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="方案第一版")).task
-    decision = run(record, ev(EventKind.PLAN_APPROVED))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha=SHA_1, plan="方案第一版")).task
+    decision = run(record, ev(EventKind.PLAN_APPROVED, sha=SHA_1))
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.approved_plan_version == 1
     assert decision.task.plan_version == 1
@@ -117,7 +117,7 @@ def test_row_03_you_approve_the_plan() -> None:
 
 def test_row_04_you_reject_the_plan() -> None:
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="方案第一版")).task
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha=SHA_1, plan="方案第一版")).task
     decision = run(record, ev(EventKind.PLAN_REJECTED, reason="先写测试"))
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.approved_plan_version is None
@@ -1456,8 +1456,8 @@ def test_row_02_new_plan_with_a_new_sha_clears_stale_ci_and_seats() -> None:
     """
     walker = Walker(new_task(Level.D))
     walker.assign("claude")
-    walker.step(ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="第一版方案"))
-    walker.step(ev(EventKind.PLAN_APPROVED, sha="plan-a"))
+    walker.step(ev(EventKind.PLAN_SUBMITTED, sha="a" * 40, plan="第一版方案"))
+    walker.step(ev(EventKind.PLAN_APPROVED, sha="a" * 40))
     walker.assign("claude")
     walker.submit_code(sha=SHA_OLD, changes=CORE_CHANGES)
     walker.ci_green()
@@ -1554,11 +1554,11 @@ def test_row_02_submitted_plan_text_survives_later_transitions() -> None:
     record = to_working(new_task(Level.D))
     record = run(
         record,
-        ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="先加纯函数，再接外壳"),
+        ev(EventKind.PLAN_SUBMITTED, sha="a" * 40, plan="先加纯函数，再接外壳"),
     ).task
     assert record.plan_text == "先加纯函数，再接外壳"
 
-    record = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-a")).task
+    record = run(record, ev(EventKind.PLAN_APPROVED, sha="a" * 40)).task
     record = to_working(record)
     record = to_acceptance(record, sha=SHA_1, changes=CORE_CHANGES)
     # note 会被后面的转换改掉，方案正文不能跟着没

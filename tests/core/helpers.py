@@ -121,8 +121,8 @@ def to_ai_review(level: Level = Level.C, quota_: QuotaSnapshot | None = None) ->
 def to_d_ai_review() -> TaskRecord:
     """D 级：先走方案批准，再交代码到待AI审核。"""
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="先改 core 里的 decide")).task
-    record = run(record, ev(EventKind.PLAN_APPROVED)).task
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha=SHA_1, plan="先改 core 里的 decide")).task
+    record = run(record, ev(EventKind.PLAN_APPROVED, sha=SHA_1)).task
     record = to_working(record)
     record = to_acceptance(record, changes=CORE_CHANGES)
     return run(record, ev(EventKind.CI_GREEN, sha=record.latest_sha)).task

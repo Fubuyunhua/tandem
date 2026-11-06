@@ -68,8 +68,8 @@ def test_scenario_2_d_level_needs_plan_approval_first() -> None:
     """2. D 级任务：开工前需要你先批准方案。"""
     walker = Walker(new_task(Level.D))
     walker.assign("claude")
-    walker.step(ev(EventKind.PLAN_SUBMITTED, plan="先加纯函数 decide，再加外壳"))
-    walker.step(ev(EventKind.PLAN_APPROVED))
+    walker.step(ev(EventKind.PLAN_SUBMITTED, sha=SHA_1, plan="先加纯函数 decide，再加外壳"))
+    walker.step(ev(EventKind.PLAN_APPROVED, sha=SHA_1))
     walker.assign("claude")
     walker.submit_code(changes=CORE_CHANGES)
     walker.ci_green()
@@ -178,8 +178,8 @@ def test_scenario_7_you_send_the_code_back() -> None:
     """7. 你审查时打回，要求修改：退回待处理，改完再走一遍。"""
     walker = Walker(new_task(Level.D))
     walker.assign("claude")
-    walker.step(ev(EventKind.PLAN_SUBMITTED, plan="方案"))
-    walker.step(ev(EventKind.PLAN_APPROVED))
+    walker.step(ev(EventKind.PLAN_SUBMITTED, sha=SHA_1, plan="方案"))
+    walker.step(ev(EventKind.PLAN_APPROVED, sha=SHA_1))
     walker.assign("claude")
     walker.submit_code(changes=CORE_CHANGES)
     walker.ci_green()

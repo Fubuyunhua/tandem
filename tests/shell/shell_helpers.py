@@ -28,7 +28,7 @@ def code_receipt(
 
 
 def plan_receipt(
-    task_id: str = "t1", attempt: int = 1, sha: str = "plan-sha", plan: str = "先写内核"
+    task_id: str = "t1", attempt: int = 1, sha: str = "a" * 40, plan: str = "先写内核"
 ) -> str:
     return render_receipt(
         "PLAN：先交方案",

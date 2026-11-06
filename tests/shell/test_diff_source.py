@@ -56,7 +56,7 @@ def test_runner_ignores_the_agent_self_report(tmp_path: Path) -> None:
     """回执自称只改了 docs，采集器说改了 core：按 core 算，任务升成 D 级。"""
     lying = render_receipt(
         "DONE：只改了文档",
-        {"task_id": "t1", "attempt": 1, "sha": "abc", "changes": {"paths": ["docs/a.md"]}},
+        {"task_id": "t1", "attempt": 1, "sha": "a" * 40, "changes": {"paths": ["docs/a.md"]}},
     )
     runner = make_runner(
         tmp_path,

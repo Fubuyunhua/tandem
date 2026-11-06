@@ -121,8 +121,9 @@ class Runner:
             raise ReceiptError(
                 f"回执里的任务编号是 {receipt.task_id}，和当前任务 {task.task_id} 不一致"
             )
+        sha = self.diff_source.resolve_oid(receipt.sha)
         collected = self.diff_source.collect(
-            base if base is not None else (task.base_sha or "main"), receipt.sha
+            base if base is not None else (task.base_sha or "main"), sha
         )
         reason = collected.describe()
         if receipt.warnings:
@@ -132,7 +133,7 @@ class Runner:
             task_id=task.task_id,
             state_version=task.state_version,
             attempt=receipt.attempt,
-            sha=receipt.sha,
+            sha=sha,
             changes=collected.changes,
             reason=reason,
         )

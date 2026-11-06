@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from tandem.core.identity import is_commit_oid
 from tandem.core.model import AssertionDrop, ChangeSet
 
 # 数断言用的近似写法：Python 的 assert、JS 的 expect(
@@ -67,6 +68,7 @@ class DiffSource(Protocol):
     """一处改动从哪里来。测试和 demo 用假实现，生产用 git。"""
 
     def collect(self, base: str, sha: str) -> CollectedDiff: ...
+    def resolve_oid(self, ref: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,11 @@ class FakeDiffSource:
 
     changes: ChangeSet
     secret_scan: SecretScanState = SecretScanState.NOT_SCANNED
+
+    def resolve_oid(self, ref: str) -> str:
+        if not is_commit_oid(ref):
+            raise DiffError("假采集器只接受完整模拟 OID")
+        return ref
 
     def collect(self, base: str, sha: str) -> CollectedDiff:
         return CollectedDiff(
@@ -134,7 +141,16 @@ class GitDiffSource:
     cwd: Path | None = None
     scanner: SecretScanner = NoSecretScan()
 
+    def resolve_oid(self, ref: str) -> str:
+        value = self._git_bytes("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
+        oid = value.decode("ascii").strip().lower()
+        if not is_commit_oid(oid):
+            raise DiffError("Git 未返回完整提交 OID")
+        return oid
+
     def collect(self, base: str, sha: str) -> CollectedDiff:
+        sha = self.resolve_oid(sha)
+        base = self.resolve_oid(base)
         # 先求共同祖先，再看"受审分支相对共同祖先"改了什么
         merge_base = self._merge_base(base, sha)
         # -z：用 NUL 分隔并且**不做**引号转义，中文、制表符、双引号都能原样拿到

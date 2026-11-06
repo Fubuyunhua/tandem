@@ -16,6 +16,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import assert_never
 
+from tandem.core.identity import is_commit_oid
 from tandem.core.level import bottom_line_reasons, compute_level
 from tandem.core.model import (
     Action,
@@ -252,6 +253,14 @@ def _dispatch(
 ) -> Decision:
     if event.task_id != task.task_id:
         return _ignore(task, "事件的任务编号和任务记录不一致")
+    if event.sha is not None and not is_commit_oid(event.sha):
+        return _ignore(task, "提交编号必须是完整的 40/64 位十六进制 OID")
+    if event.kind in {EventKind.PLAN_SUBMITTED, EventKind.PLAN_APPROVED} and not is_commit_oid(
+        event.sha
+    ):
+        return _ignore(task, "方案提交和批准必须携带完整提交编号 OID")
+    if event.review is not None and not is_commit_oid(event.review.sha):
+        return _ignore(task, "审核结论必须绑定完整提交 OID")
     if event.state_version is not None and event.state_version != task.state_version:
         return _ignore(
             task,
@@ -733,10 +742,24 @@ def _on_ci_green(task: TaskRecord, event: Event, policy: Policy, quota: QuotaSna
 
 def _on_ci_red(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """10 / 11. 待验收 → 待处理（带原因），失败达到上限 → 待你介入（R01）。"""
-    if task.status is not TaskStatus.AWAITING_ACCEPTANCE:
-        return _ignore(task, "只有在待验收的任务才会收到 CI 结果")
     if task.latest_sha is None or event.sha != task.latest_sha:
         return _ignore(task, "CI 结果没有带当前提交编号，或者编号对不上，忽略")
+    if task.status is not TaskStatus.AWAITING_ACCEPTANCE:
+        if not task.ci_green:
+            return _ignore(task, "本提交已经没有有效绿灯证据")
+        actions = _Actions(task, task.state_version + 1)
+        actions.add(ActionKind.NOTIFY, detail="同一提交 CI 已变红，撤销绿灯、审核和批准证据")
+        # 合并可能已经发出，不能假装撤回成功；留在原状态等待外部核对。
+        return _transition(
+            task,
+            task.status,
+            "同一提交 CI 变红，所有放行证据已撤销",
+            actions.items,
+            ci_green=False,
+            approved_sha=None,
+            reviews=(),
+            designated_reviewers=(),
+        )
     failures = task.accept_failures + 1
     limit = policy.thresholds.max_accept_failures
     reason = event.reason or "CI 没有给出原因"
