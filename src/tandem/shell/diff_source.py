@@ -8,21 +8,30 @@
 
 from __future__ import annotations
 
+import os
+import posixpath
 import re
 import subprocess
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
 from tandem.core.identity import is_commit_oid
-from tandem.core.model import AssertionDrop, ChangeSet
+from tandem.core.model import AssertionDrop, ChangeSet, FileChange
 
 # 数断言用的近似写法：Python 的 assert、JS 的 expect(
 ASSERTION_PATTERN = re.compile(r"(?<![\w.])(assert\b|expect\s*\()")
 
 # 测试文件的判定（只用来数断言）
 TEST_FILE_PATTERN = re.compile(r"(^|/)(tests?/|test_[^/]*\.py$|[^/]*_test\.(py|js|ts)$)")
+
+
+def _clean_git_environment() -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_OPTIONAL_LOCKS="0")
+    return env
 
 
 class DiffError(RuntimeError):
@@ -134,12 +143,40 @@ def parse_name_status_z(payload: bytes) -> tuple[list[str], list[str], list[tupl
     return paths, deleted, renames
 
 
+def parse_raw_diff_z(
+    payload: bytes,
+) -> tuple[list[str], list[str], list[tuple[str, str]], tuple[FileChange, ...]]:
+    """保留 raw diff 两端模式，名称仍按 NUL 解码。"""
+    fields = payload.split(b"\0")
+    index = 0
+    names = bytearray()
+    entries: list[FileChange] = []
+    while index < len(fields) and fields[index]:
+        header = fields[index].decode("ascii").split()
+        if len(header) != 5 or not header[0].startswith(":"):
+            raise DiffError("Git raw diff 格式错误")
+        status = header[4]
+        count = 2 if status.startswith(("R", "C")) else 1
+        if index + count >= len(fields) or not all(fields[index + 1 : index + count + 1]):
+            raise DiffError("Git raw diff 被截断")
+        raw_paths = fields[index + 1 : index + count + 1]
+        names.extend(status.encode() + b"\0" + b"\0".join(raw_paths) + b"\0")
+        paths = [part.decode("utf-8", "surrogateescape") for part in raw_paths]
+        entries.append(
+            FileChange(paths[-1], header[0][1:], header[1], paths[0] if count == 2 else None)
+        )
+        index += count + 1
+    paths, deleted, renames = parse_name_status_z(bytes(names))
+    return paths, deleted, renames, tuple(entries)
+
+
 @dataclass(frozen=True)
 class GitDiffSource:
     """真实实现：`git diff --name-status -M base...sha`，再数一遍断言的变化。"""
 
     cwd: Path | None = None
     scanner: SecretScanner = NoSecretScan()
+    _environment: dict[str, str] | None = field(default=None, repr=False, compare=False)
 
     def resolve_oid(self, ref: str) -> str:
         value = self._git_bytes("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
@@ -151,17 +188,68 @@ class GitDiffSource:
     def collect(self, base: str, sha: str) -> CollectedDiff:
         sha = self.resolve_oid(sha)
         base = self.resolve_oid(base)
+        # 只借用对象库；临时 bare 仓库没有用户 diff.*、属性驱动或原仓库配置。
+        objects = Path(self._git_bytes("rev-parse", "--git-path", "objects").decode().strip())
+        if not objects.is_absolute():
+            objects = (self.cwd or Path.cwd()) / objects
+        object_format = self._git_bytes("rev-parse", "--show-object-format").decode().strip()
+        env = _clean_git_environment()
+        with tempfile.TemporaryDirectory(prefix="tandem-diff-") as directory:
+            bare = Path(directory)
+            initialized = subprocess.run(
+                [
+                    "git",
+                    "init",
+                    "--bare",
+                    "--template=",
+                    f"--object-format={object_format}",
+                    str(bare),
+                ],
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            if initialized.returncode:
+                raise DiffError("无法创建隔离的 Git 读取环境")
+            env["GIT_OBJECT_DIRECTORY"] = str(objects.resolve())
+            return replace(self, cwd=bare, _environment=env)._collect_oids(base, sha)
+
+    def _collect_oids(self, base: str, sha: str) -> CollectedDiff:
         # 先求共同祖先，再看"受审分支相对共同祖先"改了什么
         merge_base = self._merge_base(base, sha)
         # -z：用 NUL 分隔并且**不做**引号转义，中文、制表符、双引号都能原样拿到
-        payload = self._git_bytes("diff", "--name-status", "-z", "-M", merge_base, sha)
-        paths, deleted, renames = parse_name_status_z(payload)
+        payload = self._git_bytes(
+            "diff",
+            "--raw",
+            "--no-abbrev",
+            "-z",
+            "-M",
+            "--ignore-submodules=none",
+            "--no-ext-diff",
+            "--no-textconv",
+            merge_base,
+            sha,
+        )
+        paths, deleted, renames, entries = parse_raw_diff_z(payload)
+        entries = tuple(
+            replace(
+                entry,
+                before_target=self._resolve_link(merge_base, entry.previous_path or entry.path)
+                if entry.before_mode == "120000"
+                else None,
+                after_target=self._resolve_link(sha, entry.path)
+                if entry.after_mode == "120000"
+                else None,
+            )
+            for entry in entries
+        )
         changed = tuple(paths)
         before, after, drops = self._assertion_changes(merge_base, sha, paths, deleted, renames)
         scan = self.scanner.scan((*changed, *deleted, *(pair[1] for pair in renames)))
         return CollectedDiff(
             changes=ChangeSet(
                 paths=changed,
+                file_changes=entries,
                 deleted_paths=tuple(deleted),
                 renames=tuple(renames),
                 assertions_before=before,
@@ -174,11 +262,41 @@ class GitDiffSource:
             secret_scan=scan,
         )
 
+    def _tree_mode(self, revision: str, path: str) -> str:
+        data = self._git_bytes("--literal-pathspecs", "ls-tree", "-z", revision, "--", path)
+        return data.split(b" ", 1)[0].decode("ascii") if data else "000000"
+
+    def _resolve_link(self, revision: str, path: str) -> str:
+        seen: set[str] = set()
+        target = path
+        for _ in range(40):
+            parts = target.split("/")
+            for index in range(1, len(parts) + 1):
+                prefix = "/".join(parts[:index])
+                if self._tree_mode(revision, prefix) != "120000":
+                    continue
+                if prefix in seen:
+                    raise DiffError("符号链接出现循环，不能确认目标")
+                seen.add(prefix)
+                raw = self._git_show(revision, prefix).replace("\\", "/")
+                if len(raw) > 1 and raw[1] == ":":
+                    return "/仓库外链接"
+                target = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(prefix), raw, *parts[index:])
+                )
+                if target.startswith("/") or target == ".." or target.startswith("../"):
+                    return "/仓库外链接"
+                break
+            else:
+                return target
+        raise DiffError("符号链接层数过多，不能确认目标")
+
     def _merge_base(self, base: str, sha: str) -> str:
         """两条历史的分叉点。没有共同祖先时不猜"之前"是什么。"""
         merged = subprocess.run(
             ["git", "merge-base", base, sha],
             cwd=self.cwd,
+            env=self._environment or _clean_git_environment(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -258,6 +376,7 @@ class GitDiffSource:
         completed = subprocess.run(
             ["git", "show", f"{revision}:{path}"],
             cwd=self.cwd,
+            env=self._environment or _clean_git_environment(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -273,6 +392,7 @@ class GitDiffSource:
         completed = subprocess.run(
             ["git", *args],
             cwd=self.cwd,
+            env=self._environment or _clean_git_environment(),
             capture_output=True,
             check=False,
         )

@@ -196,6 +196,18 @@ class AssertionDrop:
 
 
 @dataclass(frozen=True)
+class FileChange:
+    """Git 两端的文件模式及解析后的仓库相对链接目标。"""
+
+    path: str
+    before_mode: str
+    after_mode: str
+    previous_path: str | None = None
+    before_target: str | None = None
+    after_target: str | None = None
+
+
+@dataclass(frozen=True)
 class ChangeSet:
     """真实改动。由外壳从 diff 收集，内核据此算等级。
 
@@ -212,6 +224,7 @@ class ChangeSet:
     assertions_after: int | None = None
     assertion_drops: tuple[AssertionDrop, ...] = ()
     secret_scan_hit: bool = False
+    file_changes: tuple[FileChange, ...] = ()
 
     @property
     def touches_repository(self) -> bool:

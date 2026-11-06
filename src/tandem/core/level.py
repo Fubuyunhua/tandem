@@ -107,6 +107,13 @@ def bottom_line_reasons(changes: ChangeSet, policy: Policy) -> tuple[str, ...]:
     for path in paths:
         if _matches_any(policy.bottom_line_paths, path):
             reasons.append(f"改动了底线条目相关的路径 {path}")
+    for entry in changes.file_changes:
+        for target in (entry.before_target, entry.after_target):
+            if target is None:
+                continue
+            clean = normalize_path(target)
+            if clean is None or _matches_any(policy.bottom_line_paths, clean):
+                reasons.append(f"符号链接 {entry.path} 指向受保护或仓库外路径 {target}")
     return tuple(reasons)
 
 
@@ -130,6 +137,11 @@ def all_paths_relaxable(changes: ChangeSet, policy: Policy) -> bool:
     if illegal or not paths:
         return False
     if hits_bottom_line(changes, policy):
+        return False
+    if any(
+        entry.before_mode not in {"000000", "100644"} or entry.after_mode != "100644"
+        for entry in changes.file_changes
+    ):
         return False
     return all(
         _matches_any(policy.relaxable_paths, path) and _is_document(path, policy) for path in paths
