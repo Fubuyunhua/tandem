@@ -1,0 +1,82 @@
+# 等级策略：底线条目、可放宽路径、等级流程、阈值。
+# 改这个文件本身按 D 级处理（ADR-0001"等级可以修改"）。
+
+version: 1
+
+# 运行模式：M1 只有 Claude，所以用 single_agent（所有等级都由你审）。
+# 等到 M2 有了第二家审核者，改成 multi_agent。
+run_mode: multi_agent
+
+# 默认写手（risk.yml 里没特别说明时派给谁）
+default_writer: claude
+
+# 可用的模型提供方。"另一家"按提供方算，不按工具算。
+providers:
+  - name: claude
+    can_write: true
+    can_review: true
+  - name: codex
+    can_write: true
+    can_review: true
+  - name: opencode-go
+    can_write: true
+    can_review: true
+
+# 底线条目：改动命中任意一条，基础级别就是 D。
+# 用 glob 匹配，`core/**` 这类写法会同时匹配仓库根目录和中间层级。
+bottom_line_paths:
+  - "core/**"
+  - "src/tandem/core/**"
+  - ".github/**"
+  - "risk.yml"
+  - "scripts/gate/**"
+  - "prompts/**"
+  # 依赖清单和 lock 文件
+  - "package.json"
+  - "pyproject.toml"
+  - "requirements*.txt"
+  - "uv.lock"
+  - "package-lock.json"
+  - "pnpm-lock.yaml"
+  # 数据迁移
+  - "**/migrations/**"
+  # 密钥相关
+  - ".env*"
+  - "*.pem"
+  - "*.key"
+
+# 可放宽区：v1 只有纯文档。由规则划定，不由模型判断，最多降一级且最低到 B。
+relaxable_paths:
+  - "docs/**"
+  - "README.md"
+  - "*.md"
+  - "**/*.md"
+
+# 阈值（ADR-0001 里的占位值）
+thresholds:
+  required_reviewers: 2
+  max_accept_failures: 3
+  max_revisions: 3
+
+# 等级 → 流程：开工、审查、合并分别怎么走
+levels:
+  A:
+    plan_approval: false
+    ai_review: false
+    human_merge: false
+    min_reviewers: 0
+  B:
+    plan_approval: false
+    ai_review: true
+    human_merge: false
+    min_reviewers: 1
+  C:
+    plan_approval: false
+    ai_review: true
+    human_merge: false
+    min_reviewers: 2
+  D:
+    plan_approval: true
+    ai_review: true
+    human_merge: true
+    min_reviewers: 2
