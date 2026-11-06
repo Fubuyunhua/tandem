@@ -195,6 +195,7 @@ def parse_config(data: object) -> Config:
     policy = Policy(
         bottom_line_paths=_str_list(root.get("bottom_line_paths"), "bottom_line_paths"),
         relaxable_paths=_str_list(root.get("relaxable_paths"), "relaxable_paths"),
+        relaxable_extensions=_str_list(root.get("relaxable_extensions"), "relaxable_extensions"),
         providers=tuple(item.name for item in providers),
         writer_providers=tuple(item.name for item in providers if item.can_write),
         reviewer_providers=tuple(item.name for item in providers if item.can_review),

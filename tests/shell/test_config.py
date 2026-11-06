@@ -76,3 +76,11 @@ def test_unknown_level_raises() -> None:
                 "levels": {"E": {"ai_review": True}},
             }
         )
+
+
+def test_relaxable_zone_is_configured_by_document_type() -> None:
+    """F6：可放宽区由 risk.yml 配置，必须同时限制路径范围和文档类型。"""
+    policy = load_policy()
+    assert "docs/**" in policy.relaxable_paths
+    assert ".md" in policy.relaxable_extensions
+    assert ".txt" in policy.relaxable_extensions

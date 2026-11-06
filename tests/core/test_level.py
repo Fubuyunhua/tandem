@@ -131,3 +131,71 @@ def test_base_level_ignores_suggestion(policy: Policy) -> None:
 def test_empty_policy_has_no_bottom_line() -> None:
     policy = Policy(thresholds=Thresholds())
     assert compute_level(ChangeSet(paths=("core/model.py",)), policy) is Level.C
+
+
+# ---------------------------------------------------------------- F6：路径规范化与文档类型
+
+
+def test_document_extensions_come_from_config(policy: Policy) -> None:
+    assert ".md" in policy.relaxable_extensions
+    assert ".txt" in policy.relaxable_extensions
+
+
+def test_python_file_inside_docs_cannot_downgrade(policy: Policy) -> None:
+    """只认文档类型：docs/run.py 是可执行代码，不能因为目录叫 docs 就降到 B。"""
+    changes = ChangeSet(paths=("docs/run.py",))
+    assert compute_level(changes, policy) is Level.C
+    assert compute_level(changes, policy, Level.B) is Level.C
+
+
+def test_pure_docs_by_extension_can_downgrade(policy: Policy) -> None:
+    assert compute_level(ChangeSet(paths=("docs/note.txt",)), policy, Level.B) is Level.B
+    assert compute_level(ChangeSet(paths=("docs/note.rst",)), policy, Level.B) is Level.B
+
+
+def test_markdown_outside_the_relaxable_directories_is_not_relaxable(policy: Policy) -> None:
+    assert compute_level(ChangeSet(paths=("src/tandem/shell/note.md",)), policy, Level.B) is Level.C
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",
+        "C:/Users/me/secret.py",
+        r"\\server\share\x.py",
+        "",
+        "   ",
+        "docs/../src/tandem/core/model.py",
+        "../outside.py",
+    ],
+)
+def test_illegal_paths_are_d_level(path: str, policy: Policy) -> None:
+    """绝对路径、空路径、带 .. 的路径一律拒绝，直接按 D 处理。"""
+    changes = ChangeSet(paths=(path,))
+    assert hits_bottom_line(changes, policy)
+    assert compute_level(changes, policy) is Level.D
+
+
+def test_backslashes_are_normalized(policy: Policy) -> None:
+    assert compute_level(ChangeSet(paths=(r"docs\note.md",)), policy, Level.B) is Level.B
+    assert compute_level(ChangeSet(paths=(r"src\tandem\core\model.py",)), policy) is Level.D
+
+
+def test_leading_dot_slash_is_normalized(policy: Policy) -> None:
+    assert compute_level(ChangeSet(paths=("./docs/note.md",)), policy, Level.B) is Level.B
+
+
+def test_rename_with_illegal_path_is_d(policy: Policy) -> None:
+    changes = ChangeSet(renames=(("docs/a.md", "../outside.md"),))
+    assert compute_level(changes, policy) is Level.D
+
+
+def test_normalize_path_helper() -> None:
+    from tandem.core.level import normalize_path
+
+    assert normalize_path("docs/a.md") == "docs/a.md"
+    assert normalize_path("./docs//a.md") == "docs/a.md"
+    assert normalize_path(r"docs\a.md") == "docs/a.md"
+    assert normalize_path("/abs/path") is None
+    assert normalize_path("docs/../x") is None
+    assert normalize_path("") is None

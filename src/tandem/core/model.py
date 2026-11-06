@@ -371,6 +371,7 @@ class Policy:
 
     bottom_line_paths: tuple[str, ...] = ()
     relaxable_paths: tuple[str, ...] = ()
+    relaxable_extensions: tuple[str, ...] = ()
     providers: tuple[str, ...] = ()
     writer_providers: tuple[str, ...] = ()
     reviewer_providers: tuple[str, ...] = ()
