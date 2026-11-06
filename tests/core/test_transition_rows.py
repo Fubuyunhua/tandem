@@ -1656,6 +1656,8 @@ def test_cleanup_checked_can_abandon_a_cleanup_action() -> None:
     assert statuses[action_id] is ActionStatus.ABANDONED
     assert not statuses[action_id].is_unconfirmed  # 放弃以后不再算"未确认"
     assert "放弃" in decision.reason
+    # 备注要能独立读懂，原来没有备注时不能留一个孤零零的分隔符
+    assert decision.task.note.startswith("清理未完成：")
 
 
 def test_cleanup_checked_only_touches_cleanup_actions() -> None:
@@ -1708,6 +1710,9 @@ def test_row_26_merge_succeeded_without_our_approval_is_marked_external() -> Non
     assert decision.task.status is TaskStatus.MERGED
     assert decision.task.merge_confirmed_externally is True
     assert "未经本系统审核放行" in decision.task.note
+    # 原来就有备注（异常时记下的未确认动作），追加时不能留下开头的分隔符
+    assert not decision.task.note.startswith("｜")
+    assert decision.task.note.endswith("）")
 
     different_approval = replace(record, approved_sha=SHA_2)
     other = run(

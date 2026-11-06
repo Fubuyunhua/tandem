@@ -76,6 +76,11 @@ def _ignore(task: TaskRecord, why: str) -> Decision:
     return Decision(task=task, actions=[], reason=why, changed=False)
 
 
+def _append_note(note: str, extra: str) -> str:
+    """把一句说明追加到备注后面；原来没有备注时不留一个孤立的分隔符。"""
+    return f"{note}｜{extra}" if note.strip() else extra
+
+
 def _forget_pr_evidence() -> dict[str, object]:
     """PR 已关闭（不会再合并）时，挂在那个 PR 上的证据一起作废。
 
@@ -1163,7 +1168,7 @@ def _on_retry(task: TaskRecord, event: Event, policy: Policy) -> Decision:
                 status_before_error=None,
                 error_code=None,
                 merge_confirmed_externally=True,
-                note=f"{task.note}｜{marker}",
+                note=_append_note(task.note, marker),
             )
         case CheckResult.PR_CLOSED:
             actions.add(ActionKind.NOTIFY, detail="核对后确认 PR 已被关闭，回到待处理")
@@ -1350,10 +1355,10 @@ def _on_cleanup_checked(task: TaskRecord, event: Event) -> Decision:
     names = "、".join(f"{action.kind.value}({action.action_id})" for action in targets)
     if outcome is CheckResult.PR_CLOSED:
         reason = f"清理核对：{names} 外部已确认完成"
-        note = f"{task.note}｜清理已核对：{names} 已确认完成"
+        note = _append_note(task.note, f"清理已核对：{names} 已确认完成")
     else:
         reason = f"清理核对：{names} 无法确认，已放弃"
-        note = f"{task.note}｜清理未完成：{names} 已放弃（外部无法确认）"
+        note = _append_note(task.note, f"清理未完成：{names} 已放弃（外部无法确认）")
     return _transition(
         replace(task, actions=patched),
         task.status,
