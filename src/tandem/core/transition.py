@@ -21,6 +21,7 @@ from tandem.core.model import (
     Action,
     ActionKind,
     ActionStatus,
+    ChangeSet,
     CheckResult,
     Decision,
     Event,
@@ -374,6 +375,24 @@ def _on_assign(task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnaps
     )
 
 
+def escalation_plan(task: TaskRecord, sha: str, changes: ChangeSet, policy: Policy) -> PlanEntry:
+    """把"按真实改动升成 D 级"的这次提交写成方案内容。
+
+    三个入口（处理中交回代码 #5b、审核期间的新提交、你接手后的人工提交）都用它，
+    保证存进记录的版本号、提交编号、正文和底线原因完全一致——否则批的就是
+    "一个不存在的方案"。
+    """
+    version = task.plan_version + 1
+    reasons = "；".join(bottom_line_reasons(changes, policy)) or "无"
+    return PlanEntry(
+        version=version,
+        sha=sha,
+        text=(
+            f"第 {version} 版方案：没有文字方案，内容就是提交 {sha} 的改动，涉及的底线：{reasons}"
+        ),
+    )
+
+
 def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """2. 处理中 → 待你批准方案：D 级，并且当前这版方案还没批准。"""
     if task.status is not TaskStatus.WORKING:
@@ -483,18 +502,8 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     actions = _Actions(task, task.state_version + 1)
 
     if plan_pending:
-        plan_version = task.plan_version + 1
-        # 5b 没有文字方案：把这次交回的代码当作本版方案的内容，
-        # 写清提交编号和命中的底线条目，免得你"批准一个不存在的方案"。
-        reasons = "；".join(bottom_line_reasons(event.changes, policy)) or "无"
-        entry = PlanEntry(
-            version=plan_version,
-            sha=event.sha,
-            text=(
-                f"第 {plan_version} 版方案：没有文字方案，内容就是提交 {event.sha} 的改动，"
-                f"涉及的底线：{reasons}"
-            ),
-        )
+        # 5b 没有文字方案：把这次交回的代码当作本版方案的内容
+        entry = escalation_plan(task, event.sha, event.changes, policy)
         actions.add(ActionKind.NOTIFY, detail="按真实改动算出 D 级，要先批准方案")
         return _transition(
             task,
@@ -502,7 +511,7 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
             f"按真实改动重新算出来是 {new_level.value} 级，方案还没批准",
             actions.items,
             level=new_level,
-            plan_version=plan_version,
+            plan_version=entry.version,
             plan_history=task.plan_history + (entry,),
             latest_sha=event.sha,
             approved_sha=None,
@@ -566,13 +575,15 @@ def _on_new_submission(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         "note": event.reason or "",
     }
     if rule.requires_plan_approval and not plan_approved:
+        entry = escalation_plan(task, event.sha, event.changes, policy)
         actions.add(ActionKind.NOTIFY, detail="新提交升成 D 级，要先批准方案")
         return _transition(
             task,
             TaskStatus.AWAITING_PLAN_APPROVAL,
             f"新提交 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
             actions.items,
-            plan_version=task.plan_version + 1,
+            plan_version=entry.version,
+            plan_history=task.plan_history + (entry,),
             **invalidated,
         )
     actions.add(ActionKind.NOTIFY, detail=f"收到新提交 {event.sha}，旧结论全部作废，重新验收")
@@ -1096,13 +1107,15 @@ def _on_you_submitted_code(task: TaskRecord, event: Event, policy: Policy) -> De
         "returned_from_review": False,
     }
     if rule.requires_plan_approval and not plan_approved:
+        entry = escalation_plan(task, event.sha, event.changes, policy)
         actions.add(ActionKind.NOTIFY, detail="你这次改动升成 D 级，要先批准方案")
         return _transition(
             task,
             TaskStatus.AWAITING_PLAN_APPROVAL,
             f"你提交的 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
             actions.items,
-            plan_version=task.plan_version + 1,
+            plan_version=entry.version,
+            plan_history=task.plan_history + (entry,),
             **shared,
         )
     actions.add(ActionKind.NOTIFY, detail=f"你提交了 {event.sha}，等 CI")

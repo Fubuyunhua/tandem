@@ -1732,3 +1732,38 @@ def test_row_26_merge_succeeded_after_our_approval_is_not_external() -> None:
     assert decision.task.status is TaskStatus.MERGED
     assert decision.task.merge_confirmed_externally is False
     assert "未经本系统审核放行" not in decision.task.note
+
+
+def test_plan_escalation_on_new_submission_during_review_is_written() -> None:
+    """待 AI 审核时收到新提交并升成 D：方案也要有正文、SHA 和底线原因。"""
+    record = to_ai_review()
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2, changes=CORE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    entry = decision.task.plan()
+    assert entry is not None
+    assert entry.version == decision.task.plan_version == 1
+    assert entry.sha == SHA_2
+    assert "没有文字方案" in entry.text
+    assert SHA_2 in entry.text
+    assert "src/tandem/core/model.py" in entry.text
+    assert decision.task.plan_text == entry.text
+
+
+def test_plan_escalation_on_your_own_submission_is_written() -> None:
+    """你接手后提交并升成 D：方案同样要有正文、SHA 和底线原因。"""
+    record = to_needs_intervention_by_ci()
+    record = run(record, ev(EventKind.TAKE_OVER)).task
+    decision = run(
+        record,
+        ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CORE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    entry = decision.task.plan()
+    assert entry is not None
+    assert entry.sha == SHA_2
+    assert "没有文字方案" in entry.text
+    assert SHA_2 in entry.text
+    assert "src/tandem/core/model.py" in entry.text
