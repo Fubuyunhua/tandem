@@ -541,6 +541,41 @@ def _not_executed_checks(reason: str) -> list[Check]:
     ]
 
 
+def probe_tool_version(name: str, *, timeout: int = 5) -> str | None:
+    """读一个工具的版本（只读命令，不联网）。读不到就返回 None。"""
+    try:
+        completed = subprocess.run(
+            [name, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if completed.returncode != 0:
+        return None
+    first_line = (completed.stdout or completed.stderr).strip().splitlines()
+    if not first_line:
+        return None
+    # "git version 2.43.0" → "2.43.0"
+    parts = first_line[0].split()
+    return parts[-1] if parts else None
+
+
+def _tool_versions(explicit: Sequence[str]) -> dict[str, str | None]:
+    """显式给的版本优先；没给的用 --version 探一下。"""
+    tools: dict[str, str | None] = {}
+    for item in explicit:
+        name, _, value = item.partition("=")
+        if name:
+            tools[name.strip()] = value.strip() or None
+    for name in ("git",):
+        if name not in tools:
+            tools[name] = probe_tool_version(name)
+    return tools
+
+
 def _environment_facts(
     probe_result: dict[str, object], args: argparse.Namespace
 ) -> dict[str, object]:
@@ -551,8 +586,8 @@ def _environment_facts(
         "distro": probe_result.get("distro"),
         "platform": platform.platform(),
         "python": platform.python_version(),
-        "tools": {},
-        "sandbox": "unknown",
+        "tools": _tool_versions(args.tool_version),
+        "sandbox": args.sandbox_id,
         "egress_policy": args.egress_policy,
     }
 
@@ -567,6 +602,14 @@ def _environment_problems(
         problems.append("缺少 Agent CLI 版本")
     if not facts.get("user"):
         problems.append("缺少运行用户")
+    sandbox = facts.get("sandbox")
+    if not sandbox or sandbox == "unknown":
+        problems.append("缺少沙箱标识（--sandbox-id）")
+    tools = facts.get("tools")
+    if isinstance(tools, dict):
+        missing_tools = [name for name, version in tools.items() if not version]
+        if missing_tools:
+            problems.append("缺少工具版本：" + "、".join(sorted(missing_tools)))
     if not facts.get("distro"):
         problems.append("不在 WSL 发行版里运行（读不到 WSL_DISTRO_NAME）")
     elif expect_distro and facts.get("distro") != expect_distro:
@@ -775,6 +818,15 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR, help="记录写到哪")
     report.add_argument("--isolation-config", type=Path, default=Path("/etc/wsl.conf"))
     report.add_argument("--egress-policy", default="none", help="出站白名单的标识；none 表示未实现")
+    report.add_argument(
+        "--sandbox-id", default=None, help="Agent 沙箱的标识，例如 claude-code-sandbox、none"
+    )
+    report.add_argument(
+        "--tool-version",
+        action="append",
+        default=[],
+        help="工具版本，写成 name=value（可重复）；没给的会用 --version 探",
+    )
     report.add_argument("--run-user", default=os.environ.get("USER") or os.environ.get("USERNAME"))
     report.add_argument("--adapter", default=None, help="探测结果里没有适配器时的兜底")
     report.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="扫描分块大小")

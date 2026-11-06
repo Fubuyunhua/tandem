@@ -506,3 +506,73 @@ def test_report_dry_run_writes_no_record(run_env: dict[str, Path]) -> None:
     )
     assert code == 1
     assert not run_env["out"].exists()
+
+
+# --------------------------------------------------------- 环境事实（G12）
+
+
+def test_report_needs_sandbox_and_tool_identifiers(run_env: dict[str, Path]) -> None:
+    """缺沙箱标识或工具版本时，结论只能是"证据不完整"。"""
+    assert prepare(run_env) == 0
+    script = _fake_agent(run_env["workspace"], _git_attempt(REPO))
+    assert probe(run_env, script) == 0
+    _, record = report(run_env)
+    problems = record["environment_problems"]
+    assert isinstance(problems, list)
+    assert any("沙箱" in str(item) for item in problems), problems
+    verdict = record["verdict"]
+    assert isinstance(verdict, dict)
+    assert verdict["admitted"] is False
+
+
+def test_report_records_sandbox_and_tool_versions(run_env: dict[str, Path]) -> None:
+    assert prepare(run_env) == 0
+    script = _fake_agent(run_env["workspace"], _git_attempt(REPO))
+    assert probe(run_env, script) == 0
+    _, record = report(
+        run_env, "--sandbox-id", "claude-code-sandbox", "--tool-version", "git=2.43.0"
+    )
+    environment = record["environment"]
+    assert isinstance(environment, dict)
+    assert environment["sandbox"] == "claude-code-sandbox"
+    tools = environment["tools"]
+    assert isinstance(tools, dict)
+    assert tools["git"] == "2.43.0"
+    problems = record["environment_problems"]
+    assert isinstance(problems, list)
+    assert not any("沙箱" in str(item) for item in problems)
+
+
+def test_report_records_agent_version_and_user(run_env: dict[str, Path]) -> None:
+    assert prepare(run_env) == 0
+    script = _fake_agent(run_env["workspace"], _git_attempt(REPO))
+    assert probe(run_env, script) == 0
+    _, record = report(run_env, "--sandbox-id", "none", "--tool-version", "git=2.43.0")
+    assert record["agent_version"] == "9.9.9"
+    environment = record["environment"]
+    assert isinstance(environment, dict)
+    assert environment["user"] == "tester"
+
+
+def test_report_flags_wrong_distro(
+    run_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert prepare(run_env) == 0
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    script = _fake_agent(run_env["workspace"], _git_attempt(REPO))
+    assert probe(run_env, script) == 0
+    _, record = report(run_env, "--sandbox-id", "none", "--tool-version", "git=2.43.0")
+    problems = record["environment_problems"]
+    assert isinstance(problems, list)
+    assert any("发行版不符" in str(item) for item in problems), problems
+
+
+def test_report_redacts_tokens_from_raw_output(run_env: dict[str, Path]) -> None:
+    assert prepare(run_env) == 0
+    fake_token = "sk-abcdef1234567890abcdef"
+    script = _fake_agent(run_env["workspace"], [], result=f"顺手看到 {fake_token}")
+    assert probe(run_env, script) == 0
+    _, record = report(run_env, "--sandbox-id", "none", "--tool-version", "git=2.43.0")
+    raw = json.dumps(record, ensure_ascii=False)
+    assert fake_token not in raw
+    assert "[REDACTED]" in raw
