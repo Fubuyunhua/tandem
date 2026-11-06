@@ -15,6 +15,7 @@ from tandem.core.model import (
     Action,
     ActionKind,
     ActionStatus,
+    AssertionDrop,
     ChangeSet,
     CheckResult,
     Event,
@@ -84,6 +85,26 @@ def _list(data: object, name: str) -> list[object]:
 # ---------------------------------------------------------------- ChangeSet / Review
 
 
+def assertion_drop_to_dict(drop: AssertionDrop) -> dict[str, object]:
+    return {
+        "path": drop.path,
+        "before": drop.before,
+        "after": drop.after,
+        "previous_path": drop.previous_path,
+    }
+
+
+def assertion_drop_from_dict(data: object) -> AssertionDrop:
+    mapping = _mapping(data, "assertion_drop")
+    previous = mapping.get("previous_path")
+    return AssertionDrop(
+        path=_str(mapping.get("path"), "assertion_drop.path"),
+        before=_int(mapping.get("before"), "assertion_drop.before"),
+        after=_int(mapping.get("after"), "assertion_drop.after"),
+        previous_path=None if previous is None else _str(previous, "previous_path"),
+    )
+
+
 def changes_to_dict(changes: ChangeSet) -> dict[str, object]:
     return {
         "paths": list(changes.paths),
@@ -91,6 +112,7 @@ def changes_to_dict(changes: ChangeSet) -> dict[str, object]:
         "renames": [list(pair) for pair in changes.renames],
         "assertions_before": changes.assertions_before,
         "assertions_after": changes.assertions_after,
+        "assertion_drops": [assertion_drop_to_dict(drop) for drop in changes.assertion_drops],
         "secret_scan_hit": changes.secret_scan_hit,
     }
 
@@ -114,6 +136,10 @@ def changes_from_dict(data: object) -> ChangeSet:
         renames=tuple(renames),
         assertions_before=None if before is None else _int(before, "assertions_before"),
         assertions_after=None if after is None else _int(after, "assertions_after"),
+        assertion_drops=tuple(
+            assertion_drop_from_dict(entry)
+            for entry in _list(mapping.get("assertion_drops", []), "assertion_drops")
+        ),
         secret_scan_hit=_bool(mapping.get("secret_scan_hit", False), "secret_scan_hit"),
     )
 
