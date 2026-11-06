@@ -467,6 +467,8 @@ class Event:
     review: Review | None = None
     reason: str | None = None
     provider: str | None = None
+    # 这次有哪些 AI 参与过（人工提交时要补记进"参与过的提供方"集合）
+    providers: tuple[str, ...] = ()
     model_suggestion: Level | None = None
     check_result: CheckResult | None = None
     standard_version: int | None = None

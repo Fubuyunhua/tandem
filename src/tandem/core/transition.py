@@ -257,7 +257,7 @@ def _dispatch(
         case EventKind.TAKE_OVER:
             return _on_take_over(task)
         case EventKind.YOU_SUBMITTED_CODE:
-            return _on_you_submitted_code(task, event)
+            return _on_you_submitted_code(task, event, policy)
         case EventKind.ABANDON:
             return _on_abandon(task, event)
         case EventKind.RETRY:
@@ -336,10 +336,15 @@ def _on_plan_approved(task: TaskRecord, event: Event) -> Decision:
     if event.sha is not None and task.latest_sha is not None and event.sha != task.latest_sha:
         return _ignore(task, "你批准的是另一版方案：提交编号和当前的不一致")
     actions = _Actions(task, task.state_version + 1)
-    actions.add(ActionKind.NOTIFY, detail=f"第 {task.plan_version} 版方案已批准，回到待处理")
+    # 写手是你时，批准完方案回到"你处理中"，你可以接着提交自己已经写好的代码；
+    # 写手是 Agent 时回到"待处理"，等重新派活。
+    target = TaskStatus.YOU_WORKING if task.writer_is_human else TaskStatus.PENDING
+    actions.add(
+        ActionKind.NOTIFY, detail=f"第 {task.plan_version} 版方案已批准，回到{target.value}"
+    )
     return _transition(
         task,
-        TaskStatus.PENDING,
+        target,
         f"你批准了第 {task.plan_version} 版方案",
         actions.items,
         approved_plan_version=task.plan_version,
@@ -888,29 +893,56 @@ def _on_take_over(task: TaskRecord) -> Decision:
     return _transition(task, TaskStatus.YOU_WORKING, "你自己接手了", actions.items)
 
 
-def _on_you_submitted_code(task: TaskRecord, event: Event) -> Decision:
-    """24. 你处理中 → 待验收：你提交代码，注明有哪些 AI 参与过。"""
+def _on_you_submitted_code(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """24. 你处理中 → 待验收：你提交代码，按真实改动重算等级，注明有哪些 AI 参与过。
+
+    人工提交和 Agent 提交是同一套逻辑：同一份真实改动、同样的作废规则、
+    同样的 D 级方案门槛。区别只有"写手是你"和"要补记参与过的提供方"。
+    """
     if task.status is not TaskStatus.YOU_WORKING:
         return _ignore(task, "只有你处理中才会由你提交代码")
-    if event.sha is None:
-        return _ignore(task, "你提交代码时要带提交编号")
-    involved = "、".join(sorted(task.providers_involved)) or "无"
+    if event.sha is None or event.changes is None:
+        return _ignore(task, "你提交代码时要带提交编号和真实改动，否则按无效提交处理")
+
+    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    rule = policy.rule_for(new_level)
+    plan_approved = (
+        task.approved_plan_version is not None and task.approved_plan_version == task.plan_version
+    )
+    involved_providers = task.providers_involved | set(event.providers)
+    involved = "、".join(sorted(involved_providers)) or "无"
     actions = _Actions(task, task.state_version + 1)
+
+    shared: dict[str, object] = {
+        "level": new_level,
+        "writer": HUMAN_WRITER,
+        "writer_is_human": True,
+        "providers_involved": frozenset(involved_providers),
+        "latest_sha": event.sha,
+        "approved_sha": None,
+        "reviews": (),
+        "ci_green": False,
+        "pr_opened": True,
+        "note": f"参与过的 AI：{involved}",
+        "returned_from_review": False,
+    }
+    if rule.requires_plan_approval and not plan_approved:
+        actions.add(ActionKind.NOTIFY, detail="你这次改动升成 D 级，要先批准方案")
+        return _transition(
+            task,
+            TaskStatus.AWAITING_PLAN_APPROVAL,
+            f"你提交的 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
+            actions.items,
+            plan_version=task.plan_version + 1,
+            **shared,
+        )
     actions.add(ActionKind.NOTIFY, detail=f"你提交了 {event.sha}，等 CI")
     return _transition(
         task,
         TaskStatus.AWAITING_ACCEPTANCE,
-        f"你提交了代码 {event.sha}，参与过的 AI：{involved}",
+        f"你提交了代码 {event.sha}（{new_level.value} 级），参与过的 AI：{involved}",
         actions.items,
-        writer=HUMAN_WRITER,
-        writer_is_human=True,
-        latest_sha=event.sha,
-        approved_sha=None,
-        reviews=(),
-        ci_green=False,
-        pr_opened=True,
-        note=f"参与过的 AI：{involved}",
-        returned_from_review=False,
+        **shared,
     )
 
 

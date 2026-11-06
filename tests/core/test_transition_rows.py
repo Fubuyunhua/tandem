@@ -14,6 +14,7 @@ from tandem.core.model import (
     Level,
     QuotaState,
     RunMode,
+    TaskRecord,
     TaskStatus,
     Verdict,
 )
@@ -314,7 +315,10 @@ def test_row_14_review_failure_returns_to_pending_and_voids_conclusions() -> Non
 def test_row_14b_ai_rejects_your_own_code() -> None:
     record = to_needs_intervention_by_ci()
     record = run(record, ev(EventKind.TAKE_OVER)).task
-    record = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2)).task
+    record = run(
+        record,
+        ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CODE_CHANGES),
+    ).task
     record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
     assert record.status is TaskStatus.AWAITING_AI_REVIEW
     assert record.writer_is_human
@@ -409,7 +413,10 @@ def test_row_20_needs_green_ci() -> None:
 def test_row_20_vetoing_ai_needs_reasons() -> None:
     record = to_needs_intervention_by_ci()
     record = run(record, ev(EventKind.TAKE_OVER)).task
-    record = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2)).task
+    record = run(
+        record,
+        ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CODE_CHANGES),
+    ).task
     record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
     record = run(record, review_event(record, "codex", Verdict.FAIL)).task
     assert record.status is TaskStatus.NEEDS_INTERVENTION
@@ -461,7 +468,7 @@ def test_row_23_you_take_over() -> None:
 
 def test_row_24_you_submit_code() -> None:
     record = run(to_needs_intervention_by_ci(), ev(EventKind.TAKE_OVER)).task
-    decision = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2))
+    decision = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CODE_CHANGES))
     assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
     assert decision.task.writer_is_human
     assert decision.task.latest_sha == SHA_2
@@ -819,3 +826,86 @@ def test_row_20_intervention_approval_requires_the_current_sha() -> None:
     decision = run(record, ev(EventKind.INTERVENTION_APPROVED, sha=SHA_2, reason="我看过了"))
     assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
     assert not decision.changed
+
+
+# ------------------------------------------------- F5：人工提交也要重算等级、记录参与的 AI
+
+
+def _to_you_working() -> TaskRecord:
+    return run(to_needs_intervention_by_ci(), ev(EventKind.TAKE_OVER)).task
+
+
+def test_row_24_your_commit_is_re_leveled_by_real_changes() -> None:
+    record = _to_you_working()
+    assert record.status is TaskStatus.YOU_WORKING
+    # 你自己改了 core：等级必须重算成 D，方案还没批准 → 先回到方案批准
+    decision = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CORE_CHANGES))
+    assert decision.task.level is Level.D
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert decision.task.latest_sha == SHA_2
+    assert decision.task.plan_version == 1
+
+
+def test_row_24_your_commit_with_code_changes_goes_to_acceptance() -> None:
+    record = _to_you_working()
+    decision = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CODE_CHANGES))
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+    assert decision.task.level is Level.C
+    assert decision.task.writer_is_human
+    assert decision.task.reviews == ()
+    assert not decision.task.ci_green
+
+
+def test_row_24_records_participating_providers() -> None:
+    record = _to_you_working()
+    decision = run(
+        record,
+        ev(
+            EventKind.YOU_SUBMITTED_CODE,
+            sha=SHA_2,
+            changes=CODE_CHANGES,
+            providers=("codex", "opencode-go"),
+        ),
+    )
+    assert {"claude", "codex", "opencode-go"} <= decision.task.providers_involved
+    assert "codex" in decision.task.note
+
+
+def test_row_24_helpers_cannot_review_later() -> None:
+    """帮忙写过的提供方不能当审核者：帮过忙的 codex 会被排除。"""
+    record = _to_you_working()
+    record = run(
+        record,
+        ev(
+            EventKind.YOU_SUBMITTED_CODE,
+            sha=SHA_2,
+            changes=CODE_CHANGES,
+            providers=("codex",),
+        ),
+    ).task
+    record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
+    assert record.status is TaskStatus.NEEDS_INTERVENTION  # 只剩 opencode-go，凑不齐两家
+    assert record.error_code == "R03"
+
+
+def test_row_24_requires_real_changes() -> None:
+    record = _to_you_working()
+    decision = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2))
+    assert decision.task.status is TaskStatus.YOU_WORKING
+    assert "无效" in decision.reason
+
+
+def test_row_24_requires_sha() -> None:
+    record = _to_you_working()
+    decision = run(record, ev(EventKind.YOU_SUBMITTED_CODE, changes=CODE_CHANGES))
+    assert decision.task.status is TaskStatus.YOU_WORKING
+
+
+def test_row_03_plan_approval_returns_a_human_writer_to_you_working() -> None:
+    """写手是你时，批准方案回到"你处理中"，好让你提交已经写好的代码。"""
+    record = _to_you_working()
+    record = run(record, ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CORE_CHANGES)).task
+    assert record.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    decision = run(record, ev(EventKind.PLAN_APPROVED, sha=record.latest_sha))
+    assert decision.task.status is TaskStatus.YOU_WORKING
+    assert decision.task.approved_plan_version == record.plan_version

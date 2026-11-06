@@ -229,7 +229,14 @@ def test_scenario_9_you_change_core_and_ai_disagrees() -> None:
 
     walker.step(ev(EventKind.TAKE_OVER))
     assert walker.record.status is TaskStatus.YOU_WORKING
-    walker.step(ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2))
+    walker.step(ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CORE_CHANGES))
+    # 你改的是 core，按 D 级处理：先批准方案，回到"你处理中"，再提交同一份代码
+    assert walker.record.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert walker.record.level is Level.D
+    walker.step(ev(EventKind.PLAN_APPROVED, sha=walker.record.latest_sha))
+    assert walker.record.status is TaskStatus.YOU_WORKING
+    walker.step(ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CORE_CHANGES))
+    assert walker.record.status is TaskStatus.AWAITING_ACCEPTANCE
     walker.quota = quota()  # 第二天 codex 的额度回来了
     walker.ci_green()
     assert walker.record.status is TaskStatus.AWAITING_AI_REVIEW

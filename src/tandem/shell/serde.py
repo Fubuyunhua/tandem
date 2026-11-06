@@ -288,6 +288,7 @@ def event_to_dict(event: Event) -> dict[str, object]:
         "review": None if event.review is None else review_to_dict(event.review),
         "reason": event.reason,
         "provider": event.provider,
+        "providers": list(event.providers),
         "model_suggestion": None if event.model_suggestion is None else event.model_suggestion.name,
         "check_result": None if event.check_result is None else event.check_result.name,
         "standard_version": event.standard_version,
@@ -312,6 +313,10 @@ def event_from_dict(data: object) -> Event:
         review=None if review is None else review_from_dict(review),
         reason=_optional_str(mapping, "reason"),
         provider=_optional_str(mapping, "provider"),
+        providers=tuple(
+            _str(item, "event.providers[]")
+            for item in _list(mapping.get("providers", []), "event.providers")
+        ),
         model_suggestion=(
             None if suggestion is None else _enum_value(Level, suggestion, "model_suggestion")
         ),
