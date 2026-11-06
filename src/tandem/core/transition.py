@@ -1039,8 +1039,21 @@ def _on_retry(task: TaskRecord, event: Event) -> Decision:
             )
         case CheckResult.NOT_CONFIRMED:
             before = task.status_before_error
-            target = before if before is not None and not before.is_terminal else TaskStatus.PENDING
+            if before is not None and before.is_terminal:
+                before = None
+            # 出问题前是"处理中"：进程已经没了，回到待处理等重新派活，
+            # 不能假装还在处理中（否则没有人会再启动 Agent，任务会一直挂着）。
+            target = TaskStatus.PENDING if before in (None, TaskStatus.WORKING) else before
             actions.add(ActionKind.NOTIFY, detail=f"核对后确认没有动作完成，回到{target.value}")
+            if target is TaskStatus.AWAITING_AI_REVIEW:
+                # 审核进程没了：把还没出结论的审核者重新请求一遍
+                missing = _reviewers_without_conclusion(task)
+                for reviewer in missing:
+                    actions.add(
+                        ActionKind.REQUEST_REVIEW,
+                        detail=f"重新请 {reviewer} 审核提交 {task.latest_sha}",
+                        provider=reviewer,
+                    )
             return _transition(
                 task,
                 target,
@@ -1051,6 +1064,12 @@ def _on_retry(task: TaskRecord, event: Event) -> Decision:
             )
         case _:  # pragma: no cover
             assert_never(check)
+
+
+def _reviewers_without_conclusion(task: TaskRecord) -> tuple[str, ...]:
+    """还没给出当前提交编号结论的审核者（重试时要重新发审核请求）。"""
+    answered = {review.provider for review in _current_reviews(task)}
+    return tuple(seat for seat in task.designated_reviewers if seat not in answered)
 
 
 def _on_cancel(task: TaskRecord) -> Decision:

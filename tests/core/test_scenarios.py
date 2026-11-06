@@ -127,6 +127,9 @@ def test_scenario_4_agent_hangs_for_thirty_minutes() -> None:
     assert walker.record.status_before_error is TaskStatus.WORKING
 
     walker.step(ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    # 进程已经没了：回到待处理，等重新派活（不能假装还在处理中）
+    assert walker.record.status is TaskStatus.PENDING
+    walker.assign("claude")
     assert walker.record.status is TaskStatus.WORKING
     walker.submit_code()
     assert walker.record.status is TaskStatus.AWAITING_ACCEPTANCE
@@ -204,6 +207,9 @@ def test_scenario_8_wake_up_after_three_hours_asleep() -> None:
     assert walker.record.status is TaskStatus.ERROR
     assert walker.record.error_code == "A02"
     walker.step(ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    # 进程已经没了：回到待处理，等重新派活（不能假装还在处理中）
+    assert walker.record.status is TaskStatus.PENDING
+    walker.assign("claude")
     assert walker.record.status is TaskStatus.WORKING
     walker.submit_code()
     walker.ci_green()

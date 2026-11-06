@@ -135,7 +135,7 @@ def test_missing_agent_is_recorded_as_unknown(tmp_path: Path) -> None:
 
 
 def test_quota_exhausted_marks_provider(tmp_path: Path) -> None:
-    runner = make_runner(tmp_path)
+    runner = make_runner(tmp_path, [code_receipt()])
     runner.submit("t1", Level.C)
     runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
     runner.handle(
@@ -219,10 +219,12 @@ def test_handle_persists_even_when_execution_fails(tmp_path: Path) -> None:
     result = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
     assert result.executed[0].status is ActionStatus.UNKNOWN
     assert "Agent 出错" in result.executed[0].message
+    # 记录都留下了：创建、派活、以及执行失败自动产生的异常事件
+    kinds = [event.kind for event in runner.store.list_events("t1")]
+    assert kinds == [EventKind.CREATED, EventKind.ASSIGN, EventKind.INCIDENT]
     task = runner.store.load_task("t1")
     assert task is not None
-    assert task.status is TaskStatus.WORKING
-    assert len(runner.store.list_events("t1")) == 2
+    assert task.status is TaskStatus.ERROR
 
 
 def test_conflict_is_raised_when_snapshot_changed_underneath(
@@ -246,7 +248,7 @@ def test_conflict_is_raised_when_snapshot_changed_underneath(
 
 def test_quota_survives_restart(tmp_path: Path) -> None:
     """F11：额度估计要持久化，重启后不能忘掉"这一家已经用完"。"""
-    runner = make_runner(tmp_path)
+    runner = make_runner(tmp_path, [code_receipt()])
     runner.submit("t1", Level.C)
     runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
     runner.handle(
@@ -254,7 +256,7 @@ def test_quota_survives_restart(tmp_path: Path) -> None:
     )
     runner.store.close()
 
-    restarted = make_runner(tmp_path)
+    restarted = make_runner(tmp_path, [code_receipt()])
     assert restarted.quota.snapshot().state("claude") is QuotaState.EXHAUSTED
     restarted.store.close()
 
@@ -279,3 +281,33 @@ def test_action_status_has_a_single_source_of_truth(tmp_path: Path) -> None:
     assert task is not None
     assert [action.status for action in task.actions] == [ActionStatus.DONE]
     assert [action.status for action in task.actions] == [action.status for action in table]
+
+
+def test_agent_failure_becomes_an_incident_and_retry_really_reruns(tmp_path: Path) -> None:
+    """F12：Agent 启动失败 → 异常 → 核对后回到待处理 → 重新派活能真的再跑一次。"""
+    from tandem.core.model import CheckResult
+    from tandem.shell.agents.fake import FakeAgent
+
+    agent = FakeAgent(provider="claude", script=[])  # 第一次派活时剧本是空的 → 报错
+    runner = make_runner(tmp_path, agents={"claude": agent})
+    runner.submit("t1", Level.C)
+
+    failed = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    assert failed.decision.task.status is TaskStatus.ERROR
+    assert failed.decision.task.error_code == "A01"
+    assert failed.decision.task.status_before_error is TaskStatus.WORKING
+
+    retried = runner.handle(
+        Event(kind=EventKind.RETRY, task_id="t1", check_result=CheckResult.NOT_CONFIRMED)
+    )
+    assert retried.decision.task.status is TaskStatus.PENDING
+
+    agent.push(code_receipt(attempt=2))
+    started = runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    assert started.decision.task.status is TaskStatus.WORKING
+    assert started.receipts
+    receipt = parse_receipt(started.receipts[0])
+    task = runner.store.load_task("t1")
+    assert task is not None
+    received = runner.handle(runner.code_event(task, receipt))
+    assert received.decision.task.status is TaskStatus.AWAITING_ACCEPTANCE

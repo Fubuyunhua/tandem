@@ -968,3 +968,36 @@ def test_row_00_creation_event_does_not_change_anything() -> None:
     decision = run(record, ev(EventKind.CREATED))
     assert not decision.changed
     assert "创建" in decision.reason
+
+
+# ------------------------------------------------- F12：异常之后要真的重新开始工作
+
+
+def test_row_26_retry_after_working_returns_to_pending() -> None:
+    """核对结果是"没有动作完成"，而出问题前在处理中 → 回到待处理，等重新派活。"""
+    record = to_working(new_task())
+    record = run(record, ev(EventKind.INCIDENT, reason="Agent 进程消失", error_code="A02")).task
+    assert record.status is TaskStatus.ERROR
+    decision = run(record, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    assert decision.task.status is TaskStatus.PENDING
+    # 派活是由外壳产生 ASSIGN 事件做的，这里只负责回到待处理
+    assert actions_of(decision, ActionKind.NOTIFY)
+
+
+def test_row_26_retry_in_review_reissues_review_requests() -> None:
+    """出问题前在待 AI 审核：重试要重新发审核请求，不能原地干等。"""
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex")).task  # 已经有一家审过
+    record = run(record, ev(EventKind.INCIDENT, reason="审核进程崩了", error_code="E03")).task
+    decision = run(record, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
+    requested = [action.provider for action in actions_of(decision, ActionKind.REQUEST_REVIEW)]
+    # codex 已经有结论，只补发还没审的那一家
+    assert requested == ["opencode-go"]
+
+
+def test_row_26_retry_after_acceptance_goes_back_to_acceptance() -> None:
+    record = to_acceptance(to_working(new_task()))
+    record = run(record, ev(EventKind.INCIDENT, reason="CI 服务断了")).task
+    decision = run(record, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE

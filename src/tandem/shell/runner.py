@@ -89,6 +89,8 @@ class Runner:
     diff_source: DiffSource
     quota: QuotaTracker = field(default_factory=QuotaTracker)
     clock: Callable[[], datetime] = _utc_now
+    # 一条事件最多再派生几条后续事件（异常事件），防止互相触发
+    max_followups: int = 2
 
     def __post_init__(self) -> None:
         # 启动时接上存储，把之前记下的额度估计恢复回来
@@ -130,7 +132,7 @@ class Runner:
             reason=reason,
         )
 
-    def handle(self, event: Event) -> RunResult:
+    def handle(self, event: Event, *, depth: int = 0) -> RunResult:
         """处理一个事件：先保存，再执行。"""
         task = self.store.load_task(event.task_id)
         if task is None:
@@ -156,7 +158,30 @@ class Runner:
             if outcome.status is not ActionStatus.SENT:
                 self.store.update_action_status(action.action_id, outcome.status, now)
             executed.append(outcome)
+
+        # 启动 Agent 失败或超时，也要走异常状态：外壳把它转成一条 INCIDENT 事件
+        incident = self._incident_from(executed, now)
+        if incident is not None and depth < self.max_followups:
+            followup = self.handle(incident, depth=depth + 1)
+            return RunResult(
+                decision=followup.decision,
+                executed=(*executed, *followup.executed),
+            )
         return RunResult(decision=decision, executed=tuple(executed))
+
+    def _incident_from(self, executed: list[ExecutedAction], now: datetime) -> Event | None:
+        """把"Agent 没跑起来"翻译成一条带错误码的异常事件。"""
+        for outcome in executed:
+            if outcome.action.kind is not ActionKind.START_AGENT:
+                continue
+            if outcome.status is ActionStatus.UNKNOWN:
+                return Event(
+                    kind=EventKind.INCIDENT,
+                    task_id=outcome.action.task_id,
+                    reason=outcome.message,
+                    error_code="A01",
+                )
+        return None
 
     def assign_pending(self, provider: str | None = None) -> list[RunResult]:
         """给所有"待处理"的任务派活（第 1 条事件的来源）。"""
