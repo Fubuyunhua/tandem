@@ -20,6 +20,8 @@ from typing import cast
 
 from tandem.core.level import compute_level
 from tandem.core.model import (
+    ActionKind,
+    ActionStatus,
     ChangeSet,
     Event,
     EventKind,
@@ -36,9 +38,11 @@ from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.config import load_policy
 from tandem.shell.diff_source import DiffSource, FakeDiffSource, GitDiffSource
 from tandem.shell.executor import Executor
+from tandem.shell.github import GhGitHub, GitHubError
+from tandem.shell.github_events import GitHubEvents
 from tandem.shell.receipt import Receipt, parse_receipt, render_receipt
 from tandem.shell.runner import Runner, RunnerError
-from tandem.shell.store import Store
+from tandem.shell.store import Store, StoreError
 
 DEFAULT_DB = Path("data") / "tandem.sqlite3"
 
@@ -106,7 +110,11 @@ def _print_decision(runner: Runner, event: Event) -> bool:
         print(f"  没有生效：{result.decision.reason}")
     for action in result.executed:
         print(f"  动作：{action.message}")
-    return result.decision.changed
+    return result.decision.changed and all(
+        item.status is not ActionStatus.UNKNOWN
+        for item in result.executed
+        if item.action.kind in {ActionKind.MERGE, ActionKind.CLOSE_PR}
+    )
 
 
 # ---------------------------------------------------------------- status
@@ -167,6 +175,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 def cmd_approve(args: argparse.Namespace) -> int:
     store, runner = _open(_db_path(args))
     try:
+        _connect_github(args, runner)
         task = store.load_task(args.task_id)
         if task is None:
             print(f"没有任务 {args.task_id}")
@@ -196,6 +205,9 @@ def cmd_approve(args: argparse.Namespace) -> int:
                 print(f"{task.task_id} 在{task.status.value}，现在不需要你批准")
                 return 1
         return 0 if _print_decision(runner, event) else 2
+    except (GitHubError, RunnerError) as error:
+        print(f"GitHub 操作失败：{error}")
+        return 1
     finally:
         store.close()
 
@@ -226,12 +238,16 @@ def cmd_reject(args: argparse.Namespace) -> int:
 def cmd_cancel(args: argparse.Namespace) -> int:
     store, runner = _open(_db_path(args))
     try:
+        _connect_github(args, runner)
         task = store.load_task(args.task_id)
         if task is None:
             print(f"没有任务 {args.task_id}")
             return 1
         changed = _print_decision(runner, _event(EventKind.CANCEL, task, reason=args.reason))
         return 0 if changed else 2
+    except (GitHubError, RunnerError) as error:
+        print(f"GitHub 操作失败：{error}")
+        return 1
     finally:
         store.close()
 
@@ -407,6 +423,53 @@ def cmd_demo(_args: argparse.Namespace) -> int:
     return run_demo()
 
 
+def cmd_github(args: argparse.Namespace) -> int:
+    """拉取或核对一次；live 仅控制 GitHub 写入，不启动真实 Agent。"""
+    store, runner = _open(_db_path(args))
+    try:
+        github = GhGitHub(str(args.repo))
+        runner.executor.github = github
+        runner.executor.github_store = store
+        runner.executor.github_repo = str(args.repo)
+        runner.executor.dry_run = not bool(args.live)
+        source = GitHubEvents(runner, github, str(args.repo))
+        if args.command == "poll":
+            created = source.poll()
+            for binding in cast("list[str]", args.bind):
+                task_id, separator, number = binding.partition("=")
+                if not separator or not number.isdecimal():
+                    raise RunnerError("PR 关联格式必须为 gh-编号=PR编号")
+                source.bind_pr(task_id, int(number))
+            print(f"轮询完成，新建任务：{', '.join(created) or '无'}")
+        else:
+            if args.pr is not None:
+                source.bind_pr(str(args.task_id), int(args.pr))
+            result = source.reconcile(str(args.task_id))
+            print(f"{args.task_id}：{result.value}")
+        return 0
+    except (GitHubError, RunnerError, StoreError) as error:
+        print(f"GitHub 操作失败：{error}")
+        return 1
+    finally:
+        store.close()
+
+
+def _connect_github(args: argparse.Namespace, runner: Runner) -> None:
+    """已知 GitHub 来源的批准和取消也走同一个安全执行器。"""
+    repo = getattr(args, "repo", None)
+    live = bool(getattr(args, "live", False))
+    source = runner.store.github_source(str(args.task_id))
+    if repo is None and source is not None:
+        repo = source.repo
+    if live and repo is None:
+        raise RunnerError("live 操作需要 GitHub 来源或 --repo")
+    if repo is not None:
+        runner.executor.github = GhGitHub(str(repo))
+        runner.executor.github_store = runner.store
+        runner.executor.github_repo = str(repo)
+        runner.executor.dry_run = not live
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -420,6 +483,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status", parents=[common], help="列出任务和当前状态")
 
+    for name in ("poll", "reconcile"):
+        command = subparsers.add_parser(
+            name, parents=[common], help="轮询 GitHub" if name == "poll" else "核对异常任务"
+        )
+        command.add_argument("--repo", required=True, help="仓库 owner/repo")
+        command.add_argument("--live", action="store_true", help="显式启用 GitHub 写入")
+        if name == "reconcile":
+            command.add_argument("task_id", help="任务编号")
+            command.add_argument("--pr", type=int, default=None, help="首次核对时明确关联 PR 编号")
+        else:
+            command.add_argument(
+                "--bind", action="append", default=[], help="关联 gh-编号=PR编号，可重复"
+            )
+
     submit = subparsers.add_parser("submit", parents=[common], help="提交一个新任务")
     submit.add_argument("--task-id", required=True, help="任务编号")
     submit.add_argument("--paths", default="", help="改动的文件，逗号分隔")
@@ -430,6 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     approve = subparsers.add_parser("approve", parents=[common], help="批准方案或代码")
     approve.add_argument("--task-id", required=True, help="任务编号")
+    approve.add_argument("--repo", default=None, help="仓库 owner/repo，默认读取来源")
+    approve.add_argument("--live", action="store_true", help="显式启用 GitHub 写入")
     approve.add_argument(
         "--sha",
         required=True,
@@ -450,12 +529,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     cancel = subparsers.add_parser("cancel", parents=[common], help="取消任务")
     cancel.add_argument("--task-id", required=True, help="任务编号")
+    cancel.add_argument("--repo", default=None, help="仓库 owner/repo，默认读取来源")
+    cancel.add_argument("--live", action="store_true", help="显式启用 GitHub 写入")
     cancel.add_argument("--reason", default=None, help="原因")
 
     return parser
 
 
 COMMANDS = {
+    "poll": cmd_github,
+    "reconcile": cmd_github,
     "demo": cmd_demo,
     "status": cmd_status,
     "submit": cmd_submit,

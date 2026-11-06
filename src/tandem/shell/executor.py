@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 
 from tandem.core.model import Action, ActionKind, ActionStatus, TaskRecord
 from tandem.shell.agents.base import AgentAdapter, AgentError, AgentRequest
+from tandem.shell.github import GitHubClient, GitHubError
+from tandem.shell.store import Store
 
 # 这些动作在 M1 里没有真实实现，非 dry-run 时记为"结果未知"
 NOT_IMPLEMENTED = (
@@ -66,8 +68,13 @@ class Executor:
     agents: Mapping[str, AgentAdapter] = field(default_factory=dict[str, AgentAdapter])
     dry_run: bool = True
     log: list[str] = field(default_factory=list[str])
+    github: GitHubClient | None = None
+    github_store: Store | None = None
+    github_repo: str | None = None
 
     def execute(self, action: Action, task: TaskRecord) -> ExecutedAction:
+        if self.github is not None and action.kind in {ActionKind.MERGE, ActionKind.CLOSE_PR}:
+            return self._github_action(action, task)
         self.log.append(
             f"{'[dry-run] ' if self.dry_run else ''}{action.kind.value}"
             f"{'（' + action.provider + '）' if action.provider is not None else ''}"
@@ -97,6 +104,41 @@ class Executor:
                 )
             case _:  # pragma: no cover - 新增动作类型时 pyright 会报错
                 raise AgentError(f"未知的动作：{action.kind}")
+
+    def _github_action(self, action: Action, task: TaskRecord) -> ExecutedAction:
+        assert self.github is not None
+        source = (
+            None if self.github_store is None else self.github_store.github_source(task.task_id)
+        )
+        try:
+            if source is None or source.repo != self.github_repo or source.pr_number is None:
+                raise GitHubError("缺少匹配仓库的 PR 关联")
+            if action.kind is ActionKind.MERGE:
+                if (
+                    task.approved_sha is None
+                    or task.approved_sha != task.latest_sha
+                    or not task.ci_green
+                ):
+                    raise GitHubError("合并缺少当前提交的批准或 CI 证据")
+                confirmed = self.github.merge_pr(
+                    source.pr_number, task.approved_sha, live=not self.dry_run
+                )
+            else:
+                confirmed = self.github.close_pr(source.pr_number, live=not self.dry_run)
+        except GitHubError:
+            return ExecutedAction(action, ActionStatus.UNKNOWN, False, "GitHub 动作失败或结果未知")
+        if not self.dry_run and not confirmed:
+            return ExecutedAction(action, ActionStatus.UNKNOWN, False, "GitHub 未确认动作完成")
+        return ExecutedAction(
+            action,
+            ActionStatus.DONE,
+            self.dry_run,
+            "dry-run：未执行写入"
+            if self.dry_run
+            else "GitHub 已确认动作完成"
+            if confirmed
+            else "GitHub 未确认动作完成",
+        )
 
     def _start_agent(self, action: Action, task: TaskRecord) -> ExecutedAction:
         provider = action.provider or ""
