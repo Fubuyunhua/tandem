@@ -220,6 +220,8 @@ def _dispatch(
         return _ignore(task, f"任务已经结束（{task.status.value}），事件直接丢弃")
 
     match event.kind:
+        case EventKind.CREATED:
+            return _ignore(task, "任务创建事件只给日志用，内核不改状态")
         case EventKind.ASSIGN:
             return _on_assign(task, event, policy, quota)
         case EventKind.PLAN_SUBMITTED:

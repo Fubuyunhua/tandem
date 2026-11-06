@@ -1,9 +1,11 @@
 """SQLite 存储。
 
-三张表：
+四张表：
 - ``events``：事件只追加。用触发器把 UPDATE / DELETE 直接挡掉。
 - ``tasks``：任务的最新快照 + 状态版本号，版本号只允许往前走。
-- ``actions``：每个动作的编号和状态（已发出 / 结果未知 / 已完成）。
+- ``actions``：每个动作的编号和状态（已发出 / 结果未知 / 已完成），
+  是动作状态的唯一事实来源，任务快照里那份由它投影出来。
+- ``quota``：每家提供方的额度估计，重启后从这里恢复。
 
 数据库默认放在 ``data/`` 下（已被 git 忽略）。
 """
@@ -13,11 +15,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tandem.core.model import Action, ActionKind, ActionStatus, Event, TaskRecord, TaskStatus
+from tandem.core.model import (
+    Action,
+    ActionKind,
+    ActionStatus,
+    Event,
+    QuotaState,
+    TaskRecord,
+    TaskStatus,
+)
 from tandem.shell import serde
 
 SCHEMA = """
@@ -49,6 +59,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL,
     level TEXT NOT NULL,
     payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quota (
+    provider TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
@@ -254,11 +270,29 @@ class Store:
         ).fetchone()
         if row is None:
             return None
-        return serde.task_from_dict(json.loads(str(row["payload"])))
+        return self._project_actions(serde.task_from_dict(json.loads(str(row["payload"]))))
 
     def list_tasks(self) -> list[TaskRecord]:
         rows = self._connection.execute("SELECT payload FROM tasks ORDER BY task_id").fetchall()
-        return [serde.task_from_dict(json.loads(str(row["payload"]))) for row in rows]
+        return [
+            self._project_actions(serde.task_from_dict(json.loads(str(row["payload"]))))
+            for row in rows
+        ]
+
+    def _project_actions(self, task: TaskRecord) -> TaskRecord:
+        """动作状态的唯一事实来源是动作表，任务快照里的那份由它投影出来。"""
+        statuses = {action.action_id: action.status for action in self.list_actions(task.task_id)}
+        if not statuses:
+            return task
+        projected = tuple(
+            replace(action, status=statuses[action.action_id])
+            if action.action_id in statuses
+            else action
+            for action in task.actions
+        )
+        if projected == task.actions:
+            return task
+        return replace(task, actions=projected)
 
     def list_tasks_by_status(self, status: TaskStatus) -> list[TaskRecord]:
         return [task for task in self.list_tasks() if task.status is status]
@@ -305,6 +339,23 @@ class Store:
             )
             for row in rows
         ]
+
+    # ------------------------------------------------------------ 额度
+
+    def load_quota(self) -> dict[str, QuotaState]:
+        """重启后恢复额度估计：不知道就是不知道，用完过的继续算用完。"""
+        rows = self._connection.execute("SELECT provider, state FROM quota").fetchall()
+        return {str(row["provider"]): QuotaState[str(row["state"])] for row in rows}
+
+    def save_quota(self, provider: str, state: QuotaState, now: datetime | None = None) -> None:
+        stamp = (now or _now()).isoformat()
+        with self._connection:
+            self._connection.execute(
+                "INSERT INTO quota (provider, state, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(provider) DO UPDATE SET state = excluded.state,"
+                "   updated_at = excluded.updated_at",
+                (provider, state.name, stamp),
+            )
 
     def unconfirmed_actions(self, task_id: str) -> list[Action]:
         """第 26 条：重启后只核对没有确认完成的动作。"""

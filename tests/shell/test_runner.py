@@ -96,9 +96,17 @@ def test_full_c_loop_reaches_merged(tmp_path: Path) -> None:
     finished = runner.handle(Event(kind=EventKind.MERGED, task_id="t1", sha=SHA_1))
     assert finished.decision.task.status is TaskStatus.MERGED
 
-    # 事件只追加，动作都有记录
+    # 事件只追加，动作都有记录（第一条是创建事件）
     events = runner.store.list_events("t1")
-    assert len(events) == 6
+    assert [event.kind for event in events] == [
+        EventKind.CREATED,
+        EventKind.ASSIGN,
+        EventKind.CODE_SUBMITTED,
+        EventKind.CI_GREEN,
+        EventKind.REVIEW,
+        EventKind.REVIEW,
+        EventKind.MERGED,
+    ]
     kinds = [action.kind for action in runner.store.list_actions("t1")]
     assert ActionKind.MERGE in kinds
     merge_action = next(
@@ -149,7 +157,7 @@ def test_version_mismatch_does_not_change_task(tmp_path: Path) -> None:
     assert not result.decision.changed
     assert runner.store.load_task("t1") == before
     # 事件还是要记进日志，方便事后追问"为什么是这个结果"
-    assert len(runner.store.list_events("t1")) == 1
+    assert len(runner.store.list_events("t1")) == 2
 
 
 def test_handle_unknown_task_raises(tmp_path: Path) -> None:
@@ -214,7 +222,7 @@ def test_handle_persists_even_when_execution_fails(tmp_path: Path) -> None:
     task = runner.store.load_task("t1")
     assert task is not None
     assert task.status is TaskStatus.WORKING
-    assert len(runner.store.list_events("t1")) == 1
+    assert len(runner.store.list_events("t1")) == 2
 
 
 def test_conflict_is_raised_when_snapshot_changed_underneath(
@@ -234,3 +242,40 @@ def test_conflict_is_raised_when_snapshot_changed_underneath(
     monkeypatch.setattr(runner.store, "load_task", lambda task_id: stale)
     with pytest.raises(ConflictError):
         runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+
+
+def test_quota_survives_restart(tmp_path: Path) -> None:
+    """F11：额度估计要持久化，重启后不能忘掉"这一家已经用完"。"""
+    runner = make_runner(tmp_path)
+    runner.submit("t1", Level.C)
+    runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+    runner.handle(
+        Event(kind=EventKind.QUOTA_EXHAUSTED, task_id="t1", provider="claude", reason="写一半")
+    )
+    runner.store.close()
+
+    restarted = make_runner(tmp_path)
+    assert restarted.quota.snapshot().state("claude") is QuotaState.EXHAUSTED
+    restarted.store.close()
+
+
+def test_submit_appends_a_created_event(tmp_path: Path) -> None:
+    """F11：创建任务也要记事件，日志里能看到任务是怎么出现的。"""
+    runner = make_runner(tmp_path)
+    runner.submit("t1", Level.C)
+    events = runner.store.list_events("t1")
+    assert [event.kind for event in events] == [EventKind.CREATED]
+    assert events[0].task_id == "t1"
+
+
+def test_action_status_has_a_single_source_of_truth(tmp_path: Path) -> None:
+    """F11：执行结果写回以后，任务快照里的动作状态和动作表一致。"""
+    runner = make_runner(tmp_path, [code_receipt()])
+    runner.submit("t1", Level.C)
+    runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
+
+    table = runner.store.list_actions("t1")
+    task = runner.store.load_task("t1")
+    assert task is not None
+    assert [action.status for action in task.actions] == [ActionStatus.DONE]
+    assert [action.status for action in task.actions] == [action.status for action in table]

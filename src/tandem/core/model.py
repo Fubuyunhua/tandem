@@ -425,6 +425,7 @@ class Policy:
 class EventKind(Enum):
     """进入内核的所有事件。回执、CI、你的回答都在这里。"""
 
+    CREATED = "任务创建"
     ASSIGN = "派活"
     PLAN_SUBMITTED = "交回方案"
     PLAN_APPROVED = "你批准方案"

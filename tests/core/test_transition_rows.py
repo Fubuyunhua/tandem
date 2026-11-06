@@ -960,3 +960,11 @@ def test_row_16_reviewer_lost_marks_quota_exhausted_action() -> None:
     assert exhausted and exhausted[0].provider == "opencode-go"
     assert decision.task.status is TaskStatus.AWAITING_AI_REVIEW
     assert decision.task.designated_reviewers == ("codex",)
+
+
+def test_row_00_creation_event_does_not_change_anything() -> None:
+    """任务创建事件只给日志用，内核不改状态。"""
+    record = new_task()
+    decision = run(record, ev(EventKind.CREATED))
+    assert not decision.changed
+    assert "创建" in decision.reason

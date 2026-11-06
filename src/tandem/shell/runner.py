@@ -40,18 +40,31 @@ def _utc_now() -> datetime:
 
 @dataclass
 class QuotaTracker:
-    """额度估计（终审第 15 条）：不知道就当还有，收到"额度用完"才标记用完。"""
+    """额度估计（终审第 15 条）：不知道就当还有，收到"额度用完"才标记用完。
+
+    接上 store 以后立刻持久化，重启不会忘掉"这一家已经用完"。
+    """
 
     states: dict[str, QuotaState] = field(default_factory=dict[str, QuotaState])
+    store: Store | None = None
+
+    def attach(self, store: Store) -> None:
+        """接上存储：先把之前存下来的额度读回来（存下来的事实优先）。"""
+        self.store = store
+        self.states.update(store.load_quota())
 
     def snapshot(self) -> QuotaSnapshot:
         return QuotaSnapshot.from_mapping(self.states)
 
     def mark_exhausted(self, provider: str) -> None:
         self.states[provider] = QuotaState.EXHAUSTED
+        if self.store is not None:
+            self.store.save_quota(provider, QuotaState.EXHAUSTED)
 
     def mark_available(self, provider: str) -> None:
         self.states[provider] = QuotaState.AVAILABLE
+        if self.store is not None:
+            self.store.save_quota(provider, QuotaState.AVAILABLE)
 
 
 @dataclass(frozen=True)
@@ -77,13 +90,22 @@ class Runner:
     quota: QuotaTracker = field(default_factory=QuotaTracker)
     clock: Callable[[], datetime] = _utc_now
 
+    def __post_init__(self) -> None:
+        # 启动时接上存储，把之前记下的额度估计恢复回来
+        self.quota.attach(self.store)
+
     def submit(self, task_id: str, level: Level, *, base_sha: str = "main") -> TaskRecord:
         """建一个新任务。等级由提交时收集到的真实改动算好传进来。"""
         if self.store.load_task(task_id) is not None:
             raise RunnerError(f"任务 {task_id} 已经存在")
         now = self.clock()
         task = replace(create_task(task_id, level, self.policy), updated_at=now, base_sha=base_sha)
-        self.store.commit(task=task, now=now)
+        # 创建事实也进事件日志，事后能追问任务是从哪来的
+        self.store.commit(
+            events=[Event(kind=EventKind.CREATED, task_id=task_id)],
+            task=task,
+            now=now,
+        )
         return task
 
     def code_event(self, task: TaskRecord, receipt: Receipt, *, base: str | None = None) -> Event:
