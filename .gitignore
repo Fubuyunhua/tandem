@@ -1,0 +1,19 @@
+# 外部参考代码（不受信任，单独 clone，不纳入本仓库）
+external/
+
+# 本地环境与密钥
+.env
+.env.*
+*.local
+
+# 依赖与构建产物
+node_modules/
+.venv/
+__pycache__/
+dist/
+
+# 运行时数据（事件日志数据库等）
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
