@@ -6,7 +6,17 @@ from dataclasses import dataclass
 from hashlib import sha256
 
 from tandem.core.level import compute_level
-from tandem.core.model import Event, EventKind, Finding, Review, TaskRecord, TaskStatus, Verdict
+from tandem.core.model import (
+    ActionKind,
+    ActionStatus,
+    Event,
+    EventKind,
+    Finding,
+    Review,
+    TaskRecord,
+    TaskStatus,
+    Verdict,
+)
 from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.receipt import parse_receipt, render_receipt
 from tandem.shell.runner import Runner, RunResult
@@ -141,10 +151,20 @@ class LocalRun:
                 if current.status is not TaskStatus.AWAITING_AI_REVIEW:
                     break
         if current.status is TaskStatus.AWAITING_MERGE:
+            # Runner 的返回快照仍可能带 SENT；动作表才是执行结果的事实来源。
+            saved = self.runner.store.load_task(current.task_id)
+            assert saved is not None
+            current = saved
+            merge = next(
+                (action for action in reversed(current.actions) if action.kind is ActionKind.MERGE),
+                None,
+            )
             if (
                 current.approved_sha is not None
                 and current.approved_sha == current.latest_sha
                 and current.ci_green
+                and merge is not None
+                and merge.status is ActionStatus.DONE
             ):
                 current = self._send(
                     current,
@@ -156,7 +176,10 @@ class LocalRun:
                     ),
                 ).decision.task
             else:
-                print(f"{current.task_id}：缺少当前 SHA 的 CI 或批准证据，不能模拟合并。")
+                print(
+                    f"{current.task_id}：缺少当前 SHA 的 CI、批准证据，"
+                    "或最近一次 MERGE 动作尚未确认 DONE，不能模拟合并。"
+                )
         self._hint(current)
         return current.state_version != version
 
@@ -185,13 +208,27 @@ class LocalRun:
             else:
                 print("  CI 尚未通过，不能批准；本轮未提供介入后的重做命令。")
         elif task.status is TaskStatus.PENDING:
-            print("  可以调整 --agent-script / --review 后再次运行 tandem run。")
+            print(
+                "  检查等级下降提示或写手额度，"
+                "调整 --changes / --agent-script / --review 后再 run。"
+            )
+        elif task.status is TaskStatus.AWAITING_ACCEPTANCE:
+            print(
+                "  等待当前提交的 CI；核对提交编号后再 run 生成模拟 CI，真实 CI 请到 GitHub 核对。"
+            )
+        elif task.status is TaskStatus.AWAITING_AI_REVIEW:
+            print(
+                "  等待本轮指定审核者的结论；用 show 核对席位、提交和额度，再 run 模拟缺少的结论。"
+            )
+        elif task.status is TaskStatus.AWAITING_MERGE:
+            print("  合并结果未确认：用 show 核对当前 SHA、CI、批准及最近一次 MERGE 动作状态。")
+            print("  若涉及真实 PR，先去 GitHub 核对合并结果；本命令不会补造执行成功证据。")
         elif task.status in {TaskStatus.WORKING, TaskStatus.ERROR, TaskStatus.YOU_WORKING}:
             print("  此状态需要人工处理；本轮不自动恢复丢失的回执或异常任务。")
         print(f"  如需取消：uv run tandem cancel --task-id {task_id} {db}")
 
     def run(self, *, until_idle: bool = False, max_rounds: int = 10) -> int:
-        """达到轮数上限仍未确认空闲时返回非零，供脚本识别未完成。"""
+        """0 表示全部到达终点；1 表示未完成；2 表示达到轮数上限。"""
         if max_rounds < 1:
             raise ValueError("最大轮数必须大于 0")
         print("模拟运行 / dry-run：假 Agent、假改动、假 CI、假审核；不会调用真实 AI 或合并。")
@@ -203,11 +240,18 @@ class LocalRun:
                 # 即使已有任务暂停，也继续驱动其他任务。
                 changed = self._advance(task) or changed
             if not until_idle:
-                return 0
+                return self._finish()
             if not changed or not any(
                 task.status in AUTOMATIC_STATES for task in self.runner.store.list_tasks()
             ):
-                print("已空闲：没有任务能继续自动推进。")
-                return 0
+                return self._finish()
         print(f"达到最大轮数 {max_rounds}，尚未确认空闲；请用 show 查看后再运行。")
         return 2
+
+    def _finish(self) -> int:
+        remaining = [task for task in self.runner.store.list_tasks() if not task.status.is_terminal]
+        if remaining:
+            print(f"尚未完成：有 {len(remaining)} 个任务卡住或等待后续处理，请按上方提示操作。")
+            return 1
+        print("全部完成：所有任务均已到达终点状态。")
+        return 0
