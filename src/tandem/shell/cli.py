@@ -23,6 +23,7 @@ from tandem.core.model import (
     ActionKind,
     ActionStatus,
     ChangeSet,
+    CheckResult,
     Event,
     EventKind,
     Level,
@@ -461,6 +462,12 @@ def cmd_github(args: argparse.Namespace) -> int:
                 source.bind_pr(str(args.task_id), int(args.pr))
             result = source.reconcile(str(args.task_id))
             print(f"{args.task_id}：{result.value}")
+            if result is CheckResult.NOT_CONFIRMED:
+                print(
+                    "下一步：请手工核对 PR 状态；CLI 不会自行重发 MERGE。"
+                    "若仍待合并，请等待 task-001 的内核重试支持，"
+                    "或确认放弃后用 tandem cancel 取消任务。"
+                )
         return 0
     except (GitHubError, RunnerError, StoreError) as error:
         print(f"GitHub 操作失败：{error}")

@@ -14,6 +14,32 @@ class GitHubError(RuntimeError):
     """只向外暴露固定错误，不泄露命令输出中的凭据。"""
 
 
+def safe_action_error(error: GitHubError) -> str:
+    """只转发已知固定动作错误；替身或未来后端的任意输出不能进入日志。"""
+    known = {
+        "缺少匹配仓库的 PR 关联",
+        "合并缺少当前提交的批准或 CI 证据",
+        "PR 不存在",
+        "PR 的 head SHA 与预期不一致，拒绝合并",
+        "PR 已关闭，拒绝合并",
+        "CI 尚未全部通过，拒绝合并",
+        "GitHub 未确认合并成功",
+        "合并后的状态尚未确认",
+        "PR 已合并，不能关闭",
+        "关闭后的状态尚未确认",
+        "gh 命令失败",
+        "gh 无法执行或返回了无效数据",
+        "GitHub 返回的数据格式错误",
+        "GitHub 返回的列表格式错误",
+        "GitHub 返回的文本格式错误",
+        "PR 状态格式错误",
+        "编号必须为正整数",
+        "提交编号格式错误",
+    }
+    message = str(error)
+    return message if message in known else "GitHub 返回未知错误，详情已隐藏"
+
+
 class CIState(Enum):
     GREEN = "green"
     RED = "red"

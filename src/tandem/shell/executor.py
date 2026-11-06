@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from tandem.core.model import Action, ActionKind, ActionStatus, TaskRecord
 from tandem.shell.agents.base import AgentAdapter, AgentError, AgentRequest
-from tandem.shell.github import GitHubClient, GitHubError
+from tandem.shell.github import GitHubClient, GitHubError, safe_action_error
 from tandem.shell.store import GitHubSource, Store
 
 # 这些动作在 M1 里没有真实实现，非 dry-run 时记为"结果未知"
@@ -86,7 +86,12 @@ class Executor:
 
     def execute(self, action: Action, task: TaskRecord) -> ExecutedAction:
         if self.github is not None and action.kind in {ActionKind.MERGE, ActionKind.CLOSE_PR}:
-            return self._github_action(action, task)
+            outcome = self._github_action(action, task)
+            self.log.append(
+                f"[{'dry-run' if self.dry_run else 'live'}] {action.action_id} "
+                f"{task.task_id} {action.kind.value}：{outcome.message}"
+            )
+            return outcome
         self.log.append(
             f"{'[dry-run] ' if self.dry_run else ''}{action.kind.value}"
             f"{'（' + action.provider + '）' if action.provider is not None else ''}"
@@ -137,8 +142,10 @@ class Executor:
                 )
             else:
                 confirmed = self.github.close_pr(source.pr_number, live=not self.dry_run)
-        except GitHubError:
-            return ExecutedAction(action, ActionStatus.UNKNOWN, False, "GitHub 动作失败或结果未知")
+        except GitHubError as error:
+            return ExecutedAction(
+                action, ActionStatus.UNKNOWN, False, f"GitHub 动作失败：{safe_action_error(error)}"
+            )
         if not self.dry_run and not confirmed:
             return ExecutedAction(action, ActionStatus.UNKNOWN, False, "GitHub 未确认动作完成")
         return ExecutedAction(
