@@ -14,6 +14,7 @@ from tandem.core.model import (
     Finding,
     Level,
     QuotaState,
+    Review,
     RunMode,
     TaskRecord,
     TaskStatus,
@@ -26,6 +27,7 @@ from tests.core.helpers import (
     DOC_CHANGES,
     SHA_1,
     SHA_2,
+    Walker,
     actions_of,
     ev,
     new_task,
@@ -1121,3 +1123,101 @@ def test_row_13_passing_reviews_clear_open_findings() -> None:
     assert record.open_findings == ()
     # 历史意见不会被删掉
     assert record.review_history
+
+
+# ------------------------------------------------- H7：新提交要作废旧审核席位
+
+
+def test_row_05_new_commit_clears_old_reviewer_seats() -> None:
+    """新提交让旧的审核席位一起作废，不能拿过期席位挡住后面的人工批准。"""
+    record = to_ai_review()
+    assert record.designated_reviewers == ("codex", "opencode-go")
+    record = run(record, review_event(record, "codex", Verdict.FAIL, findings=_findings())).task
+    record = to_working(record)
+    record = run(record, ev(EventKind.REFUSED_TO_FIX, reason="标准不对")).task
+    record = run(record, ev(EventKind.TAKE_OVER)).task
+    decision = run(
+        record,
+        ev(
+            EventKind.YOU_SUBMITTED_CODE,
+            sha=SHA_2,
+            changes=CODE_CHANGES,
+            providers=("codex",),
+        ),
+    )
+    assert decision.task.designated_reviewers == ()
+
+
+def test_row_16_records_the_seats_that_actually_exist() -> None:
+    """凑不齐审核者进入 R03 时，记录里留下的是当前真实存在的席位。"""
+    walker = Walker(new_task())
+    walker.assign("claude")
+    walker.submit_code()
+    walker.quota = quota(("codex",))  # codex 用完，只剩 opencode-go
+    decision = walker.ci_green()
+    assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert decision.task.error_code == "R03"
+    assert decision.task.designated_reviewers == ("opencode-go",)
+
+
+def test_row_20_human_approval_survives_stale_seats() -> None:
+    """人工接手后声明帮过忙的提供方：旧席位不能永久挡住 R03 下的人工批准。"""
+    record = to_ai_review()
+    record = run(record, review_event(record, "codex", Verdict.FAIL, findings=_findings())).task
+    record = to_working(record)
+    record = run(record, ev(EventKind.REFUSED_TO_FIX, reason="标准不对")).task
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    record = run(record, ev(EventKind.TAKE_OVER)).task
+    record = run(
+        record,
+        ev(
+            EventKind.YOU_SUBMITTED_CODE,
+            sha=SHA_2,
+            changes=CODE_CHANGES,
+            providers=("codex",),
+        ),
+    ).task
+    record = run(record, ev(EventKind.CI_GREEN, sha=SHA_2)).task
+    assert record.status is TaskStatus.NEEDS_INTERVENTION
+    assert record.error_code == "R03"
+    assert "codex" not in record.designated_reviewers
+
+    decision = run(
+        record,
+        ev(
+            EventKind.INTERVENTION_APPROVED,
+            sha=SHA_2,
+            veto_reasons=(
+                VetoReason(finding_id="F1", reason="这条我补了测试"),
+                VetoReason(finding_id="F2", reason="时间从参数传"),
+            ),
+        ),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    assert actions_of(decision, ActionKind.MERGE)
+
+
+def test_merge_guard_still_rejects_writer_votes_on_the_ai_entry() -> None:
+    """凭 AI 证据放行时，席位里不能有写过这次代码的人（这条不因为人工入口而放松）。"""
+    from dataclasses import replace
+
+    record = to_ai_review()
+    tampered = replace(record, designated_reviewers=("codex", "claude"))
+    tampered = replace(tampered, reviews=())
+    for reviewer, provider in (("codex", "codex"), ("claude", "claude")):
+        decision = run(
+            tampered,
+            ev(
+                EventKind.REVIEW,
+                review=Review(
+                    reviewer=reviewer,
+                    provider=provider,
+                    verdict=Verdict.PASS,
+                    sha=tampered.latest_sha or SHA_1,
+                    standard_version=tampered.standard_version,
+                ),
+            ),
+        )
+        tampered = decision.task
+    assert tampered.status is TaskStatus.AWAITING_AI_REVIEW
+    assert not any(action.kind is ActionKind.MERGE for action in tampered.actions)

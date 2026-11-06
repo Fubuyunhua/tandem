@@ -426,6 +426,7 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
             latest_sha=event.sha,
             approved_sha=None,
             reviews=(),
+            designated_reviewers=(),
             ci_green=False,
             plan_version=plan_version,
             returned_from_review=False,
@@ -438,10 +439,11 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         f"交回代码 {event.sha}，按真实改动算出来是 {new_level.value} 级",
         actions.items,
         level=new_level,
-        # 新提交让旧结论、批准、否决全部作废
+        # 新提交让旧结论、批准、否决、旧审核席位全部作废
         latest_sha=event.sha,
         approved_sha=None,
         reviews=(),
+        designated_reviewers=(),
         ci_green=False,
         pr_opened=True,
         returned_from_review=False,
@@ -475,6 +477,8 @@ def _on_new_submission(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         "latest_sha": event.sha,
         "approved_sha": None,
         "reviews": (),
+        # 旧审核席位也一起作废：过期的席位不能当成本次的审核证据
+        "designated_reviewers": (),
         "ci_green": False,
         "pr_opened": True,
         "returned_from_review": False,
@@ -644,14 +648,17 @@ def _on_ci_green(task: TaskRecord, event: Event, policy: Policy, quota: QuotaSna
 
     reviewers = _select_reviewers(task, policy, quota)
     if not reviewers:
+        available = eligible_reviewers(task, policy, quota)
+        names = "、".join(available) or "无"
         actions.add(ActionKind.NOTIFY, detail="凑不齐合格的审核者")
         return _transition(
             task,
             TaskStatus.NEEDS_INTERVENTION,
-            "R03 凑不齐合格的审核者",
+            f"R03 凑不齐合格的审核者（当前只有 {len(available)} 家：{names}）",
             actions.items,
             ci_green=True,
             error_code="R03",
+            designated_reviewers=available,
         )
     for reviewer in reviewers:
         actions.add(
@@ -995,6 +1002,7 @@ def _on_you_submitted_code(task: TaskRecord, event: Event, policy: Policy) -> De
         "latest_sha": event.sha,
         "approved_sha": None,
         "reviews": (),
+        "designated_reviewers": (),
         "ci_green": False,
         "pr_opened": True,
         "note": f"参与过的 AI：{involved}",
