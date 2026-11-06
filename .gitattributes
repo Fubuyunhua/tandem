@@ -1,0 +1,14 @@
+# 统一用 LF：后台在 WSL 里运行，Windows 和 Linux 混用换行符会出问题
+* text=auto eol=lf
+
+# Windows 专用脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件不做转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+*.sqlite binary
