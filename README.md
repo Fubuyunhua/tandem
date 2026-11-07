@@ -29,6 +29,15 @@ JS/TS 去掉行注释、块注释、引号及模板字面量后近似计数 asse
 改名为非测试路径或离开原测试目录按删除测试判 D，即使文件本来没有断言。
 测试收集边界保留大小写：tests/ 改成 Tests/ 或测试文件纯大小写改名同样判 D，
 避免 Windows/macOS 本地看似等价的路径在 Linux CI 中不再被收集。
+移进 pytest 默认忽略目录（build、dist、node_modules、venv、.*、*.egg、CVS、_darcs、
+{arch} 等）也判为移出收集范围。只统计源码扩展名且符合测试命名的文件，排除 pyc 和 JSON 等 fixture。
+文档放宽必须有覆盖全部路径的已知文件模式；模式未知或缺失时不放宽。
+
+已知边界：Python 只计 assert 语句，self.assert*、pytest.raises 不计；换成这些风格可能被判 D。
+计数不能证明断言会执行，也不能证明断言强度；提前 return、动态跳过或改成 assert True 等仍需审核。
+无法确认证据时拒绝采集并抛出 DiffError：例如无共同祖先、部分克隆缺对象、已有 blob 不可读、
+Python 解析失败（包括不支持的 BOM/UTF-16 输入或语法错误）、非 commit 引用、链接循环或超过 40 层。
+这些错误不应被当作 C 或成功；闸门应以错误退出而不是放行，本轮不执行候选测试来补证据。
 
 ## 文档
 - 需求：[`docs/PRD.md`](docs/PRD.md)

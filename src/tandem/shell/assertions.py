@@ -2,10 +2,10 @@
 
 import ast
 import re
+from fnmatch import fnmatchcase
 
 TEST_FILE_PATTERN = re.compile(
-    r"(^|/)(tests?/|__tests__/|test_[^/]*\.py$|[^/]*_test\.(py|[cm]?[jt]sx?)$"
-    r"|[^/]*\.(test|spec)\.(py|[cm]?[jt]sx?)$)",
+    r"(^|/)(test_[^/]+|[^/]+_test|[^/]+\.(test|spec))\.[^/]+$",
     re.IGNORECASE,
 )
 JS_NON_CODE = re.compile(
@@ -13,10 +13,29 @@ JS_NON_CODE = re.compile(
     re.DOTALL,
 )
 JS_ASSERTION = re.compile(r"(?<![\w.])(assert\b|expect\s*\()")
+SOURCE_EXTENSIONS = frozenset({"py", "pyi", "js", "jsx", "ts", "tsx", "cjs", "mjs", "mts", "cts"})
+# pytest 默认 norecursedirs；这里采用跨平台保守匹配，不读取候选配置。
+NORECURSEDIRS = (
+    "*.egg",
+    ".*",
+    "_darcs",
+    "build",
+    "CVS",
+    "dist",
+    "node_modules",
+    "venv",
+    "{arch}",
+    "__pycache__",
+)
 
 
 def is_test_path(path: str) -> bool:
-    return TEST_FILE_PATTERN.search(path.replace("\\", "/")) is not None
+    path = path.replace("\\", "/")
+    if path.rsplit(".", 1)[-1].casefold() not in SOURCE_EXTENSIONS:
+        return False
+    return (
+        "__tests__" in path.casefold().split("/")[:-1] or TEST_FILE_PATTERN.search(path) is not None
+    )
 
 
 def leaves_test_collection(old: str, new: str) -> bool:
@@ -26,6 +45,12 @@ def leaves_test_collection(old: str, new: str) -> bool:
     if not is_test_path(new):
         return True
     old, new = old.replace("\\", "/"), new.replace("\\", "/")
+    if any(
+        fnmatchcase(part.casefold(), pattern.casefold())
+        for part in new.split("/")[:-1]
+        for pattern in NORECURSEDIRS
+    ):
+        return True
     # 保护路径可以不区分大小写，但 Linux CI 的测试收集不能据此把 Tests 当作 tests。
     if old != new and old.casefold() == new.casefold():
         return True

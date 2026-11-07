@@ -139,6 +139,16 @@ def all_paths_relaxable(changes: ChangeSet, policy: Policy) -> bool:
         return False
     if hits_bottom_line(changes, policy):
         return False
+    if not changes.file_changes:
+        return False
+    covered = {
+        clean
+        for entry in changes.file_changes
+        for path in (entry.path, entry.previous_path)
+        if path is not None and (clean := normalize_path(path)) is not None
+    }
+    if not set(paths) <= covered:
+        return False
     if any(
         entry.before_mode not in {"000000", "100644"} or entry.after_mode != "100644"
         for entry in changes.file_changes
