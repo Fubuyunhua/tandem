@@ -330,6 +330,8 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "base_sha": task.base_sha,
         "returned_from_review": task.returned_from_review,
         "actions": [action_to_dict(action) for action in task.actions],
+        "cleanup_checked": task.cleanup_checked,
+        "merge_confirmed_externally": task.merge_confirmed_externally,
         "reason": task.reason,
         "note": task.note,
         "updated_at": None if task.updated_at is None else task.updated_at.isoformat(),
@@ -409,6 +411,10 @@ def task_from_dict(data: object) -> TaskRecord:
         actions=tuple(
             action_from_dict(entry) for entry in _list(mapping.get("actions", []), "actions")
         ),
+        cleanup_checked=_bool(mapping.get("cleanup_checked", False), "cleanup_checked"),
+        merge_confirmed_externally=_bool(
+            mapping.get("merge_confirmed_externally", False), "merge_confirmed_externally"
+        ),
         reason=_str(mapping.get("reason", ""), "reason"),
         note=_str(mapping.get("note", ""), "note"),
         updated_at=None
@@ -434,6 +440,7 @@ def event_to_dict(event: Event) -> dict[str, object]:
         "provider": event.provider,
         "providers": list(event.providers),
         "veto_reasons": [veto_reason_to_dict(item) for item in event.veto_reasons],
+        "action_ids": list(event.action_ids),
         "model_suggestion": None if event.model_suggestion is None else event.model_suggestion.name,
         "check_result": None if event.check_result is None else event.check_result.name,
         "standard_version": event.standard_version,
@@ -465,6 +472,10 @@ def event_from_dict(data: object) -> Event:
         veto_reasons=tuple(
             veto_reason_from_dict(entry)
             for entry in _list(mapping.get("veto_reasons", []), "event.veto_reasons")
+        ),
+        action_ids=tuple(
+            _str(item, "event.action_ids[]")
+            for item in _list(mapping.get("action_ids", []), "event.action_ids")
         ),
         model_suggestion=(
             None if suggestion is None else _enum_value(Level, suggestion, "model_suggestion")

@@ -42,3 +42,11 @@ def test_invalid_oid_cannot_be_ci_or_approval_evidence(sha: str) -> None:
     assert not run(task, ev(EventKind.CI_GREEN, sha=sha)).changed
     task = replace(task, status=TaskStatus.AWAITING_YOUR_REVIEW, ci_green=True)
     assert not run(task, ev(EventKind.YOUR_APPROVAL, sha=sha)).changed
+
+
+@pytest.mark.parametrize("kind", [EventKind.PLAN_SUBMITTED, EventKind.PLAN_APPROVED])
+@pytest.mark.parametrize("sha", [None, "candidate", "g" * 40])
+def test_plan_oid_rejection_has_one_entry_message(kind: EventKind, sha: str | None) -> None:
+    result = run(to_ai_review(), ev(kind, sha=sha))
+    assert not result.changed
+    assert result.reason == "提交编号必须是完整的 40/64 位十六进制 OID"
