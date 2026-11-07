@@ -25,11 +25,15 @@ def leaves_test_collection(old: str, new: str) -> bool:
         return False
     if not is_test_path(new):
         return True
-    parts = old.replace("\\", "/").casefold().split("/")
+    old, new = old.replace("\\", "/"), new.replace("\\", "/")
+    # 保护路径可以不区分大小写，但 Linux CI 的测试收集不能据此把 Tests 当作 tests。
+    if old != new and old.casefold() == new.casefold():
+        return True
+    parts = old.split("/")
     for index, part in enumerate(parts[:-1]):
-        if part in {"test", "tests", "__tests__"}:
+        if part.casefold() in {"test", "tests", "__tests__"}:
             prefix = "/".join(parts[: index + 1]) + "/"
-            return not new.replace("\\", "/").casefold().startswith(prefix)
+            return not new.startswith(prefix)
     return False
 
 

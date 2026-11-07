@@ -73,3 +73,19 @@ def test_renaming_out_of_test_collection_is_a_removal(tmp_path: Path, body: str)
     _git(root, "commit", "-qm", "move outside collection")
     changes = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD").changes
     assert compute_level(changes, load_policy()) is Level.D
+
+
+@pytest.mark.parametrize("target", ["docs/test_a.py", "Tests/test_a.py", "tests/Test_a.py"])
+def test_unchanged_test_moved_out_or_case_renamed_is_d(tmp_path: Path, target: str) -> None:
+    root = _make_repo(tmp_path)
+    _commit_file(root, "tests/test_a.py", "def test_a():\n    assert True\n", "test")
+    # 经过临时路径，Windows 上也能构造 Git 树中的纯大小写改名。
+    _git(root, "mv", "tests/test_a.py", "staged-test.py")
+    if not (root / target).parent.exists():
+        (root / target).parent.mkdir(parents=True)
+    _git(root, "mv", "staged-test.py", target)
+    _git(root, "commit", "-qm", "rename unchanged test")
+    changes = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD").changes
+    assert changes.renames == (("tests/test_a.py", target),)
+    assert "tests/test_a.py" in changes.removed_test_paths
+    assert compute_level(changes, load_policy()) is Level.D
