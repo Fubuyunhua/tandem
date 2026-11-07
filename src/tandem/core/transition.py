@@ -21,6 +21,7 @@ from tandem.core.model import (
     Action,
     ActionKind,
     ActionStatus,
+    ActionUpdate,
     ChangeSet,
     CheckResult,
     Decision,
@@ -1390,13 +1391,20 @@ def _on_cleanup_checked(task: TaskRecord, event: Event) -> Decision:
     else:
         reason = f"清理核对：{names} 无法确认，已放弃"
         note = _append_note(task.note, f"清理未完成：{names} 已放弃（外部无法确认）")
-    return _transition(
+    decision = _transition(
         replace(task, actions=patched),
         task.status,
         reason,
         [],
         cleanup_checked=True,
         note=note,
+    )
+    # 这些动作早就发出去了，这里只把状态写回去；外壳不能重新执行它们
+    return replace(
+        decision,
+        action_updates=[
+            ActionUpdate(action_id=action_id, status=new_status) for action_id in wanted
+        ],
     )
 
 
