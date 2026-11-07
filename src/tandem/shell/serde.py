@@ -348,6 +348,7 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "base_sha": task.base_sha,
         "returned_from_review": task.returned_from_review,
         "actions": [action_to_dict(action) for action in task.actions],
+        "cleanup_action_ids": list(task.cleanup_action_ids),
         "cleanup_checked": task.cleanup_checked,
         "merge_confirmed_externally": task.merge_confirmed_externally,
         "reason": task.reason,
@@ -428,6 +429,10 @@ def task_from_dict(data: object) -> TaskRecord:
         returned_from_review=_bool(mapping.get("returned_from_review"), "returned_from_review"),
         actions=tuple(
             action_from_dict(entry) for entry in _list(mapping.get("actions", []), "actions")
+        ),
+        cleanup_action_ids=tuple(
+            _str(item, "cleanup_action_ids[]")
+            for item in _list(mapping.get("cleanup_action_ids", []), "cleanup_action_ids")
         ),
         cleanup_checked=_bool(mapping.get("cleanup_checked", False), "cleanup_checked"),
         merge_confirmed_externally=_bool(

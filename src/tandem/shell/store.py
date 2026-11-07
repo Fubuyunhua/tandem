@@ -23,6 +23,7 @@ from tandem.core.model import (
     Action,
     ActionKind,
     ActionStatus,
+    ActionUpdate,
     Event,
     QuotaState,
     TaskRecord,
@@ -101,6 +102,7 @@ class CommitResult:
     task_written: bool = False
     actions: int = 0
     claimed_action_ids: tuple[str, ...] = ()
+    updated_action_ids: tuple[str, ...] = ()
 
 
 def _now() -> datetime:
@@ -154,6 +156,7 @@ class Store:
         task: TaskRecord | None = None,
         expected_version: int | None = None,
         actions: Sequence[Action] = (),
+        action_updates: Sequence[ActionUpdate] = (),
         now: datetime | None = None,
     ) -> CommitResult:
         """一个事务保存“事件 + 任务快照 + 待执行动作”。
@@ -175,12 +178,26 @@ class Store:
             for action in actions:
                 if self._insert_action(action, stamp):
                     claimed.append(action.action_id)
+            updated: list[str] = []
+            for update in action_updates:
+                self._update_existing_action(update, stamp)
+                updated.append(update.action_id)
         return CommitResult(
             events=len(events),
             task_written=written,
             actions=len(actions),
             claimed_action_ids=tuple(claimed),
+            updated_action_ids=tuple(updated),
         )
+
+    def _update_existing_action(self, update: ActionUpdate, stamp: str) -> None:
+        """只改已经存在的动作状态（清理核对这类记账），不会凭空造动作。"""
+        cursor = self._connection.execute(
+            "UPDATE actions SET status = ?, updated_at = ? WHERE action_id = ?",
+            (update.status.name, stamp, update.action_id),
+        )
+        if cursor.rowcount != 1:
+            raise StoreError(f"动作 {update.action_id} 不在动作表里，不能用记账路径更新它")
 
     def _insert_event(self, event: Event, stamp: str) -> None:
         self._connection.execute(
