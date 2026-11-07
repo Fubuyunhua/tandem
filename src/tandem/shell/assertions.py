@@ -4,15 +4,12 @@ import ast
 import re
 from fnmatch import fnmatchcase
 
+from tandem.shell.js_lex import count_js_assertions
+
 TEST_FILE_PATTERN = re.compile(
     r"(^|/)(test_[^/]+|[^/]+_test|[^/]+\.(test|spec))\.[^/]+$",
     re.IGNORECASE,
 )
-JS_NON_CODE = re.compile(
-    r"//[^\r\n\u2028\u2029]*|/\*.*?\*/|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`",
-    re.DOTALL,
-)
-JS_ASSERTION = re.compile(r"(?<![\w.])(assert\b|expect\s*\()")
 SOURCE_EXTENSIONS = frozenset({"py", "pyi", "js", "jsx", "ts", "tsx", "cjs", "mjs", "mts", "cts"})
 # pytest 默认 norecursedirs；这里采用跨平台保守匹配，不读取候选配置。
 NORECURSEDIRS = (
@@ -66,6 +63,4 @@ def count_assertions(text: str, path: str) -> int:
     if path.casefold().endswith((".py", ".pyi")):
         tree = ast.parse(text, filename=path)
         return sum(isinstance(node, ast.Assert) for node in ast.walk(tree))
-    # JS/TS 仅做词法近似：屏蔽注释、引号和模板字面量，不声称等同真实测试语义。
-    code = JS_NON_CODE.sub(lambda match: " " * len(match.group()), text)
-    return len(JS_ASSERTION.findall(code))
+    return count_js_assertions(text)
