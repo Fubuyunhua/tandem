@@ -153,6 +153,9 @@ class Runner:
             task=decision.task if decision.changed else None,
             expected_version=task.state_version,
             actions=decision.actions,
+            # 记账指令（比如清理核对收尾）：和事件、版本号同一事务写进动作表，
+            # 它们不是"要做的事"，所以下面只执行 claimed 的新动作
+            action_updates=decision.action_updates,
             now=now,
         )
 
