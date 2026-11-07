@@ -9,6 +9,7 @@ import pytest
 
 from tandem.core.model import (
     ActionKind,
+    ActionStatus,
     CheckResult,
     EventKind,
     Finding,
@@ -30,6 +31,7 @@ from tests.core.helpers import (
     SOME_FINDINGS,
     Walker,
     actions_of,
+    cancelled_with_unconfirmed_cleanup,
     ev,
     new_task,
     policy,
@@ -41,6 +43,7 @@ from tests.core.helpers import (
     to_ai_review,
     to_d_ai_review,
     to_error,
+    to_error_before_merge,
     to_merge_ready,
     to_merged,
     to_needs_intervention_by_ci,
@@ -93,7 +96,7 @@ def test_row_01_single_agent_mode_needs_no_reviewer() -> None:
 
 def test_row_02_d_level_plan_waits_for_you() -> None:
     record = to_working(new_task(Level.D))
-    decision = run(record, ev(EventKind.PLAN_SUBMITTED, plan="先改 decide 的签名"))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="先改 decide 的签名"))
     assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
     assert decision.task.plan_version == 1
     assert ActionKind.NOTIFY in [action.kind for action in decision.actions]
@@ -108,8 +111,8 @@ def test_row_02_c_level_plan_is_only_a_note() -> None:
 
 def test_row_03_you_approve_the_plan() -> None:
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="方案第一版")).task
-    decision = run(record, ev(EventKind.PLAN_APPROVED))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="方案第一版")).task
+    decision = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-a"))
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.approved_plan_version == 1
     assert decision.task.plan_version == 1
@@ -117,7 +120,7 @@ def test_row_03_you_approve_the_plan() -> None:
 
 def test_row_04_you_reject_the_plan() -> None:
     record = to_working(new_task(Level.D))
-    record = run(record, ev(EventKind.PLAN_SUBMITTED, plan="方案第一版")).task
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="方案第一版")).task
     decision = run(record, ev(EventKind.PLAN_REJECTED, reason="先写测试"))
     assert decision.task.status is TaskStatus.PENDING
     assert decision.task.approved_plan_version is None
@@ -1565,3 +1568,297 @@ def test_row_02_submitted_plan_text_survives_later_transitions() -> None:
     assert record.plan_text == "先加纯函数，再接外壳"
     assert record.plan_version == 1
     assert record.approved_plan_version == 1
+
+
+def test_row_26_retry_reissues_a_new_merge_action() -> None:
+    """核对结果是"没有动作完成"，出问题前在待合并：重新发一个合并动作（新编号）。"""
+    record = to_error_before_merge()
+    assert record.status is TaskStatus.ERROR
+    assert record.status_before_error is TaskStatus.AWAITING_MERGE
+    old_merge_ids = {
+        action.action_id for action in record.actions if action.kind is ActionKind.MERGE
+    }
+
+    decision = run(
+        record,
+        ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED, sha=record.latest_sha),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    issued = actions_of(decision, ActionKind.MERGE)
+    assert len(issued) == 1
+    assert issued[0].action_id not in old_merge_ids  # 新动作编号，不会和上一次撞
+    assert decision.task.approved_sha == decision.task.latest_sha
+    assert decision.task.status_before_error is None
+
+
+def test_row_26_retry_does_not_reissue_merge_without_a_current_approval() -> None:
+    """重新合并仍要过合并守卫：批准的不是当前提交，就不发合并动作，只说明原因。"""
+    from dataclasses import replace
+
+    record = to_error_before_merge()
+    stale = replace(record, approved_sha=SHA_2)
+    decision = run(stale, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    assert not actions_of(decision, ActionKind.MERGE)
+    assert "批准的提交编号" in decision.reason
+
+
+def test_row_26_retry_does_not_reissue_merge_when_ci_is_red() -> None:
+    from dataclasses import replace
+
+    record = to_error_before_merge()
+    red = replace(record, ci_green=False)
+    decision = run(red, ev(EventKind.RETRY, check_result=CheckResult.NOT_CONFIRMED))
+    assert not actions_of(decision, ActionKind.MERGE)
+    assert "CI" in decision.reason
+
+
+def test_row_26_pr_closed_clears_pr_evidence() -> None:
+    """PR 已关闭：回到待处理，同时把这个 PR 相关的证据一起清掉。"""
+    record = to_error_before_merge()
+    assert record.pr_opened
+    decision = run(record, ev(EventKind.RETRY, check_result=CheckResult.PR_CLOSED))
+    assert decision.task.status is TaskStatus.PENDING
+    assert decision.task.pr_opened is False
+    assert decision.task.approved_sha is None
+    assert decision.task.reviews == ()
+    assert decision.task.designated_reviewers == ()
+    assert not decision.task.ci_green
+
+
+def test_cleanup_checked_confirms_close_pr_without_leaving_cancelled() -> None:
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    version = record.state_version
+    decision = run(
+        record,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(action_id,)),
+    )
+    assert decision.task.status is TaskStatus.CANCELLED  # 终点状态不变
+    assert decision.task.state_version == version + 1  # 记录还是往前走一版
+    statuses = {action.action_id: action.status for action in decision.task.actions}
+    assert statuses[action_id] is ActionStatus.DONE
+    assert "清理" in decision.reason
+    assert decision.task.cleanup_checked is True
+
+
+def test_cleanup_checked_can_abandon_a_cleanup_action() -> None:
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    decision = run(
+        record,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(action_id,),
+        ),
+    )
+    assert decision.task.status is TaskStatus.CANCELLED
+    statuses = {action.action_id: action.status for action in decision.task.actions}
+    assert statuses[action_id] is ActionStatus.ABANDONED
+    assert not statuses[action_id].is_unconfirmed  # 放弃以后不再算"未确认"
+    assert "放弃" in decision.reason
+    # 备注要能独立读懂，原来没有备注时不能留一个孤零零的分隔符
+    assert decision.task.note.startswith("清理未完成：")
+
+
+def test_cleanup_checked_only_touches_cleanup_actions() -> None:
+    record, close_id = cancelled_with_unconfirmed_cleanup()
+    start_id = next(
+        action.action_id for action in record.actions if action.kind is ActionKind.START_AGENT
+    )
+    decision = run(
+        record,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.PR_CLOSED,
+            action_ids=(start_id,),
+        ),
+    )
+    assert not decision.changed
+    assert "清理动作" in decision.reason
+
+
+def test_cleanup_checked_is_ignored_for_non_terminal_tasks() -> None:
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    from dataclasses import replace
+
+    running = replace(record, status=TaskStatus.AWAITING_ACCEPTANCE)
+    decision = run(
+        running,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(action_id,)),
+    )
+    assert not decision.changed
+    assert decision.task.status is TaskStatus.AWAITING_ACCEPTANCE
+
+
+def test_cleanup_checked_needs_action_ids() -> None:
+    record, _ = cancelled_with_unconfirmed_cleanup()
+    decision = run(record, ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED))
+    assert not decision.changed
+    assert "动作" in decision.reason
+
+
+def test_row_26_merge_succeeded_without_our_approval_is_marked_external() -> None:
+    """没经过本系统放行的合并（批准为空或不是这个 SHA）要注明"由 GitHub 事实确认"。"""
+    from dataclasses import replace
+
+    record = to_error_before_merge()
+    never_approved = replace(record, approved_sha=None)
+    decision = run(
+        never_approved,
+        ev(EventKind.RETRY, check_result=CheckResult.MERGE_SUCCEEDED, sha=record.latest_sha),
+    )
+    assert decision.task.status is TaskStatus.MERGED
+    assert decision.task.merge_confirmed_externally is True
+    assert "未经本系统审核放行" in decision.task.note
+    # 原来就有备注（异常时记下的未确认动作），追加时不能留下开头的分隔符
+    assert not decision.task.note.startswith("｜")
+    assert decision.task.note.endswith("）")
+
+    different_approval = replace(record, approved_sha=SHA_2)
+    other = run(
+        different_approval,
+        ev(EventKind.RETRY, check_result=CheckResult.MERGE_SUCCEEDED, sha=record.latest_sha),
+    )
+    assert other.task.status is TaskStatus.MERGED
+    assert other.task.merge_confirmed_externally is True
+
+
+def test_row_26_merge_succeeded_after_our_approval_is_not_external() -> None:
+    record = to_error_before_merge()
+    decision = run(
+        record,
+        ev(EventKind.RETRY, check_result=CheckResult.MERGE_SUCCEEDED, sha=record.latest_sha),
+    )
+    assert decision.task.status is TaskStatus.MERGED
+    assert decision.task.merge_confirmed_externally is False
+    assert "未经本系统审核放行" not in decision.task.note
+
+
+def test_plan_escalation_on_new_submission_during_review_is_written() -> None:
+    """待 AI 审核时收到新提交并升成 D：方案也要有正文、SHA 和底线原因。"""
+    record = to_ai_review()
+    decision = run(
+        record,
+        ev(EventKind.CODE_SUBMITTED, attempt=record.attempt, sha=SHA_2, changes=CORE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    entry = decision.task.plan()
+    assert entry is not None
+    assert entry.version == decision.task.plan_version == 1
+    assert entry.sha == SHA_2
+    assert "没有文字方案" in entry.text
+    assert SHA_2 in entry.text
+    assert "src/tandem/core/model.py" in entry.text
+    assert decision.task.plan_text == entry.text
+
+
+def test_plan_escalation_on_your_own_submission_is_written() -> None:
+    """你接手后提交并升成 D：方案同样要有正文、SHA 和底线原因。"""
+    record = to_needs_intervention_by_ci()
+    record = run(record, ev(EventKind.TAKE_OVER)).task
+    decision = run(
+        record,
+        ev(EventKind.YOU_SUBMITTED_CODE, sha=SHA_2, changes=CORE_CHANGES),
+    )
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    entry = decision.task.plan()
+    assert entry is not None
+    assert entry.sha == SHA_2
+    assert "没有文字方案" in entry.text
+    assert SHA_2 in entry.text
+    assert "src/tandem/core/model.py" in entry.text
+
+
+# ------------------------------------------------- 升级到 D 的三个入口都要写方案正文
+
+
+# ------------------------------------------------- 方案回执和批准都必须带提交编号
+
+
+def test_row_02_plan_submitted_without_sha_is_rejected() -> None:
+    """新方案回执没有提交编号就拒收：方案必须能绑定到某一个提交。"""
+    record = to_working(new_task(Level.D))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, plan="没有编号的方案"))
+    assert decision.task.status is TaskStatus.WORKING
+    assert not decision.changed
+    assert decision.task.plan_history == ()
+    assert "提交编号" in decision.reason
+
+
+def test_row_03_plan_approval_without_sha_is_rejected_for_new_plans() -> None:
+    """正常提交的方案：批准也必须带编号，缺了不生效。"""
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="文字方案")).task
+    missing = run(record, ev(EventKind.PLAN_APPROVED))
+    assert missing.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "提交编号" in missing.reason
+    wrong = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-b"))
+    assert wrong.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    matched = run(record, ev(EventKind.PLAN_APPROVED, sha="plan-a"))
+    assert matched.task.status is TaskStatus.PENDING
+    assert matched.task.approved_plan_version == 1
+
+
+def test_row_03_legacy_plan_without_any_sha_cannot_be_approved() -> None:
+    """旧任务：既没有方案 SHA 也没有 latest_sha 时不当作匹配，要求重新交带编号的方案。"""
+    from dataclasses import replace
+
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="文字方案")).task
+    legacy = replace(record, plan_history=(), latest_sha=None)
+    decision = run(legacy, ev(EventKind.PLAN_APPROVED, sha="plan-a"))
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert not decision.changed
+    assert "重新" in decision.reason and "编号" in decision.reason
+
+
+# ------------------------------------------------- 终点的精确语义（给 task-006 的不变量用）
+
+
+def test_terminal_status_never_changes_even_when_cleanup_is_checked() -> None:
+    """终点之后：状态永不改变；只有清理记账字段和版本号可以变，其他字段一律不动。"""
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    decision = run(
+        record,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(action_id,),
+        ),
+    )
+    after = decision.task
+    assert after.status is TaskStatus.CANCELLED  # 状态不动
+    # 除"清理记账"以外的字段一个都不许变
+    assert after.level is record.level
+    assert after.latest_sha == record.latest_sha
+    assert after.approved_sha == record.approved_sha
+    assert after.reviews == record.reviews
+    assert after.designated_reviewers == record.designated_reviewers
+    assert after.open_findings == record.open_findings
+    assert after.plan_history == record.plan_history
+    assert after.ci_green == record.ci_green
+    assert after.pr_opened == record.pr_opened
+    assert after.writer == record.writer
+    assert after.accept_failures == record.accept_failures
+    # 允许变化的只有：动作状态、cleanup_checked、说明（note/reason）、版本号
+    assert after.state_version == record.state_version + 1
+    assert after.cleanup_checked is True
+    assert [a.status for a in after.actions] != [a.status for a in record.actions]
+
+
+def test_terminal_task_still_ignores_every_other_event() -> None:
+    """除了清理核对，终点任务收到任何事件都只有"忽略"，连版本号都不动。"""
+    record, _ = cancelled_with_unconfirmed_cleanup()
+    for kind in (
+        EventKind.ASSIGN,
+        EventKind.CODE_SUBMITTED,
+        EventKind.CI_GREEN,
+        EventKind.RETRY,
+        EventKind.YOUR_APPROVAL,
+        EventKind.INTERVENTION_APPROVED,
+        EventKind.CANCEL,
+    ):
+        decision = run(record, ev(kind, sha=record.latest_sha))
+        assert not decision.changed
+        assert decision.task == record
+        assert "已经结束" in decision.reason

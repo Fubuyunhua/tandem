@@ -145,16 +145,21 @@ class ActionKind(Enum):
 
 
 class ActionStatus(Enum):
-    """动作的三种状态（任务记录里要记住）。"""
+    """动作的状态（任务记录里要记住）。
+
+    ``ABANDONED`` 只用于终点任务的清理动作：外部已经无法确认结果，
+    你核对后决定不再追，就把它标成"已放弃"，不再算作未确认。
+    """
 
     SENT = "已发出"
     UNKNOWN = "结果未知"
     DONE = "已完成"
+    ABANDONED = "已放弃"
 
     @property
     def is_unconfirmed(self) -> bool:
         """第 8、26 条：出问题时要知道还有哪些动作没确认完成。"""
-        return self is not ActionStatus.DONE
+        return self in {ActionStatus.SENT, ActionStatus.UNKNOWN}
 
 
 @dataclass(frozen=True)
@@ -390,6 +395,12 @@ class TaskRecord:
     # 动作记录：编号 + 状态
     actions: tuple[Action, ...] = ()
 
+    # 有没有对终点任务的清理动作做过核对（只记录，不改变终点状态）
+    cleanup_checked: bool = False
+
+    # 已合并是由 GitHub 事实确认的（没有经过本系统的合并放行）
+    merge_confirmed_externally: bool = False
+
     # 原因 / 错误码、进度说明、备注
     reason: str = ""
     note: str = ""
@@ -548,6 +559,7 @@ class EventKind(Enum):
     ABANDON = "放弃"
     RETRY = "重试（已核对）"
     CANCEL = "取消"
+    CLEANUP_CHECKED = "清理核对"
 
 
 @dataclass(frozen=True)
@@ -572,6 +584,8 @@ class Event:
     providers: tuple[str, ...] = ()
     # 你否决 AI 意见时，按意见编号给出的理由
     veto_reasons: tuple[VetoReason, ...] = ()
+    # 清理核对只针对这些动作编号（只用于终点任务的清理动作）
+    action_ids: tuple[str, ...] = ()
     model_suggestion: Level | None = None
     check_result: CheckResult | None = None
     standard_version: int | None = None

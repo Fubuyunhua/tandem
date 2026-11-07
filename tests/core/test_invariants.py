@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 from hypothesis import given, settings
@@ -19,7 +19,9 @@ from hypothesis import strategies as st
 
 from tandem.core import transition as core
 from tandem.core.model import (
+    Action,
     ActionKind,
+    ActionStatus,
     ChangeSet,
     CheckResult,
     Decision,
@@ -27,10 +29,12 @@ from tandem.core.model import (
     EventKind,
     Finding,
     Level,
+    OpenFinding,
     Policy,
     QuotaSnapshot,
     QuotaState,
     Review,
+    RevisionCount,
     RunMode,
     TaskRecord,
     TaskStatus,
@@ -42,6 +46,19 @@ from tests.core.helpers import NOW
 DEEP = os.getenv("TANDEM_INVARIANTS_DEEP") == "1"
 TRACE_SETTINGS = settings(max_examples=1000 if DEEP else 80, deadline=None)
 PROVIDERS = ("writer", "r1", "r2", "r3")
+
+TERMINAL_STATUSES = (TaskStatus.MERGED, TaskStatus.CANCELLED, TaskStatus.FAILED)
+TERMINAL_CLEANUP_FIELDS = frozenset(
+    {
+        "actions",
+        "cleanup_checked",
+        "note",
+        "reason",
+        "state_version",
+        "updated_at",
+    }
+)
+CLEANUP_KINDS = frozenset({ActionKind.STOP_AGENT, ActionKind.CLOSE_PR, ActionKind.PUSH_BRANCH})
 
 
 def make_policy(mode: RunMode = RunMode.MULTI_AGENT, required: int = 2) -> Policy:
@@ -97,9 +114,46 @@ def check_review_count(task: TaskRecord, policy: Policy, human: bool) -> None:
     assert len(providers) >= needed, "review_count"
 
 
-def check_terminal(before: TaskRecord, decision: Decision) -> None:
-    if before.status in (TaskStatus.MERGED, TaskStatus.CANCELLED, TaskStatus.FAILED):
-        assert decision.task == before and not decision.changed and not decision.actions, "terminal"
+def check_terminal(before: TaskRecord, ev: Event, decision: Decision) -> None:
+    if before.status not in TERMINAL_STATUSES:
+        return
+    after = decision.task
+    assert after.status is before.status, "terminal: state has an outgoing edge"
+    assert not decision.actions, "terminal: dispatched new actions"
+    known = {action.action_id: action for action in before.actions}
+    valid = (
+        ev.kind is EventKind.CLEANUP_CHECKED
+        and ev.task_id == before.task_id
+        and ev.state_version in (None, before.state_version)
+        and ev.check_result in (CheckResult.PR_CLOSED, CheckResult.NOT_CONFIRMED)
+        and bool(ev.action_ids)
+        and all(key in known and known[key].kind in CLEANUP_KINDS for key in ev.action_ids)
+    )
+    expected = before.actions
+    if valid:
+        outcome = (
+            ActionStatus.DONE
+            if ev.check_result is CheckResult.PR_CLOSED
+            else ActionStatus.ABANDONED
+        )
+        expected = tuple(
+            replace(action, status=outcome) if action.action_id in ev.action_ids else action
+            for action in before.actions
+        )
+    if expected == before.actions:
+        assert not decision.changed and after == before, "terminal: ignored event changed record"
+        return
+    assert decision.changed, "terminal: cleanup receipt was not recorded"
+    # A whitelist protects every other field, including future TaskRecord fields.
+    for field in fields(TaskRecord):
+        if field.name not in TERMINAL_CLEANUP_FIELDS:
+            assert getattr(after, field.name) == getattr(before, field.name), (
+                f"terminal: changed protected field {field.name}"
+            )
+    assert after.actions == expected, "terminal: changed action identity or wrong target/status"
+    assert after.cleanup_checked is True, "terminal: cleanup flag missing"
+    assert after.state_version == before.state_version + 1, "terminal: cleanup version must add one"
+    assert after.updated_at == NOW, "terminal: cleanup time must use supplied clock"
 
 
 def check_version(before: TaskRecord, decision: Decision) -> None:
@@ -214,6 +268,7 @@ def advance(task: TaskRecord) -> Event:
         model_suggestion=task.level,
         review=passing(task, missing[0] if missing else "r1"),
         check_result=CheckResult.NOT_CONFIRMED,
+        action_ids=tuple(a.action_id for a in task.actions if a.kind in CLEANUP_KINDS),
     )
 
 
@@ -264,6 +319,11 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
                 ),
                 changes=ChangeSet(paths=("core/a.py",) if value % 2 else ("app.py",)),
                 check_result=list(CheckResult)[value % 3],
+                action_ids=(
+                    tuple(a.action_id for a in task.actions if a.kind in CLEANUP_KINDS)
+                    if value % 2 == 0
+                    else ("unknown-action",)
+                ),
                 plan="Generated proposal",
             )
         elif choice == 4:
@@ -289,7 +349,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
             policy,
             human_sha is not None and human_sha == decision.task.latest_sha,
         )
-        check_terminal(before, decision)
+        check_terminal(before, ev, decision)
         check_version(before, decision)
         check_d(before, decision, human_sha)
         check_plan_approval(before, ev, decision)
@@ -455,7 +515,7 @@ def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invarian
         elif invariant == "review_count":
             check_review_count(decision.task, policy, False)
         elif invariant == "terminal":
-            check_terminal(task, decision)
+            check_terminal(task, ev, decision)
         elif invariant == "version":
             check_version(task, decision)
         elif invariant == "d":
@@ -535,15 +595,70 @@ def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invarian
         witness()
 
 
+def terminal_record(status: TaskStatus, version: int = 10, sha: str = "current") -> TaskRecord:
+    # Populate evidence/history so a cleanup implementation that clears them is
+    # detected even when it preserves the terminal status and increments version.
+    base = walk(
+        Level.D,
+        [
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.PLAN_APPROVED,
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.CI_GREEN,
+            EventKind.REVIEW,
+        ],
+    )
+    return replace(
+        base,
+        status=status,
+        state_version=version,
+        latest_sha=sha,
+        approved_sha=sha,
+        status_before_error=TaskStatus.AWAITING_AI_REVIEW,
+        error_code="retained-error",
+        base_sha="base",
+        accept_failures=2,
+        revision_counts=(RevisionCount(1, 2),),
+        open_findings=(OpenFinding("r2:F1@current:v1", "r2", sha, 1, "F1", "retained finding"),),
+        reason="terminal reason",
+        note="retained note",
+        updated_at=NOW.replace(year=2025),
+        actions=(
+            Action("cleanup-stop", ActionKind.STOP_AGENT, base.task_id, "stop", "writer"),
+            Action(
+                "cleanup-pr",
+                ActionKind.CLOSE_PR,
+                base.task_id,
+                "close",
+                status=ActionStatus.UNKNOWN,
+            ),
+            Action("cleanup-push", ActionKind.PUSH_BRANCH, base.task_id, "keep branch"),
+            Action(
+                "start",
+                ActionKind.START_AGENT,
+                base.task_id,
+                "start",
+                "writer",
+                status=ActionStatus.DONE,
+            ),
+        ),
+    )
+
+
 @TRACE_SETTINGS
 @given(
-    status=st.sampled_from([TaskStatus.MERGED, TaskStatus.CANCELLED, TaskStatus.FAILED]),
+    status=st.sampled_from(TERMINAL_STATUSES),
     version=st.integers(0, 100),
     sha=st.text(min_size=1, max_size=20),
+    outcome=st.sampled_from([CheckResult.PR_CLOSED, CheckResult.NOT_CONFIRMED]),
 )
-def test_every_event_leaves_each_terminal_unchanged(status, version, sha) -> None:
-    task = TaskRecord("terminal", status=status, state_version=version, latest_sha=sha)
-    for kind in EventKind:
+def test_every_event_obeys_terminal_cleanup_contract(status, version, sha, outcome) -> None:
+    task = terminal_record(status, version, sha)
+    # Repeat the full alphabet after cleanup to verify the terminal still has no
+    # outgoing edges and repeated identical cleanup receipts are no-ops.
+    for kind in list(EventKind) * 2:
         ev = event(
             task,
             kind,
@@ -551,12 +666,48 @@ def test_every_event_leaves_each_terminal_unchanged(status, version, sha) -> Non
             attempt=task.attempt,
             changes=ChangeSet(paths=("app.py",)),
             review=passing(task, "r1"),
-            check_result=CheckResult.NOT_CONFIRMED,
+            check_result=outcome,
             standard_version=2,
+            action_ids=("cleanup-stop", "cleanup-pr"),
         )
         decision = check_pure(task, ev, make_policy(), QuotaSnapshot())
-        check_terminal(task, decision)
+        check_terminal(task, ev, decision)
         check_version(task, decision)
+        task = decision.task
+
+
+@TRACE_SETTINGS
+@given(
+    status=st.sampled_from(TERMINAL_STATUSES),
+    action_ids=st.lists(
+        st.sampled_from(
+            [
+                "cleanup-stop",
+                "cleanup-pr",
+                "cleanup-push",
+                "start",
+                "missing",
+            ]
+        ),
+        max_size=5,
+    ),
+    outcome=st.sampled_from([None, *CheckResult]),
+    guard=st.integers(0, 3),
+    old_status=st.sampled_from(list(ActionStatus)),
+)
+def test_terminal_cleanup_checks_targets_and_guards(status, action_ids, outcome, guard, old_status):
+    task = terminal_record(status)
+    task = replace(task, actions=tuple(replace(a, status=old_status) for a in task.actions))
+    ev = event(task, EventKind.CLEANUP_CHECKED, action_ids=tuple(action_ids), check_result=outcome)
+    if guard == 1:
+        ev = replace(ev, task_id="other-task")
+    elif guard == 2:
+        ev = replace(ev, state_version=task.state_version - 1)
+    elif guard == 3:
+        ev = replace(ev, state_version=None)
+    decision = check_pure(task, ev, make_policy(), QuotaSnapshot())
+    check_terminal(task, ev, decision)
+    check_version(task, decision)
 
 
 @TRACE_SETTINGS
@@ -817,3 +968,132 @@ def test_approval_generator_uses_plan_sha_instead_of_latest_code_sha() -> None:
     decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
     assert decision.changed
     check_plan_approval(task, ev, decision)
+
+
+def changed_field_value(value: object) -> object:
+    from enum import Enum
+
+    if isinstance(value, Enum):
+        return next(item for item in type(value) if item is not value)
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, str):
+        return value + "-mutant"
+    if isinstance(value, tuple):
+        assert value, "terminal fixture must populate tuple evidence"
+        return value[:-1]
+    if isinstance(value, frozenset):
+        return value ^ {"mutant-provider"}
+    raise AssertionError(f"terminal fixture lacks a mutation value for {value!r}")
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [field.name for field in fields(TaskRecord) if field.name not in TERMINAL_CLEANUP_FIELDS],
+)
+def test_terminal_cleanup_cannot_change_protected_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+) -> None:
+    task = terminal_record(TaskStatus.CANCELLED)
+    ev = event(
+        task,
+        EventKind.CLEANUP_CHECKED,
+        check_result=CheckResult.PR_CLOSED,
+        action_ids=("cleanup-stop", "cleanup-pr"),
+    )
+    baseline = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    assert baseline.changed
+    check_terminal(task, ev, baseline)
+    original = core._on_cleanup_checked
+
+    def corrupt_cleanup(task, ev):
+        result = original(task, ev)
+        return replace(
+            result,
+            task=replace(
+                result.task,
+                **{
+                    field_name: changed_field_value(getattr(task, field_name)),
+                },
+            ),
+        )
+
+    monkeypatch.setattr(core, "_on_cleanup_checked", corrupt_cleanup)
+    decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    with pytest.raises(AssertionError, match="terminal"):
+        check_terminal(task, ev, decision)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "append",
+        "drop",
+        "identity",
+        "untargeted",
+        "wrong-status",
+        "dispatch",
+        "version",
+        "flag",
+    ],
+)
+def test_terminal_cleanup_bookkeeping_mutants_are_caught(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    task = terminal_record(TaskStatus.FAILED)
+    ev = event(
+        task,
+        EventKind.CLEANUP_CHECKED,
+        check_result=CheckResult.NOT_CONFIRMED,
+        action_ids=("cleanup-stop", "cleanup-pr"),
+    )
+    baseline = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    assert baseline.changed
+    check_terminal(task, ev, baseline)
+    original = core._on_cleanup_checked
+
+    def corrupt_cleanup(task, ev):
+        result = original(task, ev)
+        after = result.task
+        if mutation == "append":
+            after = replace(
+                after, actions=after.actions + (Action("new", ActionKind.STOP_AGENT, task.task_id),)
+            )
+        elif mutation == "drop":
+            after = replace(after, actions=after.actions[:-1])
+        elif mutation == "identity":
+            after = replace(
+                after, actions=(replace(after.actions[0], detail="new payload"), *after.actions[1:])
+            )
+        elif mutation == "untargeted":
+            after = replace(
+                after,
+                actions=tuple(
+                    replace(a, status=ActionStatus.DONE) if a.action_id == "cleanup-push" else a
+                    for a in after.actions
+                ),
+            )
+        elif mutation == "wrong-status":
+            after = replace(
+                after,
+                actions=(
+                    replace(after.actions[0], status=ActionStatus.UNKNOWN),
+                    *after.actions[1:],
+                ),
+            )
+        elif mutation == "dispatch":
+            return replace(result, actions=[Action("new", ActionKind.STOP_AGENT, task.task_id)])
+        elif mutation == "version":
+            after = replace(after, state_version=task.state_version + 2)
+        elif mutation == "flag":
+            after = replace(after, cleanup_checked=False)
+        return replace(result, task=after)
+
+    monkeypatch.setattr(core, "_on_cleanup_checked", corrupt_cleanup)
+    decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    with pytest.raises(AssertionError, match="terminal"):
+        check_terminal(task, ev, decision)
