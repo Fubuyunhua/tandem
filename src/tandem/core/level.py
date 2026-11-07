@@ -102,6 +102,10 @@ def bottom_line_reasons(changes: ChangeSet, policy: Policy) -> tuple[str, ...]:
     # 删除文件本身是一条底线条目
     reasons.extend(f"删除了文件 {path}" for path in changes.deleted_paths)
     reasons.extend(f"测试文件移出收集范围：{path}" for path in changes.removed_test_paths)
+    reasons.extend(
+        f"测试文件 {item.path}:{item.line} 新增静态弱化证据：{item.reason}"
+        for item in changes.test_weakenings
+    )
     paths, illegal = judged_paths(changes)
     if illegal:
         reasons.append("改动里有非法路径（绝对路径、空路径或含 .. 的路径）")

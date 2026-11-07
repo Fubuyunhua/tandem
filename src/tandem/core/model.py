@@ -213,6 +213,15 @@ class FileChange:
 
 
 @dataclass(frozen=True)
+class TestWeakening:
+    """采集器发现的新增静态跳过或不可达断言证据。"""
+
+    path: str
+    reason: str
+    line: int
+
+
+@dataclass(frozen=True)
 class ChangeSet:
     """真实改动。由外壳从 diff 收集，内核据此算等级。
 
@@ -231,6 +240,7 @@ class ChangeSet:
     secret_scan_hit: bool = False
     file_changes: tuple[FileChange, ...] = ()
     removed_test_paths: tuple[str, ...] = ()
+    test_weakenings: tuple[TestWeakening, ...] = ()
 
     @property
     def touches_repository(self) -> bool:

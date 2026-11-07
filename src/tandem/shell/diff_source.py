@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import Protocol
 
 from tandem.core.identity import is_commit_oid
-from tandem.core.model import AssertionDrop, ChangeSet, FileChange
+from tandem.core.model import AssertionDrop, ChangeSet, FileChange, TestWeakening
 from tandem.shell.assertions import count_assertions, is_test_path, leaves_test_collection
+from tandem.shell.weakening import new_test_weakenings
 
 
 def _clean_git_environment() -> dict[str, str]:
@@ -239,11 +240,25 @@ class GitDiffSource:
         )
         changed = tuple(paths)
         before, after, drops = self._assertion_changes(merge_base, sha, paths, deleted, renames)
+        weakenings: list[TestWeakening] = []
+        for old, new in [*((path, path) for path in paths), *renames]:
+            if is_test_path(new) and new.casefold().endswith((".py", ".pyi")):
+                try:
+                    weakenings.extend(
+                        new_test_weakenings(
+                            self._git_show(merge_base, old),
+                            self._git_show(sha, new),
+                            new,
+                        )
+                    )
+                except (SyntaxError, ValueError, UnicodeError):
+                    raise DiffError(f"无法解析测试文件 {new} 的静态弱化证据") from None
         scan = self.scanner.scan((*changed, *deleted, *(pair[1] for pair in renames)))
         return CollectedDiff(
             changes=ChangeSet(
                 paths=changed,
                 file_changes=entries,
+                test_weakenings=tuple(weakenings),
                 removed_test_paths=tuple(
                     old for old, new in renames if leaves_test_collection(old, new)
                 ),
