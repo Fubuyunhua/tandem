@@ -410,9 +410,12 @@ def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     rule = policy.rule_for(task.level)
     if not rule.requires_plan_approval:
         return _ignore(task, f"{task.level.value} 级不需要你批准方案，方案留作记录")
-    if event.sha is None:
-        # 方案必须能绑定到某一个提交，否则批准无法核对（r4 问题 3）
-        return _ignore(task, "方案回执没有带提交编号，拒收：方案必须绑定一个提交")
+    plan_sha = (event.sha or "").strip()
+    if not plan_sha:
+        # 方案必须能绑定到某一个提交，否则批准无法核对（r4 问题 3、r5 问题 3）
+        return _ignore(
+            task, "方案回执没有带可用的提交编号（空白也算没带），拒收：方案必须绑定一个提交"
+        )
     plan_version = task.plan_version + 1
     if task.approved_plan_version == plan_version:
         return _ignore(task, f"第 {plan_version} 版方案已经批准过了")
@@ -423,7 +426,7 @@ def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     )
     entry = PlanEntry(
         version=plan_version,
-        sha=event.sha or "",
+        sha=plan_sha,
         text=event.plan or "",
     )
     return _transition(
@@ -433,7 +436,7 @@ def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         actions.items,
         plan_version=plan_version,
         plan_history=task.plan_history + (entry,),
-        latest_sha=event.sha,
+        latest_sha=plan_sha,
         note=event.plan or task.note,
     )
 
@@ -451,7 +454,8 @@ def _on_plan_approved(task: TaskRecord, event: Event) -> Decision:
             task,
             "这版方案没有绑定提交编号，核对不了；请让写手重新交一版带提交编号的方案",
         )
-    if event.sha is None or event.sha != expected_sha:
+    given_sha = (event.sha or "").strip()
+    if not given_sha or given_sha != expected_sha:
         return _ignore(
             task,
             f"你批准方案要带上你看到的那一版方案的提交编号（{expected_sha}），对不上就不生效",

@@ -1973,3 +1973,39 @@ def test_cleanup_check_only_accepts_actions_registered_by_the_cancel() -> None:
     )
     assert not decision.changed
     assert "来源" in decision.reason or "登记" in decision.reason
+
+
+# ------------------------------------------------- 空白方案编号也算"没有编号"（r5 问题 3）
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_row_02_blank_plan_sha_is_rejected(blank: str) -> None:
+    """直接构造 Event 时，空白字符串的提交编号也不能当方案编号用。"""
+    record = to_working(new_task(Level.D))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, sha=blank, plan="真方案"))
+    assert decision.task.status is TaskStatus.WORKING
+    assert not decision.changed
+    assert decision.task.plan_history == ()
+    assert "提交编号" in decision.reason
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_row_03_blank_plan_sha_cannot_approve(blank: str) -> None:
+    """批准时带空白编号，等于没带。"""
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="真方案")).task
+    decision = run(record, ev(EventKind.PLAN_APPROVED, sha=blank))
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "提交编号" in decision.reason
+
+
+def test_row_03_plan_sha_is_normalized_before_compare() -> None:
+    """编号两边都做规范化（去掉首尾空白）：` plan-a ` 和 `plan-a` 是同一个提交。"""
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="  plan-a  ", plan="真方案")).task
+    entry = record.plan()
+    assert entry is not None
+    assert entry.sha == "plan-a"
+    matched = run(record, ev(EventKind.PLAN_APPROVED, sha=" plan-a "))
+    assert matched.task.status is TaskStatus.PENDING
+    assert matched.task.approved_plan_version == 1
