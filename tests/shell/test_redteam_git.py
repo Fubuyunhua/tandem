@@ -74,3 +74,13 @@ def test_missing_existing_test_blob_is_not_counted_as_empty(tmp_path: Path) -> N
     blob.unlink()
     with pytest.raises(DiffError):
         GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+
+
+def test_deleted_document_remains_bottom_line_d(tmp_path: Path) -> None:
+    root = _make_repo(tmp_path)
+    _commit_file(root, "docs/a.md", "documentation\n", "doc")
+    _git(root, "rm", "docs/a.md")
+    _git(root, "commit", "-qm", "delete doc")
+    changes = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD").changes
+    assert changes.file_changes[0].after_mode == "000000"
+    assert compute_level(changes, load_policy(), Level.B) is Level.D

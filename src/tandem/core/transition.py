@@ -796,12 +796,25 @@ def _on_ci_red(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """10 / 11. 待验收 → 待处理（带原因），失败达到上限 → 待你介入（R01）。"""
     if task.latest_sha is None or event.sha != task.latest_sha:
         return _ignore(task, "CI 结果没有带当前提交编号，或者编号对不上，忽略")
-    if task.status is not TaskStatus.AWAITING_ACCEPTANCE:
+    merge_started = task.status is TaskStatus.AWAITING_MERGE and any(
+        action.kind is ActionKind.MERGE for action in task.actions
+    )
+    can_return_to_work = (
+        task.status
+        in {
+            TaskStatus.AWAITING_ACCEPTANCE,
+            TaskStatus.AWAITING_AI_REVIEW,
+            TaskStatus.AWAITING_YOUR_REVIEW,
+            TaskStatus.AWAITING_MERGE,
+        }
+        and not merge_started
+    )
+    if not can_return_to_work:
         if not task.ci_green:
             return _ignore(task, "本提交已经没有有效绿灯证据")
         actions = _Actions(task, task.state_version + 1)
         actions.add(ActionKind.NOTIFY, detail="同一提交 CI 已变红，撤销绿灯、审核和批准证据")
-        # 合并可能已经发出，不能假装撤回成功；留在原状态等待外部核对。
+        # 合并已发出时不能假装撤回成功；其他人工状态也只撤证据，不替用户接管。
         return _transition(
             task,
             task.status,
@@ -826,7 +839,9 @@ def _on_ci_red(task: TaskRecord, event: Event, policy: Policy) -> Decision:
             actions.items,
             accept_failures=failures,
             ci_green=False,
+            approved_sha=None,
             reviews=(),
+            designated_reviewers=(),
             error_code="R01",
             note=reason,
             returned_from_review=False,
@@ -840,7 +855,9 @@ def _on_ci_red(task: TaskRecord, event: Event, policy: Policy) -> Decision:
         actions.items,
         accept_failures=failures,
         ci_green=False,
+        approved_sha=None,
         reviews=(),
+        designated_reviewers=(),
         note=reason,
         returned_from_review=False,
     )
