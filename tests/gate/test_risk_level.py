@@ -359,7 +359,11 @@ def test_workflow_keeps_gate_read_only_and_blocking() -> None:
     assert checkout["with"]["persist-credentials"] == "false"
     fetch = next(step for step in job["steps"] if "git fetch" in step.get("run", ""))
     assert fetch["env"]["PR_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
-    assert 'fetch --no-tags --no-recurse-submodules origin "$PR_HEAD_SHA"' in fetch["run"]
+    assert fetch["env"]["PR_NUMBER"] == "${{ github.event.pull_request.number }}"
+    assert (
+        'fetch --no-tags --no-recurse-submodules origin "refs/pull/${PR_NUMBER}/head"'
+        in fetch["run"]
+    )
     assert "FETCH_TOKEN" not in fetch["env"]
     assert "http.extraheader" not in fetch["run"]
     assert "github.token" not in str(fetch)
@@ -396,3 +400,110 @@ def test_file_explanations_preserve_global_secret_scan(
     summary_reasons = set(bottom_line_reasons(changes, policy))
     reasons = {rule for rule in file.rules if not rule.startswith(("改名规则：", "普通仓库改动："))}
     assert reasons <= summary_reasons
+
+
+def test_judge_setup_uv_is_pinned() -> None:
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/risk-gate.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    setup = [
+        step["uses"]
+        for step in workflow["jobs"]["risk-level"]["steps"]
+        if "setup-uv@" in step.get("uses", "")
+    ]
+    assert setup == ["astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"]
+
+
+def run_workflow_fetch(
+    repository: Path, number: str, head: str
+) -> subprocess.CompletedProcess[str]:
+    """离线执行 YAML 的原始 Bash 步骤，沿用 Actions 的遇错即停设置。"""
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/risk-gate.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    step = next(
+        step
+        for step in workflow["jobs"]["risk-level"]["steps"]
+        if "git fetch" in step.get("run", "")
+    )
+    if os.name == "nt":
+        git_executable = shutil.which("git")
+        assert git_executable is not None
+        bash = Path(git_executable).resolve().parents[1] / "bin/bash.exe"
+        assert bash.is_file(), "测试需要 Git for Windows 自带的 Bash"
+    else:
+        executable = shutil.which("bash")
+        assert executable is not None
+        bash = Path(executable)
+    return subprocess.run(
+        [str(bash), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=repository,
+        env=dict(os.environ, PR_NUMBER=number, PR_HEAD_SHA=head, GIT_TERMINAL_PROMPT="0"),
+        capture_output=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+
+@pytest.fixture
+def fork_pr(repository: Path) -> tuple[Path, str, str]:
+    """模拟 base 远端仅在 refs/pull/17/head 发布 fork 提交；全程本地路径。"""
+    base = git(repository, "rev-parse", "HEAD")
+    remote = repository.parent / "origin.git"
+    remote.mkdir()
+    git(remote, "init", "--bare", "-q")
+    git(repository, "remote", "add", "origin", str(remote))
+    git(repository, "push", "-q", "origin", f"{base}:refs/heads/main")
+    fork = repository.parent / "fork"
+    git(repository, "clone", "-q", "--no-local", str(repository), str(fork))
+    git(fork, "config", "user.name", "test")
+    git(fork, "config", "user.email", "test@example.com")
+    git(fork, "config", "commit.gpgsign", "false")
+    write(
+        fork,
+        "scripts/gate/risk_level.py",
+        "from pathlib import Path\nPath('head-executed').touch()\n",
+    )
+    head = commit(fork)
+    git(fork, "push", "-q", str(remote), f"{head}:refs/pull/17/head")
+    missing = subprocess.run(
+        ["git", "cat-file", "-e", head], cwd=repository, capture_output=True, check=False
+    )
+    assert missing.returncode != 0
+    return repository, base, head
+
+
+def test_workflow_fetches_fork_pull_ref_without_checkout(fork_pr: tuple[Path, str, str]) -> None:
+    repository, base, head = fork_pr
+    result = run_workflow_fetch(repository, "17", head)
+    assert result.returncode == 0, result.stderr
+    assert "refs/pull/17/head" in result.stderr
+    assert git(repository, "rev-parse", "FETCH_HEAD") == head
+    assert git(repository, "rev-parse", "HEAD") == base
+    assert not (repository / "head-executed").exists()
+    assert not (repository / "scripts/gate/risk_level.py").exists()
+    # 取到的对象可交给可信脚本判断，head 中的恶意脚本仍不执行。
+    gate = invoke(repository, "--base", base, "--head", head)
+    assert gate.returncode == 3, gate.stderr
+    assert not (repository / "head-executed").exists()
+
+
+@pytest.mark.parametrize("case", ["bad_number", "bad_sha", "missing_ref", "changed_head"])
+def test_workflow_fetch_fails_closed(fork_pr: tuple[Path, str, str], case: str) -> None:
+    repository, base, head = fork_pr
+    number = "17"
+    if case == "bad_number":
+        number = "17; touch injected"
+    elif case == "bad_sha":
+        head = "$(touch injected)"
+    elif case == "missing_ref":
+        number = "18"
+    else:
+        head = base
+    result = run_workflow_fetch(repository, number, head)
+    assert result.returncode != 0
+    assert git(repository, "rev-parse", "HEAD") == base
+    assert not (repository / "injected").exists()
+    assert not (repository / "head-executed").exists()
