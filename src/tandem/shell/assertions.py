@@ -9,7 +9,7 @@ TEST_FILE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 JS_NON_CODE = re.compile(
-    r"//[^\n]*|/\*.*?\*/|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`",
+    r"//[^\r\n\u2028\u2029]*|/\*.*?\*/|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`",
     re.DOTALL,
 )
 JS_ASSERTION = re.compile(r"(?<![\w.])(assert\b|expect\s*\()")

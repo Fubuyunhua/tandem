@@ -388,8 +388,10 @@ class GitDiffSource:
             check=False,
         )
         if completed.returncode != 0:
-            # 新增的文件在旧提交里不存在，按 0 算
-            return ""
+            # 只有路径确实不存在才能按新增文件的旧内容为空；已有对象读失败必须拒绝。
+            if self._tree_mode(revision, path) == "000000":
+                return ""
+            raise DiffError(f"无法读取已存在的 Git 对象 {revision}:{path}")
         return completed.stdout
 
     def _git_bytes(self, *args: str) -> bytes:

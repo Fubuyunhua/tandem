@@ -27,6 +27,7 @@ from tests.shell.test_diff_source import _commit_file, _git, _make_repo
         ("tests/a.js", "expect(false).toBe(true);\n", "// expect(false).toBe(true);\n"),
         ("tests/a.js", "expect(false).toBe(true);\n", "/* expect(false).toBe(true); */\n"),
         ("tests/a.js", "expect(false).toBe(true);\n", "const text = 'expect(false).toBe(true)';\n"),
+        ("tests/a.js", "// comment\u2028expect(false).toBe(true);\n", "// comment\u2028void 0;\n"),
     ],
 )
 def test_comments_and_strings_cannot_replace_assertions(
