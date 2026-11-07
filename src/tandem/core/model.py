@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import assert_never
@@ -145,16 +145,21 @@ class ActionKind(Enum):
 
 
 class ActionStatus(Enum):
-    """动作的三种状态（任务记录里要记住）。"""
+    """动作的状态（任务记录里要记住）。
+
+    ``ABANDONED`` 只用于终点任务的清理动作：外部已经无法确认结果，
+    你核对后决定不再追，就把它标成"已放弃"，不再算作未确认。
+    """
 
     SENT = "已发出"
     UNKNOWN = "结果未知"
     DONE = "已完成"
+    ABANDONED = "已放弃"
 
     @property
     def is_unconfirmed(self) -> bool:
         """第 8、26 条：出问题时要知道还有哪些动作没确认完成。"""
-        return self is not ActionStatus.DONE
+        return self in {ActionStatus.SENT, ActionStatus.UNKNOWN}
 
 
 @dataclass(frozen=True)
@@ -324,6 +329,18 @@ class PlanEntry:
 
 
 @dataclass(frozen=True)
+class ActionUpdate:
+    """把**已经存在的**动作改成一个新状态（比如清理核对收尾）。
+
+    这不是"要做的事"，而是一条记账指令：外壳必须把它和事件、版本号放在同一个
+    事务里更新动作表，绝不能当成新动作重新执行。
+    """
+
+    action_id: str
+    status: ActionStatus
+
+
+@dataclass(frozen=True)
 class RevisionCount:
     """修改次数按审核标准版本分开计算，保留历史（第 22、23 条）。"""
 
@@ -389,6 +406,15 @@ class TaskRecord:
 
     # 动作记录：编号 + 状态
     actions: tuple[Action, ...] = ()
+
+    # 进入终点时登记下来的清理动作编号（清理核对只认这一批，来源可核验）
+    cleanup_action_ids: tuple[str, ...] = ()
+
+    # 有没有对终点任务的清理动作做过核对（只记录，不改变终点状态）
+    cleanup_checked: bool = False
+
+    # 已合并是由 GitHub 事实确认的（没有经过本系统的合并放行）
+    merge_confirmed_externally: bool = False
 
     # 原因 / 错误码、进度说明、备注
     reason: str = ""
@@ -548,6 +574,7 @@ class EventKind(Enum):
     ABANDON = "放弃"
     RETRY = "重试（已核对）"
     CANCEL = "取消"
+    CLEANUP_CHECKED = "清理核对"
 
 
 @dataclass(frozen=True)
@@ -572,6 +599,8 @@ class Event:
     providers: tuple[str, ...] = ()
     # 你否决 AI 意见时，按意见编号给出的理由
     veto_reasons: tuple[VetoReason, ...] = ()
+    # 清理核对只针对这些动作编号（只用于终点任务的清理动作）
+    action_ids: tuple[str, ...] = ()
     model_suggestion: Level | None = None
     check_result: CheckResult | None = None
     standard_version: int | None = None
@@ -585,5 +614,7 @@ class Decision:
     task: TaskRecord
     actions: list[Action]
     reason: str
+    # 需要写回"已有动作"的状态（只记账，不执行）
+    action_updates: list[ActionUpdate] = field(default_factory=list[ActionUpdate])
     # 状态版本号有没有变。没变说明这个事件被忽略了（比如版本号对不上、终点状态）。
     changed: bool = False

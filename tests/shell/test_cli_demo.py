@@ -118,7 +118,14 @@ def test_approve_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     runner = make_runner(db, [plan_receipt("t1", plan="先写内核，再接外壳")])
     runner.submit("t1", Level.D)
     runner.handle(Event(kind=EventKind.ASSIGN, task_id="t1", provider="claude"))
-    runner.handle(Event(kind=EventKind.PLAN_SUBMITTED, task_id="t1", plan="先写内核，再接外壳"))
+    runner.handle(
+        Event(
+            kind=EventKind.PLAN_SUBMITTED,
+            task_id="t1",
+            sha="abc",
+            plan="先写内核，再接外壳",
+        )
+    )
     loaded = runner.store.load_task("t1")
     assert loaded is not None
     assert loaded.status.value == "待你批准方案"
