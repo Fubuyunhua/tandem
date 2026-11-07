@@ -407,6 +407,9 @@ class TaskRecord:
     # 动作记录：编号 + 状态
     actions: tuple[Action, ...] = ()
 
+    # 进入终点时登记下来的清理动作编号（清理核对只认这一批，来源可核验）
+    cleanup_action_ids: tuple[str, ...] = ()
+
     # 有没有对终点任务的清理动作做过核对（只记录，不改变终点状态）
     cleanup_checked: bool = False
 

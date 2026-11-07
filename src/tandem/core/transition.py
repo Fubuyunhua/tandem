@@ -287,9 +287,10 @@ def _dispatch(
         # 1. 状态永不改变——终点没有任何出边，任何事件都不会让任务离开终点；
         # 2. 唯一的例外是 CLEANUP_CHECKED：它只把已经发出的清理动作标成
         #    "已完成/已放弃"，顺带写 cleanup_checked 和一句说明；
-        # 3. 除了"动作状态 + cleanup_checked + note/reason + state_version"，
-        #    其余字段（等级、提交编号、批准、审核结论、席位、方案、CI 标记、
-        #    pr_opened、写手、计数……）在终点之后一律不再变化；
+        # 3. 除了"动作状态 + cleanup_checked + cleanup_action_ids + note/reason
+        #    + state_version + updated_at"，其余字段（等级、提交编号、批准、
+        #    审核结论、席位、方案、CI 标记、pr_opened、写手、计数……）
+        #    在终点之后一律不再变化；updated_at 是记录时间戳，decide() 统一写入；
         # 4. 版本号会 +1，因为任务记录的每次变化都要留一版，重放才对得上——
         #    这是记录版本，不是状态转换。
         if event.kind is EventKind.CLEANUP_CHECKED:
@@ -1366,6 +1367,7 @@ def _on_cleanup_checked(task: TaskRecord, event: Event) -> Decision:
         return _ignore(task, "清理核对要带上要核对的动作编号")
 
     known = {action.action_id: action for action in task.actions}
+    registered = set(task.cleanup_action_ids)
     targets: list[Action] = []
     for action_id in wanted:
         action = known.get(action_id)
@@ -1373,15 +1375,35 @@ def _on_cleanup_checked(task: TaskRecord, event: Event) -> Decision:
             return _ignore(task, f"任务里没有动作 {action_id}")
         if action.kind not in CLEANUP_ACTION_KINDS:
             return _ignore(task, f"{action.kind.value}不是清理动作，清理核对只能核对清理动作")
+        if action_id not in registered:
+            return _ignore(
+                task,
+                f"动作 {action_id} 不是进入终点时登记的清理动作，来源不可核验，不能这样核对",
+            )
         targets.append(action)
 
     new_status = ActionStatus.DONE if outcome is CheckResult.PR_CLOSED else ActionStatus.ABANDONED
-    updated_ids = set(wanted)
-    if all(action.status is new_status for action in targets):
+    # 只允许把"未完成"收尾一次：已收尾的，同结果幂等忽略、相反结果整批拒绝
+    for action in targets:
+        if action.status is ActionStatus.SENT or action.status is ActionStatus.UNKNOWN:
+            continue
+        if action.status is new_status:
+            continue
+        return _ignore(
+            task,
+            f"动作 {action.action_id} 已经收尾为{action.status.value}，"
+            f"不能用相反结果{new_status.value}覆盖；要更正请另走更正入口",
+        )
+    open_ids = {
+        action.action_id
+        for action in targets
+        if action.status is ActionStatus.SENT or action.status is ActionStatus.UNKNOWN
+    }
+    if not open_ids:
         return _ignore(task, f"这些清理动作已经是{new_status.value}，不用再核对")
 
     patched = tuple(
-        replace(action, status=new_status) if action.action_id in updated_ids else action
+        replace(action, status=new_status) if action.action_id in open_ids else action
         for action in task.actions
     )
     names = "、".join(f"{action.kind.value}({action.action_id})" for action in targets)
@@ -1439,6 +1461,9 @@ def _on_cancel(task: TaskRecord) -> Decision:
     if task.pr_opened:
         actions.add(ActionKind.CLOSE_PR, detail="关闭 PR，保留分支")
 
+    cleanup_ids = tuple(
+        action.action_id for action in actions.items if action.kind in CLEANUP_ACTION_KINDS
+    )
     return _transition(
         task,
         TaskStatus.CANCELLED,
@@ -1447,4 +1472,5 @@ def _on_cancel(task: TaskRecord) -> Decision:
         reviews=(),
         approved_sha=None,
         returned_from_review=False,
+        cleanup_action_ids=cleanup_ids,
     )
