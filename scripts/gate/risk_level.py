@@ -77,10 +77,13 @@ def explain_file(
         deleted_paths=paths if action == "删除" else (),
         renames=((paths[0], paths[1]),) if action == "改名" else (),
         assertion_drops=tuple(drop for drop in changes.assertion_drops if drop.path == paths[-1]),
+        # 采集器目前只有整批命中标志，不代表此文件已被定位为含密钥。
+        secret_scan_hit=changes.secret_scan_hit,
     )
     rules = list(bottom_line_reasons(file_changes, policy))
     if action == "改名":
-        rules.append("改名规则：新旧路径同时参与判断，取更严格级别")
+        outcome = "本次命中底线，判 D" if rules else "本次未命中底线，判 C"
+        rules.append(f"改名规则：新旧路径同时参与判断，{outcome}")
     if not rules:
         rules.append("普通仓库改动：C；纯文档也不接受模型降级")
     return FileResult(paths=paths, action=action, rules=tuple(rules))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import pytest
 import yaml
 
 from tandem.core.level import bottom_line_reasons
+from tandem.core.model import ChangeSet
 from tandem.shell.config import parse_config
 from tandem.shell.diff_source import GitDiffSource
 
@@ -143,6 +145,7 @@ def test_renaming_protected_file_into_docs_is_d(repository: Path) -> None:
     report = check_report(repository, "D", "改名规则：新旧路径同时参与判断")
     assert report["files"][0]["paths"] == ["src/tandem/core/example.py", "docs/已移动.md"]
     assert "改动了底线条目相关的路径 src/tandem/core/example.py" in report["bottom_lines"]
+    assert report["files"][0]["rules"][-1] == ("改名规则：新旧路径同时参与判断，本次命中底线，判 D")
 
 
 def test_default_revisions_use_pr_event(repository: Path) -> None:
@@ -195,6 +198,7 @@ def test_ordinary_rename_uses_existing_core_semantics(repository: Path) -> None:
     report = check_report(repository, "C", "改名规则：新旧路径同时参与判断")
     assert report["bottom_lines"] == []
     assert report["files"][0]["paths"] == ["app.py", "docs/app.py"]
+    assert report["files"][0]["rules"] == ["改名规则：新旧路径同时参与判断，本次未命中底线，判 C"]
 
 
 def test_cross_file_assertion_increases_do_not_cancel_drops(repository: Path) -> None:
@@ -368,3 +372,27 @@ def test_workflow_keeps_gate_read_only_and_blocking() -> None:
     assert "||" not in gate["run"]
     summary = next(step for step in job["steps"] if "GITHUB_STEP_SUMMARY" in step.get("run", ""))
     assert summary["if"] == "always()"
+
+
+@pytest.mark.parametrize(
+    ("action", "paths"),
+    [("修改或新增", ("app.py",)), ("删除", ("app.py",)), ("改名", ("app.py", "docs/app.py"))],
+)
+@pytest.mark.parametrize("secret_scan_hit", [False, True])
+def test_file_explanations_preserve_global_secret_scan(
+    action: str, paths: tuple[str, ...], secret_scan_hit: bool
+) -> None:
+    """扫描只有整批命中标志；每条文件解释都保留它，不冒充文件级定位。"""
+    entry = runpy.run_path(str(SCRIPT))
+    policy = parse_config(yaml.safe_load((ROOT / "risk.yml").read_text(encoding="utf-8"))).policy
+    changes = ChangeSet(
+        paths=("app.py", "other.py"),
+        deleted_paths=("app.py",),
+        renames=(("app.py", "docs/app.py"),),
+        secret_scan_hit=secret_scan_hit,
+    )
+    file = entry["explain_file"](changes, policy, paths, action)
+    assert ("密钥扫描命中" in file.rules) is secret_scan_hit
+    summary_reasons = set(bottom_line_reasons(changes, policy))
+    reasons = {rule for rule in file.rules if not rule.startswith(("改名规则：", "普通仓库改动："))}
+    assert reasons <= summary_reasons
