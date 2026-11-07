@@ -17,14 +17,19 @@
 | 第一次合并 | feat/risk-gate，本地引用 | c8966cd | origin/feat/risk-gate 为 cfb2fc5，本地是其后代且领先两提交，按用户允许的规则使用更新的同名本地分支 |
 | 第二次合并 | origin/feat/github-adapter | 8115b27 | 与同名本地分支一致 |
 | 第三次合并 | origin/feat/cli-run | dab9e1a | 与同名本地分支一致；验收指南来自此提交 |
+| 收尾追加追平 | feat/risk-gate 的新提交 | 9f56a64 | 演练期间本地分支继续前进；仅文档和 4 个回归用例，追加一轮完整验证 |
 
 risk-gate 领先的两项修复为 `6e2aed8`（改名解释、扫描结果透传）和
 `c8966cd`（通过 PR 引用获取 fork 对象、固定依赖 Action）。这里只核对本地对象与测试，
 没有执行远端工作流来认证这些部署行为。
 
+初版报告 `e8367e5` 完成后，检查到 risk-gate 又新增 `9f56a64`，因此在原定三轮之后
+追加追平合并，不把并行新增内容误算进先前结果。最终风险分支输入固定为 `9f56a64`。
+
 明确没有合入 PR #7 的 `feat/state-invariants@338cf6d` 或 PR #8 的
 `feat/redteam-fixes@1579fa1`；最后也用祖先关系检查确认这两个分支头不在集成结果中。
 共享的 m1 基线不等于合入了它们尚在修改的分支。
+收尾时 PR #8 的本地头已到 `db9ac9e`；仍未合入，不能据其新增审核文档声称修复已集成。
 
 ## 2. 每轮合并、冲突与检查结果
 
@@ -33,6 +38,7 @@ risk-gate 领先的两项修复为 `6e2aed8`（改名解释、扫描结果透传
 | risk-gate | 475a5ec | 无文本冲突；首次 format 检查暴露 R5 文档代码块排版问题，修正后重跑 | 均通过 | 0 errors | 354 passed，1 skipped | 退出 0 |
 | GitHub adapter | 654479a | 无文本冲突，自动合并 | 均通过 | 0 errors | 464 passed，1 skipped | 退出 0 |
 | CLI run | 55fbb6f | cli.py 两个冲突块，组合双方导入和子命令；见下节 | 均通过 | 0 errors | 514 passed，1 skipped | 退出 0 |
+| risk-gate 追平 | c2b61c8 | 无文本冲突；合入新增属性/base 策略来源的文档与测试，不改运行时代码 | 均通过 | 0 errors | 518 passed，1 skipped | 退出 0 |
 
 每轮完整执行的检查为：
 
@@ -118,9 +124,10 @@ A–G 合计 **46 条 CLI 命令**，加准备阶段的 `tandem --help` 为指�
 7/9/5/4/3/4/7。没有把这些步骤记成通过，也没有把它们归咎于核心转换错误。
 这是按指定分支顺序集成时可以预期、但确实存在的功能依赖失败。
 
-### 4.2 第三轮：47/47 符合预期，无阻断
+### 4.2 第三轮及追平轮：分别 47/47 符合预期，无阻断
 
-下表的退出码序列是实际输出，顺序与指南每个案例的命令一致：
+下表的退出码序列是两轮各自复跑的实际输出，顺序与指南每个案例的命令一致；
+追平轮使用新的临时库，不复用第三轮的终点任务来冒充再次通过：
 
 | 案例 | 条数 | 实际退出码 | 关键验证 |
 |---|---|---|---|
@@ -146,6 +153,7 @@ T7 所关注的两个入口在最后一轮均已存在：`src/tandem/shell/githu
 - `%TEMP%\tandem-integ-risk-gate-sacxe37s\results.json`
 - `%TEMP%\tandem-integ-github-adapter-arnthm5h\results.json`
 - `%TEMP%\tandem-integ-cli-run-l_q_z1lq\results.json`
+- `%TEMP%\tandem-integ-risk-gate-refresh-n8qem_0c\results.json`
 
 这些材料只含本地模拟任务；没有生产数据库、真实 Issue 正文或凭据。
 
@@ -165,7 +173,7 @@ T7 所关注的两个入口在最后一轮均已存在：`src/tandem/shell/githu
 建议先让相关修复在 m1 核心基线上稳定，再采用本次已演练的顺序：
 
 1. **更新后的 feat/m1-runnable**：作为共同基线；R5 修复后重新核对相关反例。
-2. **feat/risk-gate**：使用包含 c8966cd 的更新版本，保留可信 base 裁判模式。
+2. **feat/risk-gate**：使用已验证的 `9f56a64`（包含 c8966cd），保留可信 base 裁判模式。
 3. **feat/github-adapter**：接入来源、持久化与安全执行边界；本轮与风险分支无文本冲突。
 4. **feat/cli-run**：最后组合 CLI；在提交正式合并前解决同样的导入/注册区冲突，保留双方功能。
 
@@ -175,4 +183,5 @@ GitHub 与 CLI-run 都修改同一个 CLI 入口，建议两边先 merge 最新�
 不是用 ours/theirs 整文件覆盖来省掉冲突。
 
 #7/#8 等稳定后再逐个追加独立演练，不夹入当前结果；每次都重新检查全套测试和临时库路线。
-本地三个 merge commit 是集成证据，不是对真实后台或合并政策的自动批准。
+上述本地 merge commit 是集成证据，不是对真实后台或合并政策的自动批准。
+最终追平后的全量结果为 **518 passed、1 skipped**，A–G 加准备帮助仍为 **47/47** 符合预期。
