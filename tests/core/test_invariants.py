@@ -22,6 +22,7 @@ from tandem.core.model import (
     Action,
     ActionKind,
     ActionStatus,
+    ActionUpdate,
     ChangeSet,
     CheckResult,
     Decision,
@@ -127,21 +128,29 @@ def check_terminal(before: TaskRecord, ev: Event, decision: Decision) -> None:
         and ev.state_version in (None, before.state_version)
         and ev.check_result in (CheckResult.PR_CLOSED, CheckResult.NOT_CONFIRMED)
         and bool(ev.action_ids)
-        and all(key in known and known[key].kind in CLEANUP_KINDS for key in ev.action_ids)
+        and all(
+            key in known and known[key].kind in CLEANUP_KINDS and key in before.cleanup_action_ids
+            for key in ev.action_ids
+        )
+    )
+    outcome = (
+        ActionStatus.DONE if ev.check_result is CheckResult.PR_CLOSED else ActionStatus.ABANDONED
     )
     expected = before.actions
     if valid:
-        outcome = (
-            ActionStatus.DONE
-            if ev.check_result is CheckResult.PR_CLOSED
-            else ActionStatus.ABANDONED
-        )
-        expected = tuple(
-            replace(action, status=outcome) if action.action_id in ev.action_ids else action
-            for action in before.actions
-        )
+        # A conflicting finished result rejects the ENTIRE batch, including
+        # still-open targets. Matching finished targets may accompany open ones.
+        if all(
+            known[key].status in (ActionStatus.SENT, ActionStatus.UNKNOWN, outcome)
+            for key in ev.action_ids
+        ):
+            expected = tuple(
+                replace(action, status=outcome) if action.action_id in ev.action_ids else action
+                for action in before.actions
+            )
     if expected == before.actions:
         assert not decision.changed and after == before, "terminal: ignored event changed record"
+        assert not decision.action_updates, "terminal: ignored event wrote action updates"
         return
     assert decision.changed, "terminal: cleanup receipt was not recorded"
     # A whitelist protects every other field, including future TaskRecord fields.
@@ -150,6 +159,9 @@ def check_terminal(before: TaskRecord, ev: Event, decision: Decision) -> None:
             assert getattr(after, field.name) == getattr(before, field.name), (
                 f"terminal: changed protected field {field.name}"
             )
+    assert decision.action_updates == [
+        ActionUpdate(key, outcome) for key in dict.fromkeys(ev.action_ids)
+    ], "terminal: wrong action bookkeeping updates"
     assert after.actions == expected, "terminal: changed action identity or wrong target/status"
     assert after.cleanup_checked is True, "terminal: cleanup flag missing"
     assert after.state_version == before.state_version + 1, "terminal: cleanup version must add one"
@@ -162,6 +174,7 @@ def check_version(before: TaskRecord, decision: Decision) -> None:
     else:
         assert decision.task == before, "version: ignored record changed"
         assert not decision.actions, "version: ignored actions"
+        assert not decision.action_updates, "version: ignored action updates"
 
 
 def check_d(before: TaskRecord, decision: Decision, human_sha: str | None) -> None:
@@ -625,6 +638,7 @@ def terminal_record(status: TaskStatus, version: int = 10, sha: str = "current")
         reason="terminal reason",
         note="retained note",
         updated_at=NOW.replace(year=2025),
+        cleanup_action_ids=("cleanup-stop", "cleanup-pr", "cleanup-push"),
         actions=(
             Action("cleanup-stop", ActionKind.STOP_AGENT, base.task_id, "stop", "writer"),
             Action(
@@ -694,10 +708,24 @@ def test_every_event_obeys_terminal_cleanup_contract(status, version, sha, outco
     outcome=st.sampled_from([None, *CheckResult]),
     guard=st.integers(0, 3),
     old_status=st.sampled_from(list(ActionStatus)),
+    registered=st.lists(
+        st.sampled_from(["cleanup-stop", "cleanup-pr", "cleanup-push"]), unique=True
+    ),
 )
-def test_terminal_cleanup_checks_targets_and_guards(status, action_ids, outcome, guard, old_status):
+def test_terminal_cleanup_checks_targets_and_guards(
+    status,
+    action_ids,
+    outcome,
+    guard,
+    old_status,
+    registered,
+):
     task = terminal_record(status)
-    task = replace(task, actions=tuple(replace(a, status=old_status) for a in task.actions))
+    task = replace(
+        task,
+        actions=tuple(replace(a, status=old_status) for a in task.actions),
+        cleanup_action_ids=tuple(registered),
+    )
     ev = event(task, EventKind.CLEANUP_CHECKED, action_ids=tuple(action_ids), check_result=outcome)
     if guard == 1:
         ev = replace(ev, task_id="other-task")
@@ -892,8 +920,8 @@ def test_unapproved_d_code_receipts_cannot_advance(mode, attempt, sha) -> None:
 
 @TRACE_SETTINGS
 @given(
-    first_sha=st.text(min_size=1, max_size=20),
-    suffix=st.text(min_size=1, max_size=20),
+    first_sha=st.text(alphabet="0123456789abcdef", min_size=1, max_size=20),
+    suffix=st.text(alphabet="0123456789abcdef", min_size=1, max_size=20),
     submitted=st.sampled_from([EventKind.PLAN_SUBMITTED, EventKind.CODE_SUBMITTED]),
 )
 def test_plan_approval_is_bound_to_current_plan_sha(first_sha, suffix, submitted) -> None:
@@ -1096,4 +1124,90 @@ def test_terminal_cleanup_bookkeeping_mutants_are_caught(
     monkeypatch.setattr(core, "_on_cleanup_checked", corrupt_cleanup)
     decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
     with pytest.raises(AssertionError, match="terminal"):
+        check_terminal(task, ev, decision)
+
+
+@pytest.mark.parametrize("case", ["unregistered", "same-result", "opposite-result", "mixed-batch"])
+def test_terminal_cleanup_rejects_unverifiable_or_finished_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    task = terminal_record(TaskStatus.CANCELLED)
+    if case == "unregistered":
+        task = replace(task, cleanup_action_ids=())
+    else:
+        task = replace(
+            task,
+            actions=tuple(
+                replace(a, status=ActionStatus.DONE) if a.action_id == "cleanup-stop" else a
+                for a in task.actions
+            ),
+        )
+    ev = event(
+        task,
+        EventKind.CLEANUP_CHECKED,
+        action_ids=("cleanup-stop", "cleanup-pr") if case == "mixed-batch" else ("cleanup-stop",),
+        check_result=CheckResult.PR_CLOSED
+        if case in ("unregistered", "same-result")
+        else CheckResult.NOT_CONFIRMED,
+    )
+    baseline = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    assert not baseline.changed
+    check_terminal(task, ev, baseline)
+    original = core._on_cleanup_checked
+
+    def bypass_provenance_or_finality(task, ev):
+        if case == "unregistered":
+            candidate = replace(task, cleanup_action_ids=ev.action_ids)
+        else:
+            candidate = replace(
+                task,
+                actions=tuple(
+                    replace(a, status=ActionStatus.SENT) if a.action_id in ev.action_ids else a
+                    for a in task.actions
+                ),
+            )
+        result = original(candidate, ev)
+        return replace(
+            result, task=replace(result.task, cleanup_action_ids=task.cleanup_action_ids)
+        )
+
+    monkeypatch.setattr(core, "_on_cleanup_checked", bypass_provenance_or_finality)
+    decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    assert decision.changed
+    with pytest.raises(AssertionError, match="terminal"):
+        check_terminal(task, ev, decision)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "target", "status", "duplicate"])
+def test_terminal_cleanup_action_update_mutants_are_caught(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    task = terminal_record(TaskStatus.MERGED)
+    ev = event(
+        task,
+        EventKind.CLEANUP_CHECKED,
+        action_ids=("cleanup-stop",),
+        check_result=CheckResult.PR_CLOSED,
+    )
+    baseline = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    assert baseline.changed
+    check_terminal(task, ev, baseline)
+    original = core._on_cleanup_checked
+
+    def bad_updates(task, ev):
+        result = original(task, ev)
+        update = result.action_updates[0]
+        updates = {
+            "missing": [],
+            "target": [replace(update, action_id="start")],
+            "status": [replace(update, status=ActionStatus.UNKNOWN)],
+            "duplicate": [update, update],
+        }[mutation]
+        return replace(result, action_updates=updates)
+
+    monkeypatch.setattr(core, "_on_cleanup_checked", bad_updates)
+    decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
+    with pytest.raises(AssertionError, match="terminal: wrong action bookkeeping updates"):
         check_terminal(task, ev, decision)
