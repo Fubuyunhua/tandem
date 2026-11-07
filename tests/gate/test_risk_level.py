@@ -507,3 +507,50 @@ def test_workflow_fetch_fails_closed(fork_pr: tuple[Path, str, str], case: str) 
     assert git(repository, "rev-parse", "HEAD") == base
     assert not (repository / "injected").exists()
     assert not (repository / "head-executed").exists()
+
+
+@pytest.mark.parametrize("decrease_assertions", [False, True])
+def test_attributes_do_not_hide_assertion_drops(
+    repository: Path, decrease_assertions: bool
+) -> None:
+    write(repository, ".gitattributes", "tests/*.py -diff\n")
+    if decrease_assertions:
+        write(repository, "tests/test_app.py", "def test_app():\n    assert 1\n")
+    commit(repository)
+    report = check_report(
+        repository,
+        "D" if decrease_assertions else "C",
+        "测试文件 tests/test_app.py 的断言从 2 条减到 1 条"
+        if decrease_assertions
+        else "普通仓库改动",
+    )
+    if decrease_assertions:
+        assert report["assertion_drops"] == [
+            {"path": "tests/test_app.py", "before": 2, "after": 1, "previous_path": None}
+        ]
+    else:
+        assert report["bottom_lines"] == []
+
+
+@pytest.mark.parametrize("base_protects_app", [False, True])
+def test_policy_source_is_latest_base_not_common_ancestor(
+    repository: Path, base_protects_app: bool
+) -> None:
+    policy = yaml.safe_load((repository / "risk.yml").read_text(encoding="utf-8"))
+    original_paths = list(policy["bottom_line_paths"])
+    policy["bottom_line_paths"] = original_paths + ([] if base_protects_app else ["app.py"])
+    write(repository, "risk.yml", yaml.safe_dump(policy))
+    ancestor = commit(repository)
+    policy["bottom_line_paths"] = original_paths + (["app.py"] if base_protects_app else [])
+    write(repository, "risk.yml", yaml.safe_dump(policy))
+    base = commit(repository)
+    git(repository, "checkout", "-qb", "review-policy", ancestor)
+    write(repository, "app.py", "value = 2\n")
+    head = commit(repository)
+    result = invoke(repository, "--base", base, "--head", head)
+    assert result.returncode == (3 if base_protects_app else 0), result.stderr
+    report = json.loads((repository / "risk-level.json").read_text(encoding="utf-8"))
+    assert report["merge_base"] == ancestor
+    assert report["policy_source"] == f"{base}:risk.yml"
+    assert report["level"] == ("D" if base_protects_app else "C")
+    assert [file["paths"] for file in report["files"]] == [["app.py"]]
