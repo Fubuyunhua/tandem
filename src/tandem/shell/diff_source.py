@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import posixpath
-import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field, replace
@@ -20,12 +19,7 @@ from typing import Protocol
 
 from tandem.core.identity import is_commit_oid
 from tandem.core.model import AssertionDrop, ChangeSet, FileChange
-
-# 数断言用的近似写法：Python 的 assert、JS 的 expect(
-ASSERTION_PATTERN = re.compile(r"(?<![\w.])(assert\b|expect\s*\()")
-
-# 测试文件的判定（只用来数断言）
-TEST_FILE_PATTERN = re.compile(r"(^|/)(tests?/|test_[^/]*\.py$|[^/]*_test\.(py|js|ts)$)")
+from tandem.shell.assertions import count_assertions, is_test_path, leaves_test_collection
 
 
 def _clean_git_environment() -> dict[str, str]:
@@ -250,6 +244,9 @@ class GitDiffSource:
             changes=ChangeSet(
                 paths=changed,
                 file_changes=entries,
+                removed_test_paths=tuple(
+                    old for old, new in renames if leaves_test_collection(old, new)
+                ),
                 deleted_paths=tuple(deleted),
                 renames=tuple(renames),
                 assertions_before=before,
@@ -332,7 +329,7 @@ class GitDiffSource:
         counted = False
 
         for path in paths:
-            if not TEST_FILE_PATTERN.search(path):
+            if not is_test_path(path):
                 continue
             before = self._count_assertions(merge_base, path)
             after = self._count_assertions(sha, path)
@@ -343,7 +340,7 @@ class GitDiffSource:
                 drops.append(AssertionDrop(path=path, before=before, after=after))
 
         for path in deleted:
-            if not TEST_FILE_PATTERN.search(path):
+            if not is_test_path(path):
                 continue
             before = self._count_assertions(merge_base, path)
             before_total += before
@@ -352,10 +349,14 @@ class GitDiffSource:
                 drops.append(AssertionDrop(path=path, before=before, after=0))
 
         for old_path, new_path in renames:
-            if not (TEST_FILE_PATTERN.search(old_path) or TEST_FILE_PATTERN.search(new_path)):
+            if not (is_test_path(old_path) or is_test_path(new_path)):
                 continue
             before = self._count_assertions(merge_base, old_path)
-            after = self._count_assertions(sha, new_path)
+            after = (
+                0
+                if leaves_test_collection(old_path, new_path)
+                else self._count_assertions(sha, new_path)
+            )
             before_total += before
             after_total += after
             counted = True
@@ -370,7 +371,10 @@ class GitDiffSource:
 
     def _count_assertions(self, revision: str, path: str) -> int:
         text = self._git_show(revision, path)
-        return len(ASSERTION_PATTERN.findall(text))
+        try:
+            return count_assertions(text, path)
+        except (SyntaxError, ValueError, UnicodeError):
+            raise DiffError(f"无法解析测试文件 {path}，不能确认断言证据") from None
 
     def _git_show(self, revision: str, path: str) -> str:
         completed = subprocess.run(

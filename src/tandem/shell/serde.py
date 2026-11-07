@@ -116,6 +116,7 @@ def changes_to_dict(changes: ChangeSet) -> dict[str, object]:
         "assertions_after": changes.assertions_after,
         "assertion_drops": [assertion_drop_to_dict(drop) for drop in changes.assertion_drops],
         "secret_scan_hit": changes.secret_scan_hit,
+        "removed_test_paths": list(changes.removed_test_paths),
         "file_changes": [
             {
                 "path": item.path,
@@ -154,6 +155,10 @@ def changes_from_dict(data: object) -> ChangeSet:
             for entry in _list(mapping.get("assertion_drops", []), "assertion_drops")
         ),
         secret_scan_hit=_bool(mapping.get("secret_scan_hit", False), "secret_scan_hit"),
+        removed_test_paths=tuple(
+            _str(item, "removed_test_paths[]")
+            for item in _list(mapping.get("removed_test_paths", []), "removed_test_paths")
+        ),
         file_changes=tuple(
             file_change_from_dict(item)
             for item in _list(mapping.get("file_changes", []), "file_changes")

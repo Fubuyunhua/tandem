@@ -225,6 +225,7 @@ class ChangeSet:
     assertion_drops: tuple[AssertionDrop, ...] = ()
     secret_scan_hit: bool = False
     file_changes: tuple[FileChange, ...] = ()
+    removed_test_paths: tuple[str, ...] = ()
 
     @property
     def touches_repository(self) -> bool:
