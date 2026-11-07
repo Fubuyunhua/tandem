@@ -100,7 +100,7 @@ def test_unknown_github_error_does_not_leak_into_message_or_log(tmp_path: Path) 
         runner.store.close()
 
 
-def test_not_confirmed_prints_next_step_without_retrying_merge(
+def test_not_confirmed_without_ci_prints_blocker_without_retrying_merge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     db = tmp_path / "reconcile.sqlite3"
@@ -124,7 +124,8 @@ def test_not_confirmed_prints_next_step_without_retrying_merge(
     assert cli.main(["reconcile", "gh-7", "--db", str(db), "--repo", "owner/repo"]) == 0
     output = capsys.readouterr().out
     assert "下一步" in output and "手工核对" in output
-    assert "MERGE" in output and "tandem cancel" in output
+    assert "MERGE" in output and "CI" in output
+    assert "等待 task-001" not in output
     assert github.writes == []
     with Store(db) as store:
         assert store.list_actions("gh-7")[0].status is ActionStatus.UNKNOWN

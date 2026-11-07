@@ -333,3 +333,100 @@ def test_git_diff_source_rejects_unrelated_histories(tmp_path: Path) -> None:
 
     with pytest.raises(DiffError):
         GitDiffSource(cwd=root).collect("main", "other")
+
+
+# ------------------------------------------------- 断言减少按文件判断（task-003 Codex 发现）
+
+
+def test_git_diff_source_does_not_let_a_new_file_offset_a_drop(tmp_path: Path) -> None:
+    """一个测试文件少了断言、另一个新增测试文件补上：合计不变也要判 D。"""
+    from tandem.core.level import compute_level
+    from tests.core.helpers import policy
+
+    root = _make_repo(tmp_path)
+    _commit_file(
+        root,
+        "tests/test_app.py",
+        "def test_a():\n    assert 1\n    assert 2\n",
+        "add app tests",
+    )
+    _commit_file(
+        root,
+        "tests/test_app.py",
+        "def test_a():\n    assert 1\n",
+        "drop one assertion",
+    )
+    _commit_file(
+        root, "tests/test_new.py", "def test_b():\n    assert 3\n", "add another test file"
+    )
+    # 目标提交相对共同祖先：test_app 少一条、test_new 多一条
+    _git(root, "reset", "-q", "--hard", "HEAD")
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~2", "HEAD")
+    assert collected.changes.assertions_before == 2
+    assert collected.changes.assertions_after == 2  # 合计持平
+    drops = collected.changes.assertion_drops
+    assert [drop.path for drop in drops] == ["tests/test_app.py"]
+    assert (drops[0].before, drops[0].after) == (2, 1)
+    assert compute_level(collected.changes, policy()) is Level.D
+
+
+def test_git_diff_source_counts_only_increases_as_not_bottom_line(tmp_path: Path) -> None:
+    """只增加断言不算底线，仍然是 C 级。"""
+    from tandem.core.level import compute_level
+    from tests.core.helpers import policy
+
+    root = _make_repo(tmp_path)
+    _commit_file(root, "tests/test_app.py", "def test_a():\n    assert 1\n", "add test")
+    _commit_file(
+        root,
+        "tests/test_app.py",
+        "def test_a():\n    assert 1\n    assert 2\n    assert 3\n",
+        "add assertions",
+    )
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+    assert collected.changes.assertion_drops == ()
+    assert compute_level(collected.changes, policy()) is Level.C
+
+
+def test_git_diff_source_reports_rename_drop_in_per_file_detail(tmp_path: Path) -> None:
+    """改名并减少断言：减少的记录要带上旧路径和新路径。"""
+    root = _make_repo(tmp_path)
+    _commit_file(
+        root,
+        "tests/test_a.py",
+        "def test_a():\n    assert 1\n    assert 2\n",
+        "add tests",
+    )
+    _git(root, "mv", "tests/test_a.py", "tests/test_b.py")
+    _commit_file(root, "tests/test_b.py", "def test_a():\n    assert 1\n", "rename and trim")
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+    drops = collected.changes.assertion_drops
+    assert len(drops) == 1
+    assert drops[0].previous_path == "tests/test_a.py"
+    assert drops[0].path == "tests/test_b.py"
+    assert (drops[0].before, drops[0].after) == (2, 1)
+
+
+def test_changes_with_assertion_drops_survive_json_roundtrip() -> None:
+    """逐文件记录要能存进事件日志再读回来（tandem show 靠它说明原因）。"""
+    from tandem.core.model import AssertionDrop
+    from tandem.shell import serde
+
+    changes = ChangeSet(
+        paths=("tests/test_app.py", "tests/test_new.py"),
+        assertions_before=2,
+        assertions_after=2,
+        assertion_drops=(
+            AssertionDrop(
+                path="tests/test_b.py",
+                previous_path="tests/test_a.py",
+                before=3,
+                after=2,
+            ),
+        ),
+    )
+    restored = serde.changes_from_dict(serde.changes_to_dict(changes))
+    assert restored == changes

@@ -462,11 +462,21 @@ def cmd_github(args: argparse.Namespace) -> int:
                 source.bind_pr(str(args.task_id), int(args.pr))
             result = source.reconcile(str(args.task_id))
             print(f"{args.task_id}：{result.value}")
-            if result is CheckResult.NOT_CONFIRMED:
+            # 核对事件可能让内核重发动作；读取执行后的状态，不能只显示写前观察。
+            task = store.load_task(str(args.task_id))
+            if task is None:
+                raise RunnerError("核对后找不到任务记录")
+            print(f"  当前状态：{task.status.value}")
+            print(f"  原因：{task.reason}")
+            if task.status is TaskStatus.ERROR:
+                print("下一步：请手工核对 PR 和失败原因，再决定是否重新核对。")
+                return 2
+            if result is CheckResult.NOT_CONFIRMED and task.status is not TaskStatus.MERGED:
+                if not args.live:
+                    print("dry-run：未执行远端写入；M1 仍由用户手工核对并合并。")
                 print(
-                    "下一步：请手工核对 PR 状态；CLI 不会自行重发 MERGE。"
-                    "若仍待合并，请等待 task-001 的内核重试支持，"
-                    "或确认放弃后用 tandem cancel 取消任务。"
+                    "下一步：请手工核对 PR、CI 与当前提交的批准证据；"
+                    "MERGE 是否重发由内核守卫决定，CLI 不会自行绕过。"
                 )
         return 0
     except (GitHubError, RunnerError, StoreError) as error:

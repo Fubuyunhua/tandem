@@ -36,11 +36,13 @@ def test_document_warns_against_live_in_m1() -> None:
     assert "approve --live 会真的发起合并" in text
 
 
-def test_document_keeps_three_deferred_core_boundaries() -> None:
+def test_document_keeps_remaining_boundaries_and_updates_core_retry_support() -> None:
     text = DOCUMENT.read_text(encoding="utf-8")
     assert "后续交给 task-001 写手处理" in text
-    for boundary in ("取消清理失败恢复", "NOT_CONFIRMED 合并重发", "PR_CLOSED 后的 PR 生命周期"):
+    for boundary in ("取消清理失败恢复", "PR_CLOSED 后的 PR 生命周期"):
         assert boundary in text
+    assert "内核已支持 NOT_CONFIRMED 合并重发" in text
+    assert "不清除 `pr_opened`" not in text
 
 
 def test_document_explains_required_checks_without_changing_risk_level() -> None:

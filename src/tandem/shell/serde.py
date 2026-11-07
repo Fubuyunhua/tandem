@@ -15,6 +15,7 @@ from tandem.core.model import (
     Action,
     ActionKind,
     ActionStatus,
+    AssertionDrop,
     ChangeSet,
     CheckResult,
     Event,
@@ -22,6 +23,7 @@ from tandem.core.model import (
     Finding,
     Level,
     OpenFinding,
+    PlanEntry,
     Review,
     RevisionCount,
     RunMode,
@@ -84,6 +86,26 @@ def _list(data: object, name: str) -> list[object]:
 # ---------------------------------------------------------------- ChangeSet / Review
 
 
+def assertion_drop_to_dict(drop: AssertionDrop) -> dict[str, object]:
+    return {
+        "path": drop.path,
+        "before": drop.before,
+        "after": drop.after,
+        "previous_path": drop.previous_path,
+    }
+
+
+def assertion_drop_from_dict(data: object) -> AssertionDrop:
+    mapping = _mapping(data, "assertion_drop")
+    previous = mapping.get("previous_path")
+    return AssertionDrop(
+        path=_str(mapping.get("path"), "assertion_drop.path"),
+        before=_int(mapping.get("before"), "assertion_drop.before"),
+        after=_int(mapping.get("after"), "assertion_drop.after"),
+        previous_path=None if previous is None else _str(previous, "previous_path"),
+    )
+
+
 def changes_to_dict(changes: ChangeSet) -> dict[str, object]:
     return {
         "paths": list(changes.paths),
@@ -91,6 +113,7 @@ def changes_to_dict(changes: ChangeSet) -> dict[str, object]:
         "renames": [list(pair) for pair in changes.renames],
         "assertions_before": changes.assertions_before,
         "assertions_after": changes.assertions_after,
+        "assertion_drops": [assertion_drop_to_dict(drop) for drop in changes.assertion_drops],
         "secret_scan_hit": changes.secret_scan_hit,
     }
 
@@ -114,6 +137,10 @@ def changes_from_dict(data: object) -> ChangeSet:
         renames=tuple(renames),
         assertions_before=None if before is None else _int(before, "assertions_before"),
         assertions_after=None if after is None else _int(after, "assertions_after"),
+        assertion_drops=tuple(
+            assertion_drop_from_dict(entry)
+            for entry in _list(mapping.get("assertion_drops", []), "assertion_drops")
+        ),
         secret_scan_hit=_bool(mapping.get("secret_scan_hit", False), "secret_scan_hit"),
     )
 
@@ -127,6 +154,19 @@ def finding_from_dict(data: object) -> Finding:
     return Finding(
         id=_str(mapping.get("id"), "finding.id"),
         text=_str(mapping.get("text", ""), "finding.text"),
+    )
+
+
+def plan_entry_to_dict(entry: PlanEntry) -> dict[str, object]:
+    return {"version": entry.version, "sha": entry.sha, "text": entry.text}
+
+
+def plan_entry_from_dict(data: object) -> PlanEntry:
+    mapping = _mapping(data, "plan_entry")
+    return PlanEntry(
+        version=_int(mapping.get("version"), "plan_entry.version"),
+        sha=_str(mapping.get("sha", ""), "plan_entry.sha"),
+        text=_str(mapping.get("text", ""), "plan_entry.text"),
     )
 
 
@@ -234,6 +274,8 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "error_code": task.error_code,
         "plan_version": task.plan_version,
         "approved_plan_version": task.approved_plan_version,
+        "plan_history": [plan_entry_to_dict(entry) for entry in task.plan_history],
+        "plan_text": task.plan_text,
         "writer": task.writer,
         "writer_is_human": task.writer_is_human,
         "providers_involved": sorted(task.providers_involved),
@@ -255,6 +297,8 @@ def task_to_dict(task: TaskRecord) -> dict[str, object]:
         "base_sha": task.base_sha,
         "returned_from_review": task.returned_from_review,
         "actions": [action_to_dict(action) for action in task.actions],
+        "cleanup_checked": task.cleanup_checked,
+        "merge_confirmed_externally": task.merge_confirmed_externally,
         "reason": task.reason,
         "note": task.note,
         "updated_at": None if task.updated_at is None else task.updated_at.isoformat(),
@@ -296,6 +340,10 @@ def task_from_dict(data: object) -> TaskRecord:
         error_code=_optional_str(mapping, "error_code"),
         plan_version=_int(mapping.get("plan_version"), "plan_version"),
         approved_plan_version=_optional_int(mapping, "approved_plan_version"),
+        plan_history=tuple(
+            plan_entry_from_dict(entry)
+            for entry in _list(mapping.get("plan_history", []), "plan_history")
+        ),
         writer=_optional_str(mapping, "writer"),
         writer_is_human=_bool(mapping.get("writer_is_human"), "writer_is_human"),
         providers_involved=frozenset(
@@ -330,6 +378,10 @@ def task_from_dict(data: object) -> TaskRecord:
         actions=tuple(
             action_from_dict(entry) for entry in _list(mapping.get("actions", []), "actions")
         ),
+        cleanup_checked=_bool(mapping.get("cleanup_checked", False), "cleanup_checked"),
+        merge_confirmed_externally=_bool(
+            mapping.get("merge_confirmed_externally", False), "merge_confirmed_externally"
+        ),
         reason=_str(mapping.get("reason", ""), "reason"),
         note=_str(mapping.get("note", ""), "note"),
         updated_at=None
@@ -355,6 +407,7 @@ def event_to_dict(event: Event) -> dict[str, object]:
         "provider": event.provider,
         "providers": list(event.providers),
         "veto_reasons": [veto_reason_to_dict(item) for item in event.veto_reasons],
+        "action_ids": list(event.action_ids),
         "model_suggestion": None if event.model_suggestion is None else event.model_suggestion.name,
         "check_result": None if event.check_result is None else event.check_result.name,
         "standard_version": event.standard_version,
@@ -386,6 +439,10 @@ def event_from_dict(data: object) -> Event:
         veto_reasons=tuple(
             veto_reason_from_dict(entry)
             for entry in _list(mapping.get("veto_reasons", []), "event.veto_reasons")
+        ),
+        action_ids=tuple(
+            _str(item, "event.action_ids[]")
+            for item in _list(mapping.get("action_ids", []), "event.action_ids")
         ),
         model_suggestion=(
             None if suggestion is None else _enum_value(Level, suggestion, "model_suggestion")
