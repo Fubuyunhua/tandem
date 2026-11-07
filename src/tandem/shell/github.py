@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Protocol, cast
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubError(RuntimeError):
@@ -85,7 +88,7 @@ def _sha(sha: str) -> str:
 
 
 class GitHubWrites:
-    """真假实现共用核对规则；布尔值只表示写入已获确认。"""
+    """真假实现共用核对规则；合并/关闭读回确认，评论仅确认 API 接收。"""
 
     def get_pr(self, number: int) -> PullRequest:
         raise NotImplementedError
@@ -140,8 +143,7 @@ class GitHubWrites:
 
     def comment(self, number: int, body: str, *, live: bool = False) -> bool:
         resource = f"issues/{_number(number)}/comments"
-        if self._issue_state(number) not in {"open", "closed"}:
-            raise GitHubError("评论目标状态无效")
+        self._issue_state(number)
         if not live:
             return False
         self._write(resource, {"body": body}, "POST")
@@ -164,6 +166,25 @@ def _text(value: object) -> str:
     if not isinstance(value, str):
         raise GitHubError("GitHub 返回的文本格式错误")
     return value
+
+
+def _parse_issue(raw: object) -> Issue | None:
+    """逐条解析；PR 在读取 Issue 字段前排除，畸形数据交由调用方记录。"""
+    item = _mapping(raw)
+    if "pull_request" in item:
+        return None
+    number = item.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise GitHubError("Issue 编号格式错误")
+    _number(number)
+    state = _text(item.get("state"))
+    if state not in {"open", "closed"}:
+        raise GitHubError("Issue 状态格式错误")
+    labels = tuple(_text(_mapping(label).get("name")) for label in _items(item.get("labels")))
+    body = item.get("body")
+    return Issue(
+        number, _text(item.get("title")), "" if body is None else _text(body), labels, state
+    )
 
 
 @dataclass
@@ -219,25 +240,20 @@ class GhGitHub(GitHubWrites):
 
     def list_issues(self) -> tuple[Issue, ...]:
         issues: list[Issue] = []
-        for page in _items(self._api("issues?state=open&labels=agent&per_page=100", pages=True)):
-            for raw in _items(page):
-                item = _mapping(raw)
-                if "pull_request" in item:
+        pages = _items(self._api("issues?state=open&labels=agent&per_page=100", pages=True))
+        for page_number, page in enumerate(pages, start=1):
+            for position, raw in enumerate(_items(page), start=1):
+                try:
+                    issue = _parse_issue(raw)
+                except GitHubError:
+                    # 仅记录位置，不把不可信字段或异常文本复制到日志。
+                    logger.warning(
+                        "GitHub 跳过第 %d 页第 %d 条无效 Issue（字段格式错误）",
+                        page_number,
+                        position,
+                    )
                     continue
-                number = item.get("number")
-                if not isinstance(number, int) or isinstance(number, bool):
-                    raise GitHubError("Issue 编号格式错误")
-                labels = tuple(
-                    _text(_mapping(label).get("name")) for label in _items(item.get("labels"))
-                )
-                issue = Issue(
-                    number,
-                    _text(item.get("title")),
-                    _text(item.get("body") or ""),
-                    labels,
-                    _text(item.get("state")),
-                )
-                if issue.state == "open" and "agent" in issue.labels:
+                if issue is not None and issue.state == "open" and "agent" in issue.labels:
                     issues.append(issue)
         return tuple(issues)
 
