@@ -112,7 +112,9 @@ def test_executor_merge_guard_is_independent_of_client(
         runner.store.close()
 
 
-def test_issue_list_skips_pull_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_issue_list_skips_pull_requests(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     issue = {
         "number": 7,
         "title": "需求",
@@ -120,14 +122,15 @@ def test_issue_list_skips_pull_requests(monkeypatch: pytest.MonkeyPatch) -> None
         "labels": [{"name": "agent"}],
         "state": "open",
     }
-    # PR 条目故意缺少 Issue 字段，必须在解析字段之前排除。
+    # 完整 PR 防止被当作普通 Issue；不完整 PR 也应直接排除而非脏数据告警。
     process = FakeGhProcess(
         FakeGitHub(),
         replies={
             "issues?state=open&labels=agent&per_page=100": [
-                [{"pull_request": {}, "number": 8}, issue]
+                [{**issue, "number": 8, "pull_request": {}}, {"pull_request": {}}, issue]
             ]
         },
     )
     monkeypatch.setattr(subprocess, "run", process.run)
     assert [item.number for item in GhGitHub("owner/repo").list_issues()] == [7]
+    assert not caplog.records
