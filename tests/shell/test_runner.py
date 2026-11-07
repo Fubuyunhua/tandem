@@ -20,7 +20,7 @@ from tandem.core.model import (
 )
 from tandem.shell.agents.claude_cli import ClaudeCliAgent
 from tandem.shell.receipt import parse_receipt, render_receipt
-from tandem.shell.runner import QuotaTracker, RunnerError
+from tandem.shell.runner import QuotaTracker, Runner, RunnerError
 from tests.core.helpers import SHA_1
 from tests.shell.shell_helpers import NOW, code_receipt, make_runner
 
@@ -383,3 +383,88 @@ def test_replaying_an_identical_decision_does_not_run_the_agent_twice(
     assert len(agent.prompts) == 1  # 假 Agent 没有被再调用一次
     assert replay.receipts == ()
     assert [item.status for item in runner.store.list_actions("t1")] == [ActionStatus.DONE]
+
+
+# ------------------------------------------------- 清理核对要能真正收尾（r5 问题 1）
+
+from tandem.core.model import CheckResult  # noqa: E402
+from tests.core.helpers import cancelled_with_unconfirmed_cleanup  # noqa: E402
+
+
+def _cancel_and_cleanup_runner(tmp_path: Path) -> tuple[Runner, str]:
+    """造一个"已取消、关 PR 结果未知"的真实记录，并写进 Store。"""
+    record, action_id = cancelled_with_unconfirmed_cleanup()
+    runner = make_runner(tmp_path)
+    runner.store.commit(task=record, actions=record.actions)
+    return runner, action_id
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (CheckResult.PR_CLOSED, ActionStatus.DONE),
+        (CheckResult.NOT_CONFIRMED, ActionStatus.ABANDONED),
+    ],
+)
+def test_cleanup_check_is_persisted_and_not_executed_again(
+    tmp_path: Path, result: CheckResult, expected: ActionStatus
+) -> None:
+    """核对结果要写回动作表（同一事务），读回一致，且不会被当成新动作执行。"""
+    runner, action_id = _cancel_and_cleanup_runner(tmp_path)
+    before_rows = runner.store.list_actions("t1")
+    before_log = list(runner.executor.log)
+
+    outcome = runner.handle(
+        Event(
+            kind=EventKind.CLEANUP_CHECKED,
+            task_id="t1",
+            check_result=result,
+            action_ids=(action_id,),
+        )
+    )
+
+    # 内核的决定里是收尾后的状态
+    decided = {a.action_id: a.status for a in outcome.decision.task.actions}
+    assert decided[action_id] is expected
+    # 动作表也同步了（不是只改快照）
+    rows = {a.action_id: a.status for a in runner.store.list_actions("t1")}
+    assert rows[action_id] is expected
+    # 读回的任务快照与动作表一致
+    stored = runner.store.load_task("t1")
+    assert stored is not None
+    projected = {a.action_id: a.status for a in stored.actions}
+    assert projected[action_id] is expected
+    assert stored.status is TaskStatus.CANCELLED
+    # 收尾的动作不再算"未确认"
+    assert action_id not in {a.action_id for a in runner.store.unconfirmed_actions("t1")}
+    # 没有被当成新动作重新执行：动作行数不变、执行器没有被调用
+    assert len(runner.store.list_actions("t1")) == len(before_rows)
+    assert runner.executor.log == before_log
+
+
+def test_cleanup_check_updates_are_atomic_with_the_event(tmp_path: Path) -> None:
+    """动作表更新失败时，事件和版本号都不能单独写进去（同一事务）。"""
+    from tandem.core.model import ActionUpdate
+    from tandem.shell.store import StoreError
+
+    runner, action_id = _cancel_and_cleanup_runner(tmp_path)
+    task = runner.store.load_task("t1")
+    assert task is not None
+    events_before = len(runner.store.list_events("t1"))
+
+    with pytest.raises(StoreError):
+        runner.store.commit(
+            events=[Event(kind=EventKind.CLEANUP_CHECKED, task_id="t1")],
+            task=replace(task, state_version=task.state_version + 1, cleanup_checked=True),
+            expected_version=task.state_version,
+            action_updates=[ActionUpdate(action_id="不存在的动作", status=ActionStatus.DONE)],
+        )
+
+    # 整笔回滚：事件、版本号、动作状态都没变
+    assert len(runner.store.list_events("t1")) == events_before
+    after = runner.store.load_task("t1")
+    assert after is not None
+    assert after.state_version == task.state_version
+    assert after.cleanup_checked is False
+    statuses = {a.action_id: a.status for a in runner.store.list_actions("t1")}
+    assert statuses[action_id] is ActionStatus.UNKNOWN

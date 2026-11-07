@@ -44,20 +44,24 @@ from tandem.shell.runner import Runner
 from tandem.shell.executor import Executor
 from tandem.shell.diff_source import FakeDiffSource
 from tests.core.helpers import (
-    cancelled_with_unconfirmed_cleanup, policy, ev, NOW, CODE_CHANGES,
+    cancelled_with_unconfirmed_cleanup,
+    policy,
+    ev,
+    NOW,
+    CODE_CHANGES,
 )
 
 record, action_id = cancelled_with_unconfirmed_cleanup()
 with Store(Path(":memory:")) as store:
     store.commit(task=record, actions=record.actions)
-    runner = Runner(
-        store, policy(), Executor(), FakeDiffSource(CODE_CHANGES), clock=lambda: NOW
+    runner = Runner(store, policy(), Executor(), FakeDiffSource(CODE_CHANGES), clock=lambda: NOW)
+    result = runner.handle(
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(action_id,),
+        )
     )
-    result = runner.handle(ev(
-        EventKind.CLEANUP_CHECKED,
-        check_result=CheckResult.NOT_CONFIRMED,
-        action_ids=(action_id,),
-    ))
     # result.decision.task 中该动作是 ABANDONED；下面两处仍是 UNKNOWN / 未确认。
     print(store.load_task("t1").actions)
     print(store.unconfirmed_actions("t1"))

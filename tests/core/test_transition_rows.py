@@ -1862,3 +1862,150 @@ def test_terminal_task_still_ignores_every_other_event() -> None:
         assert not decision.changed
         assert decision.task == record
         assert "已经结束" in decision.reason
+
+
+# ------------------------------------------------- 清理核对只能把"未完成"收尾一次（r5 问题 2）
+
+
+def _cleanup_record() -> tuple[TaskRecord, str, str]:
+    """返回（已取消且 CLOSE_PR 未知的记录, CLOSE_PR 编号, STOP_AGENT 编号）。"""
+    record, close_id = cancelled_with_unconfirmed_cleanup()
+    stop_id = next(
+        action.action_id for action in record.actions if action.kind is ActionKind.STOP_AGENT
+    )
+    return record, close_id, stop_id
+
+
+def test_cleanup_check_rejects_opposite_result_after_done() -> None:
+    """已经确认完成的动作，不能被改成"已放弃"。"""
+    record, close_id, _ = _cleanup_record()
+    done = run(
+        record,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(close_id,)),
+    ).task
+    decision = run(
+        done,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(close_id,),
+        ),
+    )
+    assert not decision.changed
+    assert "已经收尾" in decision.reason
+    statuses = {a.action_id: a.status for a in decision.task.actions}
+    assert statuses[close_id] is ActionStatus.DONE
+
+
+def test_cleanup_check_rejects_opposite_result_after_abandon() -> None:
+    """已经放弃的动作，也不能被普通核对改成完成。"""
+    record, close_id, _ = _cleanup_record()
+    abandoned = run(
+        record,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(close_id,),
+        ),
+    ).task
+    decision = run(
+        abandoned,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(close_id,)),
+    )
+    assert not decision.changed
+    statuses = {a.action_id: a.status for a in decision.task.actions}
+    assert statuses[close_id] is ActionStatus.ABANDONED
+
+
+def test_cleanup_check_same_result_twice_is_idempotent() -> None:
+    """同一结果再核对一次：幂等忽略，不改版本。"""
+    record, close_id, _ = _cleanup_record()
+    once = run(
+        record,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(close_id,)),
+    ).task
+    twice = run(
+        once,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(close_id,)),
+    )
+    assert not twice.changed
+    assert twice.task == once
+    assert "不用再核对" in twice.reason
+
+
+def test_cleanup_check_mixed_batch_is_rejected_atomically() -> None:
+    """一批里只要有一条是相反结果，整批都不生效（包括还没收尾的那条）。"""
+    record, close_id, stop_id = _cleanup_record()
+    done = run(
+        record,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(close_id,)),
+    ).task
+    before = {a.action_id: a.status for a in done.actions}
+    decision = run(
+        done,
+        ev(
+            EventKind.CLEANUP_CHECKED,
+            check_result=CheckResult.NOT_CONFIRMED,
+            action_ids=(close_id, stop_id),
+        ),
+    )
+    assert not decision.changed
+    statuses = {a.action_id: a.status for a in decision.task.actions}
+    assert statuses[close_id] is ActionStatus.DONE  # 没被改动
+    assert statuses[stop_id] is before[stop_id]  # 也没被顺手收尾
+
+
+def test_cleanup_check_only_accepts_actions_registered_by_the_cancel() -> None:
+    """清理动作要有可核验的来源：只有进入终点时登记的那一批可以核对。"""
+    # 先额度用完产生一个 STOP_AGENT，再取消任务：取消本身没有清理动作可登记
+    record = to_working(new_task())
+    record = run(record, ev(EventKind.QUOTA_EXHAUSTED, provider="claude", reason="写一半")).task
+    stopped = next(
+        action.action_id for action in record.actions if action.kind is ActionKind.STOP_AGENT
+    )
+    record = run(record, ev(EventKind.CANCEL)).task
+    assert record.status is TaskStatus.CANCELLED
+    assert record.cleanup_action_ids == ()  # 这次取消没有登记清理动作
+
+    decision = run(
+        record,
+        ev(EventKind.CLEANUP_CHECKED, check_result=CheckResult.PR_CLOSED, action_ids=(stopped,)),
+    )
+    assert not decision.changed
+    assert "来源" in decision.reason or "登记" in decision.reason
+
+
+# ------------------------------------------------- 空白方案编号也算"没有编号"（r5 问题 3）
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_row_02_blank_plan_sha_is_rejected(blank: str) -> None:
+    """直接构造 Event 时，空白字符串的提交编号也不能当方案编号用。"""
+    record = to_working(new_task(Level.D))
+    decision = run(record, ev(EventKind.PLAN_SUBMITTED, sha=blank, plan="真方案"))
+    assert decision.task.status is TaskStatus.WORKING
+    assert not decision.changed
+    assert decision.task.plan_history == ()
+    assert "提交编号" in decision.reason
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_row_03_blank_plan_sha_cannot_approve(blank: str) -> None:
+    """批准时带空白编号，等于没带。"""
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="plan-a", plan="真方案")).task
+    decision = run(record, ev(EventKind.PLAN_APPROVED, sha=blank))
+    assert decision.task.status is TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "提交编号" in decision.reason
+
+
+def test_row_03_plan_sha_is_normalized_before_compare() -> None:
+    """编号两边都做规范化（去掉首尾空白）：` plan-a ` 和 `plan-a` 是同一个提交。"""
+    record = to_working(new_task(Level.D))
+    record = run(record, ev(EventKind.PLAN_SUBMITTED, sha="  plan-a  ", plan="真方案")).task
+    entry = record.plan()
+    assert entry is not None
+    assert entry.sha == "plan-a"
+    matched = run(record, ev(EventKind.PLAN_APPROVED, sha=" plan-a "))
+    assert matched.task.status is TaskStatus.PENDING
+    assert matched.task.approved_plan_version == 1

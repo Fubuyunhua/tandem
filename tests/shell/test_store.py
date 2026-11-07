@@ -339,3 +339,16 @@ def test_external_merge_marker_survives_a_store_roundtrip(store: Store) -> None:
     assert loaded is not None
     assert loaded.merge_confirmed_externally is True
     assert "未经本系统审核放行" in loaded.note
+
+
+def test_cleanup_action_ids_survive_a_store_roundtrip(store: Store) -> None:
+    """清理动作的来源登记要能存下来，否则重启后核对会因"来源不可核验"被拒。"""
+    task = _task(
+        4,
+        status=TaskStatus.CANCELLED,
+        cleanup_action_ids=("t1:4:0", "t1:4:1"),
+    )
+    store.commit(task=task)
+    loaded = store.load_task("t1")
+    assert loaded is not None
+    assert loaded.cleanup_action_ids == ("t1:4:0", "t1:4:1")
