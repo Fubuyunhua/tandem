@@ -2,7 +2,8 @@
 
 子命令：
 - ``tandem demo``：用临时数据库和假 Agent 跑两个场景，打印状态路径；
-- ``tandem status``：列出任务和当前状态；
+- ``tandem status`` / ``show``：列出任务或查看完整记录；
+- ``tandem run``：只用假证据驱动本地任务；
 - ``tandem submit`` / ``approve`` / ``reject`` / ``cancel``：对任务做相应操作。
 """
 
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -35,12 +37,14 @@ from tandem.core.model import (
     Verdict,
     VetoReason,
 )
+from tandem.shell import serde
 from tandem.shell.agents.fake import FakeAgent
 from tandem.shell.config import load_config, load_policy
 from tandem.shell.diff_source import DiffSource, FakeDiffSource, GitDiffSource
 from tandem.shell.executor import Executor
 from tandem.shell.github import GhGitHub, GitHubError
 from tandem.shell.github_events import GitHubEvents
+from tandem.shell.local_run import LocalRun
 from tandem.shell.receipt import Receipt, parse_receipt, render_receipt
 from tandem.shell.runner import Runner, RunnerError
 from tandem.shell.store import Store, StoreError
@@ -151,6 +155,64 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- show
+
+
+def _print_summary(task: TaskRecord) -> None:
+    """把批准前最需要核对的证据放在完整 JSON 之前。"""
+    print("批准前请先写下自己的判断，再对照下方 AI 审核意见。")
+    # 内核目前只保存布尔绿灯，False 不能单独证明已收到红灯。
+    print(f"CI：{'绿（当前提交）' if task.ci_green else '未通过或未知（没有有效绿灯）'}")
+    if task.approved_sha is None:
+        print("批准的提交：无（尚未批准）")
+    else:
+        match = "与当前一致" if task.approved_sha == task.latest_sha else "与当前不一致"
+        print(f"批准的提交：{task.approved_sha}（{match}）")
+    reviews = {item.provider: item for item in task.current_reviews()}
+    providers = dict.fromkeys((*task.designated_reviewers, *reviews))
+    conclusions = " / ".join(
+        f"{provider} {reviews[provider].verdict.value if provider in reviews else '待回应'}"
+        for provider in providers
+    )
+    print(f"本轮审核：{conclusions or '无本轮 AI 审核结论'}")
+    print(f"待回应意见：{len(task.open_findings)} 条（复合键见下方完整记录）")
+    if task.plan_version == 0:
+        print("方案：尚无方案版本")
+    else:
+        approved = task.approved_plan_version == task.plan_version
+        print(f"方案：第 {task.plan_version} 版{'已批准' if approved else '待批准'}")
+        plan = task.plan()
+        print(f"方案提交编号：{plan.sha if plan is not None else '无（旧记录未保存）'}")
+        print(f"方案正文：{task.plan_text or '无（旧记录未保存）'}")
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """完整展示任务与事件，批准前可以核对提交和逐条意见。"""
+    db = _db_path(args)
+    if not db.exists():
+        print(f"还没有数据库：{db}")
+        return 1
+    with Store(db) as store:
+        task = store.load_task(args.task_id)
+        if task is None:
+            print(f"没有任务 {args.task_id}")
+            return 1
+        print(f"{task.task_id}：{task.status.value}；等级 {task.level.value}")
+        print(f"提交编号：{task.latest_sha or '无'}")
+        _print_summary(task)
+        print("完整任务记录（含审核历史、待回应意见及其复合键、动作）：")
+        print(json.dumps(serde.task_to_dict(task), ensure_ascii=False, indent=2))
+        print("历史事件（按发生顺序）：")
+        print(
+            json.dumps(
+                [serde.event_to_dict(event) for event in store.list_events(task.task_id)],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    return 0
+
+
 # ---------------------------------------------------------------- submit
 
 
@@ -165,7 +227,11 @@ def _changes_from_args(args: argparse.Namespace) -> ChangeSet:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
-    store, runner = _open(_db_path(args))
+    policy = load_policy()
+    if args.mode is not None:
+        mode = RunMode.SINGLE_AGENT if args.mode == "single_agent" else RunMode.MULTI_AGENT
+        policy = replace(policy, run_mode=mode)
+    store, runner = _open(_db_path(args), policy=policy)
     try:
         changes = _changes_from_args(args)
         level = compute_level(changes, runner.policy)
@@ -176,6 +242,34 @@ def cmd_submit(args: argparse.Namespace) -> int:
     except RunnerError as error:
         print(f"提交失败：{error}")
         return 1
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------- run
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    db = _db_path(args)
+    if not db.is_file():
+        print(f"还没有数据库：{db}（请先 submit）")
+        return 1
+    policy = load_policy()
+    agents = {provider: FakeAgent(provider=provider) for provider in policy.writer_providers}
+    changes = ChangeSet(
+        paths=tuple(path.strip() for path in args.changes.split(",") if path.strip())
+    )
+    store, runner = _open(
+        db, agents=agents, policy=policy, diff_source=FakeDiffSource(changes=changes)
+    )
+    try:
+        return LocalRun(
+            runner,
+            agents,
+            args.agent_script,
+            args.review,
+            allow_level_drop=args.allow_level_drop,
+        ).run(until_idle=args.until_idle, max_rounds=args.max_rounds)
     finally:
         store.close()
 
@@ -505,6 +599,20 @@ def _connect_github(args: argparse.Namespace, runner: Runner) -> None:
 # ---------------------------------------------------------------- 入口
 
 
+def _positive_rounds(value: str) -> int:
+    rounds = int(value)
+    if rounds < 1:
+        raise argparse.ArgumentTypeError("最大轮数必须大于 0")
+    return rounds
+
+
+def _nonempty_changes(value: str) -> str:
+    """不能用空的模拟改动把任务变成无需审核的 A 级。"""
+    if not any(path.strip() for path in value.split(",")):
+        raise argparse.ArgumentTypeError("--changes 不能为空，必须提供至少一个模拟改动路径")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tandem", description="个人 AI 开发循环系统")
     common = argparse.ArgumentParser(add_help=False)
@@ -528,9 +636,36 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--bind", action="append", default=[], help="关联 gh-编号=PR编号，可重复"
             )
+    run = subparsers.add_parser("run", parents=[common], help="用假证据推进一轮本地任务")
+    run.add_argument("--agent-script", choices=("ok", "ci-red", "refuse"), default="ok")
+    run.add_argument(
+        "--changes",
+        required=True,
+        type=_nonempty_changes,
+        help="模拟改动路径，逗号分隔，必填且非空（每轮重算等级）",
+    )
+    run.add_argument(
+        "--allow-level-drop",
+        action="store_true",
+        help="明确允许模拟改动降低任务等级，可能减少审核或人工关口",
+    )
+    run.add_argument("--review", choices=("pass", "fail"), default="pass", help="模拟 AI 审核结论")
+    run.add_argument("--until-idle", action="store_true", help="重复运行直到需要人工处理或无进展")
+    run.add_argument(
+        "--max-rounds", type=_positive_rounds, default=10, help="最多运行几轮，默认 10"
+    )
+
+    show = subparsers.add_parser("show", parents=[common], help="查看完整任务记录和历史事件")
+    show.add_argument("task_id", help="任务编号")
 
     submit = subparsers.add_parser("submit", parents=[common], help="提交一个新任务")
     submit.add_argument("--task-id", required=True, help="任务编号")
+    submit.add_argument(
+        "--mode",
+        choices=("single_agent", "multi_agent"),
+        default=None,
+        help="此任务的运行模式（默认使用 risk.yml，不修改配置文件）",
+    )
     submit.add_argument("--paths", default="", help="改动的文件，逗号分隔")
     submit.add_argument("--deleted", default="", help="删除的文件，逗号分隔")
     submit.add_argument(
@@ -573,6 +708,8 @@ COMMANDS = {
     "reconcile": cmd_github,
     "demo": cmd_demo,
     "status": cmd_status,
+    "show": cmd_show,
+    "run": cmd_run,
     "submit": cmd_submit,
     "approve": cmd_approve,
     "reject": cmd_reject,
