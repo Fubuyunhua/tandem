@@ -1,5 +1,6 @@
 """只用本地 Git 对象验证子模块、用户配置和符号链接边界。"""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -124,3 +125,73 @@ def test_shallow_clone_reports_a_clear_error_when_base_is_outside_the_boundary(
 
     message = str(raised.value)
     assert "HEAD~5" in message or "浅克隆" in message or "对象" in message
+
+
+def test_source_repo_grafts_cannot_forge_a_merge_base(tmp_path: Path) -> None:
+    """S1：源仓库里的 .git/info/grafts 不能伪造共同祖先把改动整个藏掉。
+
+    `--no-replace-objects` 只关掉 replace 引用，管不到 grafts。审查复核里的反例是
+    两条兄弟分支：`M ── B`（base 分支）和 `M ── S`（受审提交），把 grafts 写成
+    「B 的父提交是 S」，`merge-base(B, S)` 就变成 S，`diff S..S` 为空，新增的
+    底线文件整个消失、等级算成 A。
+    """
+    root = _make_repo(tmp_path)
+    fork_point = _git(root, "rev-parse", "HEAD").strip()
+
+    _git(root, "checkout", "-qb", "base-branch")
+    _commit_file(root, "docs/base.md", "base side", "base side commit")
+    base = _git(root, "rev-parse", "HEAD").strip()
+
+    _git(root, "checkout", "-qb", "review", fork_point)
+    _commit_file(root, "src/tandem/core/model.py", "x = 1", "hits the bottom line")
+    head = _git(root, "rev-parse", "HEAD").strip()
+    assert base != head
+
+    info = root / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "grafts").write_text(f"{base} {head}" + os.linesep, encoding="utf-8")
+
+    try:
+        collected = GitDiffSource(cwd=root).collect(base, head)
+    except DiffError as error:
+        # 明确报错也算合格：绝不能静默给出"没有改动"
+        assert "共同祖先" in str(error) or "grafts" in str(error)
+        return
+    assert "src/tandem/core/model.py" in collected.changes.paths, (
+        "grafts 伪造共同祖先以后，改动被藏掉了"
+    )
+    assert compute_level(collected.changes, load_policy()) is Level.D
+
+
+def test_git_calls_disable_commit_graph_and_grafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1：源仓库的 merge-base 与隔离仓库的每次读取都要关掉 commit-graph 与 grafts。"""
+    recorded: list[tuple[list[str], dict[str, str]]] = []
+    original = subprocess.run
+
+    def spy(command: list[str], **kwargs: object) -> object:
+        raw_env = kwargs.get("env")
+        env: dict[str, str] = dict(raw_env) if isinstance(raw_env, dict) else {}
+        recorded.append((list(command), env))
+        return original(command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    root = _make_repo(tmp_path)
+    _commit_file(root, "app.py", "y = 2\n", "change")
+    GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+
+    source_calls = [(argv, env) for argv, env in recorded if not env.get("GIT_OBJECT_DIRECTORY")]
+    isolated_calls = [(argv, env) for argv, env in recorded if env.get("GIT_OBJECT_DIRECTORY")]
+    assert source_calls and isolated_calls
+
+    merge_base_calls = [(argv, env) for argv, env in source_calls if "merge-base" in argv]
+    assert merge_base_calls, "没有跑到 merge-base"
+    for argv, env in merge_base_calls:
+        assert "core.commitGraph=false" in argv, argv
+        graft_file = env.get("GIT_GRAFT_FILE")
+        assert graft_file, "merge-base 必须让 git 读不到 grafts"
+
+    assert any("diff" in argv for argv in (argv for argv, _ in isolated_calls))
+    for argv, _ in isolated_calls:
+        assert "core.commitGraph=false" in argv, argv
