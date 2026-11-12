@@ -427,21 +427,17 @@ def advance(task: TaskRecord) -> Event:
     )
 
 
-@TRACE_SETTINGS
-@given(
-    level=st.sampled_from(list(Level)),
-    mode=st.sampled_from(list(RunMode)),
-    required=st.integers(2, 3),
-    prefix=st.integers(0, 9),
-    instructions=st.lists(
-        st.tuples(st.integers(0, 7), st.sampled_from(list(EventKind)), st.integers(0, 7)),
-        min_size=1,
-        max_size=200 if DEEP else 40,
-    ),
-)
-def test_generated_event_sequences(level, mode, required, prefix, instructions) -> None:
+def execute_trace(
+    level: Level,
+    mode: RunMode,
+    required: int,
+    prefix: int,
+    instructions: list[tuple[int, EventKind, int]],
+) -> list[TaskStatus]:
+    """跑一条轨迹：每一步都过一遍全部 oracle，返回访问过的状态（含起点）。"""
     policy = make_policy(mode, required)
     task = core.create_task("trace", level, policy)
+    visited: list[TaskStatus] = [task.status]
     green_sha: str | None = None
     human_sha: str | None = None
     # 记下"这一步发出去的审核席位"，作为下一步的输入证据：
@@ -502,6 +498,23 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
                 "outsider",
             )
             ev = event(task, EventKind.REVIEW, review=passing(task, outsider))
+        elif choice == 8:
+            # 岔路：把任务推向"待你介入 / 你处理中"（第 11/14b/15/20/23 条）。
+            # 随机均匀抽事件时这几条路几乎走不到：要连续三次验收失败才会到待你介入。
+            if task.status is TaskStatus.AWAITING_ACCEPTANCE:
+                ev = replace(ev, kind=EventKind.CI_RED, sha=task.latest_sha)
+            elif task.status is TaskStatus.NEEDS_INTERVENTION:
+                ev = replace(ev, kind=EventKind.TAKE_OVER)
+            elif task.status is TaskStatus.YOU_WORKING:
+                ev = replace(ev, kind=EventKind.YOU_SUBMITTED_CODE)
+        elif choice == 9:
+            # 终点：放弃（待你介入 → 失败）或打回/合并
+            if task.status is TaskStatus.NEEDS_INTERVENTION:
+                ev = replace(ev, kind=EventKind.ABANDON, reason="放弃")
+            elif task.status is TaskStatus.AWAITING_YOUR_REVIEW:
+                ev = replace(ev, kind=EventKind.YOUR_REJECTION, reason="打回")
+            elif task.status is TaskStatus.AWAITING_MERGE:
+                ev = replace(ev, kind=EventKind.MERGED, sha=task.approved_sha or task.latest_sha)
         before = task
         decision = check_pure(before, ev, policy, quota)
         if decision.changed and ev.kind is EventKind.CI_GREEN:
@@ -534,6 +547,125 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
         check_plan_approval(before, ev, decision)
         check_fresh(before, decision)
         task = decision.task
+        visited.append(task.status)
+    return visited
+
+
+@TRACE_SETTINGS
+@given(
+    level=st.sampled_from(list(Level)),
+    mode=st.sampled_from(list(RunMode)),
+    required=st.integers(2, 3),
+    prefix=st.integers(0, 9),
+    instructions=st.lists(
+        st.tuples(st.integers(0, 9), st.sampled_from(list(EventKind)), st.integers(0, 7)),
+        min_size=1,
+        max_size=200 if DEEP else 40,
+    ),
+)
+def test_generated_event_sequences(level, mode, required, prefix, instructions) -> None:
+    execute_trace(level, mode, required, prefix, instructions)
+
+
+# 确定性的轨迹配方：每条都写明它负责把生成器带到哪些状态。
+# 用固定输入而不是随机种子，避免"覆盖率断言偶尔变红"。
+COVERAGE_TRACES: list[tuple[Level, RunMode, int, int, list[tuple[int, EventKind, int]]]] = [
+    # 正常路径：待处理 → 处理中 → 待验收 → 待AI审核 → 待合并 → 已合并
+    (
+        Level.C,
+        RunMode.MULTI_AGENT,
+        2,
+        0,
+        [
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (9, EventKind.CREATED, 0),
+        ],
+    ),
+    # D 级：待你批准方案 → 待你审核
+    (
+        Level.D,
+        RunMode.MULTI_AGENT,
+        2,
+        0,
+        [
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+        ],
+    ),
+    # 岔路：验收失败三次 → 待你介入 → 你处理中
+    (
+        Level.C,
+        RunMode.MULTI_AGENT,
+        2,
+        0,
+        [
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (8, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (8, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (8, EventKind.CREATED, 0),
+            (8, EventKind.CREATED, 0),
+        ],
+    ),
+    # 终点：待你介入 → 失败；异常 → 已取消
+    (
+        Level.C,
+        RunMode.MULTI_AGENT,
+        2,
+        0,
+        [
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (8, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (8, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (0, EventKind.CREATED, 0),
+            (8, EventKind.CREATED, 0),
+            (9, EventKind.CREATED, 0),
+        ],
+    ),
+    (
+        Level.C,
+        RunMode.MULTI_AGENT,
+        2,
+        0,
+        [
+            (0, EventKind.CREATED, 0),
+            (1, EventKind.INCIDENT, 0),
+            (1, EventKind.CANCEL, 0),
+        ],
+    ),
+]
+
+
+def test_generator_reaches_every_state() -> None:
+    """P7：13 个状态每个都至少被生成器走到一次。
+
+    以前 NEEDS_INTERVENTION / YOU_WORKING / FAILED（以及 ERROR / CANCELLED）
+    在随机轨迹里一次都没出现，第 1/3/5 条不变量在这几个状态上只靠手写例子。
+    这里用固定的轨迹配方证明"生成器确实能走到"，随机轨迹由 choice 8/9 提高概率。
+    """
+    visited: set[TaskStatus] = set()
+    for level, mode, required, prefix, instructions in COVERAGE_TRACES:
+        visited.update(execute_trace(level, mode, required, prefix, instructions))
+    missing = sorted(status.name for status in set(TaskStatus) - visited)
+    assert not missing, f"generator never reached these states: {missing}"
 
 
 def walk(level: Level, kinds: list[EventKind], policy: Policy | None = None) -> TaskRecord:
