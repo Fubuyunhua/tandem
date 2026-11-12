@@ -10,6 +10,12 @@ Only durable events are replayed, through the real core decide, without executin
 any actions. Final action statuses are projected from the durable action table.
 This checks replay consistency with those inputs, not standalone log recovery or
 exactly-once delivery: claimed but unexecuted actions may remain SENT indefinitely.
+
+P8：这些 oracle 与外壳规则是两份独立实现，改规则时必须一起改。
+check_atomic / check_once / check_replay / check_version 分别对应
+`src/tandem/shell/store.py` 的 `commit`（一个事务 + `_write_task` 的版本校验）、
+`_insert_action`（动作编号只抢一次执行权）、`list_events` + `decide` 的重放语义、
+以及 `_write_task` 的 `state_version` 列与 payload 一致性。
 """
 
 from __future__ import annotations

@@ -5,6 +5,28 @@ No network, shell execution, or real agents are used. Review counts follow each
 level's policy. D assignments may request a plan; code needs plan approval and
 merging needs human approval bound to the current SHA. Plan approval must name
 the current plan's SHA, independently of the latest code SHA.
+
+P8（重要）：这些 oracle 与内核规则是**两份独立实现**，改规则时必须一起改。
+本文件里每个 check_* 都对应 `docs/design/task-lifecycle.md` 第七版的某几条
+和 `src/tandem/core/transition.py` 里的某个处理函数：
+
+| oracle | 任务书条目 | 内核位置 |
+|---|---|---|
+| check_ci / check_ci_sha | 第 9、10、12、19 条 | `_on_ci_green`、`_on_ci_red`、`_merge` |
+| check_separation | 第 12–16 条 | `_on_review`、`eligible_reviewers` |
+| check_review_count | 第 12–16 条 | `_on_review`、`_select_reviewers` |
+| check_terminal | 终点语义 + 清理核对 | `_dispatch` 的终点分支、`_on_cleanup_checked` |
+| check_version | 横切规则（版本号 +1） | `_transition` |
+| check_d | 第 2–5b、13、17、20 条 | `_on_plan_*`、`_on_your_approval` 等 |
+| check_approval_route | 第 6、17、20 条 | 同上的状态前置条件 |
+| check_approval_sha | 第 17、20 条（r4 问题 3） | 同上里的 `event.sha == latest_sha` |
+| check_plan_approval | 第 3、5b 条 | `_on_plan_approved` |
+| check_stale | 横切规则（过期/错位事件忽略） | `_dispatch` 入口的编号与版本号校验 |
+| check_pure | 纯函数约束 | `decide` |
+| check_fresh | 新提交作废旧证据 | `_drop_stale_evidence`、`_on_new_submission` |
+
+改内核规则时，先看这张表里有没有对应的 oracle：有就一起改，没有就先补一条，
+否则会出现"规则变了、测试还绿"的假绿。
 """
 
 from __future__ import annotations
