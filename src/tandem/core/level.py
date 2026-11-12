@@ -48,10 +48,19 @@ def _pattern_hits(pattern: str, path: str) -> bool:
     ``src/tandem/core/model.py``，符合 ADR 里 ``core/**``、``**/migrations/**``
     这种写法。
     """
+    # 跨平台采用保守的一致语义，Linux 上也不允许大小写变体逃过底线。
+    pattern, path = pattern.casefold(), path.casefold()
+    patterns = [pattern]
+    if pattern.startswith("**/"):
+        patterns.append(pattern[3:])
     candidates = [path]
     parts = path.split("/")
     candidates.extend("/".join(parts[index:]) for index in range(1, len(parts)))
-    return any(fnmatchcase(candidate, pattern) for candidate in candidates)
+    return any(
+        fnmatchcase(candidate, glob) or (glob.endswith("/**") and candidate == glob[:-3])
+        for candidate in candidates
+        for glob in patterns
+    )
 
 
 def _matches_any(patterns: tuple[str, ...], path: str) -> bool:
@@ -92,12 +101,24 @@ def bottom_line_reasons(changes: ChangeSet, policy: Policy) -> tuple[str, ...]:
         )
     # 删除文件本身是一条底线条目
     reasons.extend(f"删除了文件 {path}" for path in changes.deleted_paths)
+    reasons.extend(f"测试文件移出收集范围：{path}" for path in changes.removed_test_paths)
+    reasons.extend(
+        f"测试文件 {item.path}:{item.line} 新增静态弱化证据：{item.reason}"
+        for item in changes.test_weakenings
+    )
     paths, illegal = judged_paths(changes)
     if illegal:
         reasons.append("改动里有非法路径（绝对路径、空路径或含 .. 的路径）")
     for path in paths:
         if _matches_any(policy.bottom_line_paths, path):
             reasons.append(f"改动了底线条目相关的路径 {path}")
+    for entry in changes.file_changes:
+        for target in (entry.before_target, entry.after_target):
+            if target is None:
+                continue
+            clean = normalize_path(target)
+            if clean is None or _matches_any(policy.bottom_line_paths, clean):
+                reasons.append(f"符号链接 {entry.path} 指向受保护或仓库外路径 {target}")
     return tuple(reasons)
 
 
@@ -121,6 +142,21 @@ def all_paths_relaxable(changes: ChangeSet, policy: Policy) -> bool:
     if illegal or not paths:
         return False
     if hits_bottom_line(changes, policy):
+        return False
+    if not changes.file_changes:
+        return False
+    covered = {
+        clean
+        for entry in changes.file_changes
+        for path in (entry.path, entry.previous_path)
+        if path is not None and (clean := normalize_path(path)) is not None
+    }
+    if not set(paths) <= covered:
+        return False
+    if any(
+        entry.before_mode not in {"000000", "100644"} or entry.after_mode != "100644"
+        for entry in changes.file_changes
+    ):
         return False
     return all(
         _matches_any(policy.relaxable_paths, path) and _is_document(path, policy) for path in paths

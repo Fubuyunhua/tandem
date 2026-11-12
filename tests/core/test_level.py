@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tandem.core.level import base_level, compute_level, hits_bottom_line
-from tandem.core.model import ChangeSet, Level, Policy, Thresholds
+from tandem.core.model import ChangeSet, FileChange, Level, Policy, Thresholds
 from tandem.shell.config import load_policy
 
 
@@ -13,6 +13,12 @@ from tandem.shell.config import load_policy
 def policy() -> Policy:
     """用仓库里真实的 risk.yml，顺便守住配置文件本身。"""
     return load_policy()
+
+
+def _documents(*paths: str) -> ChangeSet:
+    return ChangeSet(
+        paths=paths, file_changes=tuple(FileChange(path, "100644", "100644") for path in paths)
+    )
 
 
 def _path_for_pattern(pattern: str) -> str:
@@ -95,12 +101,12 @@ def test_rename_within_docs_is_not_d(policy: Policy) -> None:
 
 
 def test_pure_docs_can_downgrade_to_b(policy: Policy) -> None:
-    changes = ChangeSet(paths=("docs/design/note.md", "README.md"))
+    changes = _documents("docs/design/note.md", "README.md")
     assert compute_level(changes, policy, Level.B) is Level.B
 
 
 def test_pure_docs_without_suggestion_stays_c(policy: Policy) -> None:
-    assert compute_level(ChangeSet(paths=("docs/note.md",)), policy) is Level.C
+    assert compute_level(_documents("docs/note.md"), policy) is Level.C
 
 
 def test_code_cannot_downgrade(policy: Policy) -> None:
@@ -110,7 +116,7 @@ def test_code_cannot_downgrade(policy: Policy) -> None:
 
 def test_absolute_lowest_is_b(policy: Policy) -> None:
     """最多降一级，最低到 B：建议 A 也只降到 B。"""
-    assert compute_level(ChangeSet(paths=("docs/note.md",)), policy, Level.A) is Level.B
+    assert compute_level(_documents("docs/note.md"), policy, Level.A) is Level.B
 
 
 def test_docs_mixed_with_code_cannot_downgrade(policy: Policy) -> None:
@@ -124,7 +130,7 @@ def test_model_can_raise_any_level(policy: Policy) -> None:
 
 
 def test_base_level_ignores_suggestion(policy: Policy) -> None:
-    assert base_level(ChangeSet(paths=("docs/note.md",)), policy) is Level.C
+    assert base_level(_documents("docs/note.md"), policy) is Level.C
     assert base_level(ChangeSet(), policy) is Level.A
 
 
@@ -149,8 +155,8 @@ def test_python_file_inside_docs_cannot_downgrade(policy: Policy) -> None:
 
 
 def test_pure_docs_by_extension_can_downgrade(policy: Policy) -> None:
-    assert compute_level(ChangeSet(paths=("docs/note.txt",)), policy, Level.B) is Level.B
-    assert compute_level(ChangeSet(paths=("docs/note.rst",)), policy, Level.B) is Level.B
+    assert compute_level(_documents("docs/note.txt"), policy, Level.B) is Level.B
+    assert compute_level(_documents("docs/note.rst"), policy, Level.B) is Level.B
 
 
 def test_markdown_outside_the_relaxable_directories_is_not_relaxable(policy: Policy) -> None:
@@ -177,12 +183,12 @@ def test_illegal_paths_are_d_level(path: str, policy: Policy) -> None:
 
 
 def test_backslashes_are_normalized(policy: Policy) -> None:
-    assert compute_level(ChangeSet(paths=(r"docs\note.md",)), policy, Level.B) is Level.B
+    assert compute_level(_documents(r"docs\note.md"), policy, Level.B) is Level.B
     assert compute_level(ChangeSet(paths=(r"src\tandem\core\model.py",)), policy) is Level.D
 
 
 def test_leading_dot_slash_is_normalized(policy: Policy) -> None:
-    assert compute_level(ChangeSet(paths=("./docs/note.md",)), policy, Level.B) is Level.B
+    assert compute_level(_documents("./docs/note.md"), policy, Level.B) is Level.B
 
 
 def test_rename_with_illegal_path_is_d(policy: Policy) -> None:

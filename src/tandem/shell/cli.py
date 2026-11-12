@@ -17,6 +17,7 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
@@ -367,7 +368,7 @@ def _demo_receipt(task_id: str, attempt: int, conclusion: str) -> str:
         {
             "task_id": task_id,
             "attempt": attempt,
-            "sha": f"demo-{task_id}-{attempt}",
+            "sha": sha256(f"demo-{task_id}-{attempt}".encode()).hexdigest()[:40],
         },
     )
 
@@ -378,7 +379,7 @@ def _demo_plan_receipt(task_id: str, attempt: int, plan: str) -> str:
         {
             "task_id": task_id,
             "attempt": attempt,
-            "sha": f"demo-{task_id}-plan",
+            "sha": sha256(f"demo-{task_id}-plan".encode()).hexdigest()[:40],
             "plan": plan,
         },
     )
