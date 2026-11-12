@@ -848,6 +848,9 @@ def _on_ci_red(task: TaskRecord, event: Event, policy: Policy) -> Decision:
             reviews=(),
             designated_reviewers=(),
         )
+    # K4（用户 2026-11-12 拍板）：验收失败次数**不**因新提交清零，跨提交累积。
+    # 有意为之：上限要能约束"不停换一个提交重试"的 Agent；清零等于让换提交成为
+    # 绕过 R01 的手段。代价是同一个任务的历史失败一直占着配额，达到上限就找你。
     failures = task.accept_failures + 1
     limit = policy.thresholds.max_accept_failures
     reason = event.reason or "CI 没有给出原因"

@@ -2079,3 +2079,28 @@ def test_k7_reason_explains_why_the_level_stayed() -> None:
     )
     assert "保持 D" in decision.task.reason
     assert "本次改动算出" in decision.task.reason
+
+
+# ------------------------------------------------- K4：换了新提交，验收失败次数不清零
+
+
+def test_k4_accept_failures_accumulate_across_new_submissions() -> None:
+    """K4（2026-11-12 拍板）：失败次数跨提交累积，所以换新提交也不会重置。
+
+    三次失败可以来自三个不同的提交；第三次就到上限，进入"待你介入"（R01）。
+    反过来如果每次新提交都把计数清零，Agent 就能靠不停换提交无限重试。
+    """
+    record = to_working(new_task())
+    for index in range(2):
+        record = to_acceptance(record, sha=f"{index + 1}" * 40)
+        record = run(record, ev(EventKind.CI_RED, sha=record.latest_sha, reason="测试没过")).task
+        assert record.status is TaskStatus.PENDING
+        assert record.accept_failures == index + 1
+        record = to_working(record)
+
+    # 第三次换一个"全新"的提交，仍然失败：计数累加到上限，进入 R01
+    record = to_acceptance(record, sha="3" * 40)
+    decision = run(record, ev(EventKind.CI_RED, sha=record.latest_sha, reason="还是没过"))
+    assert decision.task.accept_failures == 3
+    assert decision.task.status is TaskStatus.NEEDS_INTERVENTION
+    assert decision.task.error_code == "R01"
