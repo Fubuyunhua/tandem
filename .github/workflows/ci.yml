@@ -1,7 +1,7 @@
 name: CI
 
-# 只用 push 和 pull_request 触发。不要用 pull_request_target：
-# 它会让外部 fork 提交的代码拿到仓库的权限和密钥。
+# 普通 CI 会执行 PR 代码，因此只用 push 和 pull_request，不能用 pull_request_target。
+# risk-gate 的受限模式是例外：它只运行可信 base，PR head 仅作为 Git 数据读取。
 on:
   push:
     branches: [main]
@@ -26,3 +26,5 @@ jobs:
         run: uv run pyright
       - name: 测试（含内核纯度检查）
         run: uv run pytest
+      - name: 冒烟测试（跑一遍 demo）
+        run: uv run tandem demo

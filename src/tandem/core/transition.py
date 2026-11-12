@@ -1,0 +1,1518 @@
+"""决策中心：`decide()` 实现 `docs/design/task-lifecycle.md` 第七版的 #1–#27 和取消表。
+
+内核只做判断：输入是任务记录、事件、策略、额度快照、当前时间，
+输出是新的任务记录和动作清单。外壳负责保存和真正执行这些动作。
+
+几条横切规则在这里统一处理：
+- 事件带了状态版本号但对不上 → 忽略，不改任何东西；
+- 已取消的任务后来又收到回执 → 忽略；
+- 有新提交进来 → 针对旧提交的审核结论、批准、否决全部作废；
+- 审核者只能来自不同提供方，且不能是写过这次代码的提供方。
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime
+from typing import assert_never
+
+from tandem.core.identity import is_commit_oid
+from tandem.core.level import bottom_line_reasons, compute_level
+from tandem.core.model import (
+    Action,
+    ActionKind,
+    ActionStatus,
+    ActionUpdate,
+    ChangeSet,
+    CheckResult,
+    Decision,
+    Event,
+    EventKind,
+    Finding,
+    Level,
+    OpenFinding,
+    PlanEntry,
+    Policy,
+    QuotaSnapshot,
+    Review,
+    RunMode,
+    TaskRecord,
+    TaskStatus,
+    Verdict,
+)
+
+# 写手是"你"时记在 writer 字段里的名字
+HUMAN_WRITER = "you"
+
+
+def create_task(task_id: str, level: Level, policy: Policy) -> TaskRecord:
+    """新任务的初始记录。等级由外壳按提交时的改动算好传进来。"""
+    return TaskRecord(task_id=task_id, level=level, run_mode=policy.run_mode)
+
+
+class _Actions:
+    """动作清单构造器。
+
+    ``action_id`` 由"任务编号 + 目标状态版本号 + 序号"组成，是确定性的，
+    重放同样的输入会得到同样的编号。
+    """
+
+    def __init__(self, task: TaskRecord, version: int) -> None:
+        self._task = task
+        self._version = version
+        self.items: list[Action] = []
+
+    def add(self, kind: ActionKind, detail: str = "", provider: str | None = None) -> None:
+        self.items.append(
+            Action(
+                action_id=f"{self._task.task_id}:{self._version}:{len(self.items)}",
+                kind=kind,
+                task_id=self._task.task_id,
+                detail=detail,
+                provider=provider,
+            )
+        )
+
+
+def _ignore(task: TaskRecord, why: str) -> Decision:
+    """这个事件不改变任何东西。"""
+    return Decision(task=task, actions=[], reason=why, changed=False)
+
+
+def _append_note(note: str, extra: str) -> str:
+    """把一句说明追加到备注后面；原来没有备注时不留一个孤立的分隔符。"""
+    return f"{note}｜{extra}" if note.strip() else extra
+
+
+def _forget_pr_evidence() -> dict[str, object]:
+    """PR 已关闭（不会再合并）时，挂在那个 PR 上的证据一起作废。
+
+    和 ``_drop_stale_evidence`` 是一个思路，只是触发条件不是"换了提交编号"，
+    而是"这个 PR 不存在了"：CI 绿、你批准的提交、这一轮的审核结论、审核席位、
+    pr_opened 都不能留给下一个 PR 复用。``latest_sha`` 保留——提交本身还在。
+    """
+    return {
+        "pr_opened": False,
+        "ci_green": False,
+        "approved_sha": None,
+        "reviews": (),
+        "designated_reviewers": (),
+        "returned_from_review": False,
+    }
+
+
+def _drop_stale_evidence(task: TaskRecord, changes: dict[str, object]) -> dict[str, object]:
+    """换提交编号时，旧提交的证据一律作废。
+
+    "证据"指那些绑定某一个提交编号的结论：CI 是否绿、你批准的是哪个提交、
+    这一轮的有效审核结论、以及这次指定的审核席位。只要 ``latest_sha`` 变了，
+    它们就都不能跟到新提交上，否则会出现"新提交带着旧提交的 CI 绿"这种假证据。
+    显式传了值的调用方优先（目前没有任何路径需要在新提交上沿用旧证据）。
+    """
+    sha = changes.get("latest_sha")
+    if not isinstance(sha, str) or sha == task.latest_sha:
+        return changes
+    invalidated: dict[str, object] = {
+        "ci_green": False,
+        "approved_sha": None,
+        "reviews": (),
+        "designated_reviewers": (),
+        "returned_from_review": False,
+    }
+    merged = dict(invalidated)
+    merged.update(changes)
+    return merged
+
+
+def _transition(
+    task: TaskRecord,
+    status: TaskStatus,
+    reason: str,
+    actions: list[Action],
+    **changes: object,
+) -> Decision:
+    """进入下一个状态：状态版本号 +1，动作记进任务记录。
+
+    换提交编号时自动作废旧证据（见 ``_drop_stale_evidence``），
+    这样每条转换都不用自己记得清 CI 绿、批准和审核席位。
+    """
+    updated = replace(
+        task,
+        status=status,
+        state_version=task.state_version + 1,
+        reason=reason,
+        **_drop_stale_evidence(task, changes),
+    )
+    return Decision(
+        task=updated.with_actions(tuple(actions)), actions=actions, reason=reason, changed=True
+    )
+
+
+def eligible_reviewers(
+    task: TaskRecord,
+    policy: Policy,
+    quota: QuotaSnapshot,
+    extra_excluded: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """合格的审核者：不同提供方、有额度、没写过这次代码。"""
+    excluded = task.providers_involved | set(extra_excluded)
+    result: list[str] = []
+    for provider in policy.reviewer_providers:
+        if provider in excluded:
+            continue
+        if not quota.has_quota(provider):
+            continue
+        result.append(provider)
+    return tuple(result)
+
+
+def _select_reviewers(
+    task: TaskRecord,
+    policy: Policy,
+    quota: QuotaSnapshot,
+    extra_excluded: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """按等级要求的家数挑审核者。凑不齐就返回空，由第 16 条处理。"""
+    needed = policy.rule_for(task.level).min_reviewers
+    candidates = eligible_reviewers(task, policy, quota, extra_excluded)
+    if len(candidates) < needed:
+        return ()
+    return candidates[:needed]
+
+
+def _current_reviews(task: TaskRecord) -> tuple[Review, ...]:
+    return task.current_reviews()
+
+
+def _reviews_by_provider(reviews: tuple[Review, ...]) -> dict[str, Review]:
+    """按提供方去重：一家提供方只能算一票。
+
+    审核者的名字（"codex"、"codex-session-2"）只是会话名，独立性按模型提供方算。
+    """
+    grouped: dict[str, Review] = {}
+    for review in reviews:
+        grouped.setdefault(review.provider, review)
+    return grouped
+
+
+def merge_blocker(task: TaskRecord, policy: Policy, *, human: bool = False) -> tuple[str, ...]:
+    """放行的统一不变量：任何产生 MERGE 动作的路径都要先过这里。
+
+    检查用的是"进入这一条转换之前的记录"，所以：
+    - 已挂着的批准必须是给当前提交编号的（不是某一版旧提交的）；
+    - ``human=False`` 表示凭 AI 审核证据放行，此时席位里不能有写过这次代码的人；
+      ``human=True`` 表示你明确的人工批准，席位不作为证据核对，
+      但"写过代码的不能投审核票"这条在接收结论时照旧生效。
+
+    返回非空表示不允许合并，元组里是原因（写进日志）。
+    """
+    reasons: list[str] = []
+    if not task.ci_green:
+        reasons.append("当前提交编号的 CI 不是绿的")
+    if task.latest_sha is None:
+        reasons.append("任务没有提交编号")
+    if task.approved_sha is not None and task.approved_sha != task.latest_sha:
+        reasons.append("批准的提交编号和当前的不一致")
+    if task.latest_sha is not None and not human:
+        intruders = set(task.designated_reviewers) & task.providers_involved
+        if intruders:
+            reasons.append(f"审核者里有人写过这次代码：{'、'.join(sorted(intruders))}")
+    return tuple(reasons)
+
+
+def _merge(
+    task: TaskRecord,
+    policy: Policy,
+    reason: str,
+    actions: _Actions,
+    blocked_record: TaskRecord | None = None,
+    *,
+    human: bool = False,
+    **changes: object,
+) -> Decision:
+    """唯一产生 MERGE 动作的出口。
+
+    守卫看的是传进来的 ``task``（进入这条转换之前的记录），而不是加完
+    ``changes`` 之后的样子，否则"这次刚写进去的 approved_sha"会把自己检查掉。
+
+    守卫不过时：默认把这个事件当作没生效（忽略），
+    传了 ``blocked_record`` 就把"审核结论"记下来、状态留在原地（第 12 条用）。
+    """
+    candidate = replace(task, **changes)
+    blockers = merge_blocker(task, policy, human=human)
+    if blockers:
+        message = "；".join(blockers)
+        if blocked_record is None:
+            return _ignore(task, f"{reason}；但不能合并：{message}")
+        actions.add(ActionKind.NOTIFY, detail=f"不能合并：{message}")
+        return _transition(
+            blocked_record,
+            blocked_record.status,
+            f"{reason}；但不能合并：{message}",
+            actions.items,
+        )
+    actions.add(ActionKind.MERGE, detail=reason)
+    return _transition(candidate, TaskStatus.AWAITING_MERGE, reason, actions.items)
+
+
+def decide(
+    task: TaskRecord,
+    event: Event,
+    policy: Policy,
+    quota: QuotaSnapshot,
+    now: datetime,
+) -> Decision:
+    """内核主函数。纯函数：同样的输入总是得到同样的输出。"""
+    result = _dispatch(task, event, policy, quota)
+    if result.changed:
+        # 时间只作为参数传进来，内核里不读时钟
+        result = replace(result, task=replace(result.task, updated_at=now))
+    return result
+
+
+def _dispatch(
+    task: TaskRecord,
+    event: Event,
+    policy: Policy,
+    quota: QuotaSnapshot,
+) -> Decision:
+    if event.task_id != task.task_id:
+        return _ignore(task, "事件的任务编号和任务记录不一致")
+    # 格式只在入口核对；处理函数只核对身份是否与当前任务/方案相同。
+    plan_event = event.kind in {EventKind.PLAN_SUBMITTED, EventKind.PLAN_APPROVED}
+    if ((event.sha is not None or plan_event) and not is_commit_oid(event.sha)) or (
+        event.review is not None and not is_commit_oid(event.review.sha)
+    ):
+        return _ignore(task, "提交编号必须是完整的 40/64 位十六进制 OID")
+    if event.state_version is not None and event.state_version != task.state_version:
+        return _ignore(
+            task,
+            f"事件带的版本号 {event.state_version} 和任务当前的 {task.state_version} 不一致",
+        )
+    if task.status.is_terminal:
+        # 终点的精确语义（给 task-006 的性质测试用）：
+        # 1. 状态永不改变——终点没有任何出边，任何事件都不会让任务离开终点；
+        # 2. 唯一的例外是 CLEANUP_CHECKED：它只把已经发出的清理动作标成
+        #    "已完成/已放弃"，顺带写 cleanup_checked 和一句说明；
+        # 3. 除了"动作状态 + cleanup_checked + cleanup_action_ids + note/reason
+        #    + state_version + updated_at"，其余字段（等级、提交编号、批准、
+        #    审核结论、席位、方案、CI 标记、pr_opened、写手、计数……）
+        #    在终点之后一律不再变化；updated_at 是记录时间戳，decide() 统一写入；
+        # 4. 版本号会 +1，因为任务记录的每次变化都要留一版，重放才对得上——
+        #    这是记录版本，不是状态转换。
+        if event.kind is EventKind.CLEANUP_CHECKED:
+            return _on_cleanup_checked(task, event)
+        return _ignore(task, f"任务已经结束（{task.status.value}），事件直接丢弃")
+
+    match event.kind:
+        case EventKind.CREATED:
+            return _ignore(task, "任务创建事件只给日志用，内核不改状态")
+        case EventKind.ASSIGN:
+            return _on_assign(task, event, policy, quota)
+        case EventKind.PLAN_SUBMITTED:
+            return _on_plan_submitted(task, event, policy)
+        case EventKind.PLAN_APPROVED:
+            return _on_plan_approved(task, event)
+        case EventKind.PLAN_REJECTED:
+            return _on_plan_rejected(task, event)
+        case EventKind.CODE_SUBMITTED:
+            return _on_code_submitted(task, event, policy)
+        case EventKind.REFUSED_TO_FIX:
+            return _on_refused_to_fix(task, event)
+        case EventKind.QUOTA_EXHAUSTED:
+            return _on_quota_exhausted(task, event, policy, quota)
+        case EventKind.INCIDENT:
+            return _on_incident(task, event)
+        case EventKind.CI_GREEN:
+            return _on_ci_green(task, event, policy, quota)
+        case EventKind.CI_RED:
+            return _on_ci_red(task, event, policy)
+        case EventKind.REVIEW:
+            return _on_review(task, event, policy)
+        case EventKind.YOUR_APPROVAL:
+            return _on_your_approval(task, event, policy)
+        case EventKind.YOUR_REJECTION:
+            return _on_your_rejection(task, event)
+        case EventKind.MERGED:
+            return _on_merged(task, event)
+        case EventKind.INTERVENTION_APPROVED:
+            return _on_intervention_approved(task, event, policy)
+        case EventKind.REWORK:
+            return _on_rework(task, event)
+        case EventKind.STANDARD_CHANGED:
+            return _on_standard_changed(task, event, policy, quota)
+        case EventKind.TAKE_OVER:
+            return _on_take_over(task)
+        case EventKind.YOU_SUBMITTED_CODE:
+            return _on_you_submitted_code(task, event, policy)
+        case EventKind.ABANDON:
+            return _on_abandon(task, event)
+        case EventKind.RETRY:
+            return _on_retry(task, event, policy)
+        case EventKind.CANCEL:
+            return _on_cancel(task)
+        case EventKind.CLEANUP_CHECKED:
+            return _ignore(task, "只有终点任务的清理动作才能这样做核对")
+        case _:  # pragma: no cover - 新增事件类型时 pyright 会在这里报错
+            assert_never(event.kind)
+
+
+# ---------------------------------------------------------------- 第 1–7 条
+
+
+def _on_assign(task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnapshot) -> Decision:
+    """1. 待处理 → 处理中：写手有额度；多 Agent 模式下还要凑得齐审核者。"""
+    if task.status is not TaskStatus.PENDING:
+        return _ignore(task, "只有待处理的任务才会派活")
+    writer = event.provider if event.provider is not None else policy.default_writer
+    if writer not in policy.writer_providers:
+        return _ignore(task, f"{writer} 不是能写代码的提供方")
+    if not quota.has_quota(writer):
+        return _ignore(task, f"{writer} 额度用完，下次换一家")
+
+    rule = policy.rule_for(task.level)
+    if task.run_mode is RunMode.MULTI_AGENT and rule.requires_ai_review:
+        reviewers = eligible_reviewers(task, policy, quota, extra_excluded=(writer,))
+        if len(reviewers) < rule.min_reviewers:
+            return _ignore(
+                task, f"多 Agent 模式下需要 {rule.min_reviewers} 家合格审核者，现在凑不齐"
+            )
+
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.START_AGENT, detail=f"把任务派给 {writer}", provider=writer)
+    return _transition(
+        task,
+        TaskStatus.WORKING,
+        f"派活给 {writer}",
+        actions.items,
+        writer=writer,
+        writer_is_human=False,
+        providers_involved=task.providers_involved | {writer},
+        attempt=task.attempt + 1,
+    )
+
+
+def escalation_plan(task: TaskRecord, sha: str, changes: ChangeSet, policy: Policy) -> PlanEntry:
+    """把"按真实改动升成 D 级"的这次提交写成方案内容。
+
+    三个入口（处理中交回代码 #5b、审核期间的新提交、你接手后的人工提交）都用它，
+    保证存进记录的版本号、提交编号、正文和底线原因完全一致——否则批的就是
+    "一个不存在的方案"。
+    """
+    version = task.plan_version + 1
+    reasons = "；".join(bottom_line_reasons(changes, policy)) or "无"
+    return PlanEntry(
+        version=version,
+        sha=sha,
+        text=(
+            f"第 {version} 版方案：没有文字方案，内容就是提交 {sha} 的改动，涉及的底线：{reasons}"
+        ),
+    )
+
+
+def _on_plan_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """2. 处理中 → 待你批准方案：D 级，并且当前这版方案还没批准。"""
+    if task.status is not TaskStatus.WORKING:
+        return _ignore(task, "只有在处理中的任务才会交回方案")
+    rule = policy.rule_for(task.level)
+    if not rule.requires_plan_approval:
+        return _ignore(task, f"{task.level.value} 级不需要你批准方案，方案留作记录")
+    plan_sha = (event.sha or "").strip()
+    if not plan_sha:
+        # 方案必须能绑定到某一个提交，否则批准无法核对（r4 问题 3、r5 问题 3）
+        return _ignore(
+            task, "方案回执没有带可用的提交编号（空白也算没带），拒收：方案必须绑定一个提交"
+        )
+    plan_version = task.plan_version + 1
+    if task.approved_plan_version == plan_version:
+        return _ignore(task, f"第 {plan_version} 版方案已经批准过了")
+
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(
+        ActionKind.NOTIFY, detail=f"{task.level.value} 级需要你先批准第 {plan_version} 版方案"
+    )
+    entry = PlanEntry(
+        version=plan_version,
+        sha=plan_sha,
+        text=event.plan or "",
+    )
+    return _transition(
+        task,
+        TaskStatus.AWAITING_PLAN_APPROVAL,
+        f"交回第 {plan_version} 版方案，等你批准",
+        actions.items,
+        plan_version=plan_version,
+        plan_history=task.plan_history + (entry,),
+        latest_sha=plan_sha,
+        note=event.plan or task.note,
+    )
+
+
+def _on_plan_approved(task: TaskRecord, event: Event) -> Decision:
+    """3. 待你批准方案 → 待处理：记下批准的是哪一版方案。"""
+    if task.status is not TaskStatus.AWAITING_PLAN_APPROVAL:
+        return _ignore(task, "只有待你批准方案的任务才会批准方案")
+    entry = task.plan()
+    expected_sha = entry.sha if entry is not None and entry.sha else (task.latest_sha or "")
+    if not expected_sha:
+        # 旧任务：这版方案既没绑定提交编号、任务也没有最新提交编号，
+        # 核对不了就不算匹配，要求重新交一版有编号的方案。
+        return _ignore(
+            task,
+            "这版方案没有绑定提交编号，核对不了；请让写手重新交一版带提交编号的方案",
+        )
+    given_sha = (event.sha or "").strip()
+    if not given_sha or given_sha != expected_sha:
+        return _ignore(
+            task,
+            f"你批准方案要带上你看到的那一版方案的提交编号（{expected_sha}），对不上就不生效",
+        )
+    actions = _Actions(task, task.state_version + 1)
+    # 写手是你时，批准完方案回到"你处理中"，你可以接着提交自己已经写好的代码；
+    # 写手是 Agent 时回到"待处理"，等重新派活。
+    target = TaskStatus.YOU_WORKING if task.writer_is_human else TaskStatus.PENDING
+    actions.add(
+        ActionKind.NOTIFY, detail=f"第 {task.plan_version} 版方案已批准，回到{target.value}"
+    )
+    return _transition(
+        task,
+        target,
+        f"你批准了第 {task.plan_version} 版方案",
+        actions.items,
+        approved_plan_version=task.plan_version,
+    )
+
+
+def _on_plan_rejected(task: TaskRecord, event: Event) -> Decision:
+    """4. 待你批准方案 → 待处理：带你的意见。"""
+    if task.status is not TaskStatus.AWAITING_PLAN_APPROVAL:
+        return _ignore(task, "只有待你批准方案的任务才会打回方案")
+    reason = event.reason or "你没有写意见"
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.NOTIFY, detail="方案被打回，等写手重做方案")
+    return _transition(
+        task,
+        TaskStatus.PENDING,
+        f"你打回了第 {task.plan_version} 版方案：{reason}",
+        actions.items,
+        approved_plan_version=None,
+        note=reason,
+    )
+
+
+# 这些状态下都允许接收新代码：新提交让旧的审核、批准、否决全部作废
+NEW_SUBMISSION_STATES = frozenset(
+    {
+        TaskStatus.AWAITING_ACCEPTANCE,
+        TaskStatus.AWAITING_AI_REVIEW,
+        TaskStatus.AWAITING_YOUR_REVIEW,
+        TaskStatus.NEEDS_INTERVENTION,
+        TaskStatus.ERROR,
+        TaskStatus.AWAITING_MERGE,
+    }
+)
+
+
+def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """5 / 5b. 处理中 → 待验收，或者重新算级别后升成 D 级 → 待你批准方案。"""
+    if task.status is not TaskStatus.WORKING:
+        if task.status in NEW_SUBMISSION_STATES:
+            return _on_new_submission(task, event, policy)
+        return _ignore(task, f"{task.status.value}时不该收到代码回执")
+    if event.sha is None or event.attempt is None or event.changes is None:
+        return _ignore(task, "回执缺少任务编号、第几次尝试或提交编号，按无效回执处理")
+    if event.attempt != task.attempt:
+        return _ignore(
+            task, f"回执带的是第 {event.attempt} 次尝试，和当前第 {task.attempt} 次对不上"
+        )
+
+    # 按真实改动重新算级别（每次都重算，不沿用上一次的结果）
+    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    rule = policy.rule_for(new_level)
+    plan_pending = rule.requires_plan_approval and task.approved_plan_version != task.plan_version
+    actions = _Actions(task, task.state_version + 1)
+
+    if plan_pending:
+        # 5b 没有文字方案：把这次交回的代码当作本版方案的内容
+        entry = escalation_plan(task, event.sha, event.changes, policy)
+        actions.add(ActionKind.NOTIFY, detail="按真实改动算出 D 级，要先批准方案")
+        return _transition(
+            task,
+            TaskStatus.AWAITING_PLAN_APPROVAL,
+            f"按真实改动重新算出来是 {new_level.value} 级，方案还没批准",
+            actions.items,
+            level=new_level,
+            plan_version=entry.version,
+            plan_history=task.plan_history + (entry,),
+            latest_sha=event.sha,
+            approved_sha=None,
+            reviews=(),
+            designated_reviewers=(),
+            ci_green=False,
+            returned_from_review=False,
+        )
+
+    actions.add(ActionKind.NOTIFY, detail=f"交回代码（第 {task.attempt} 次尝试），等 CI")
+    return _transition(
+        task,
+        TaskStatus.AWAITING_ACCEPTANCE,
+        f"交回代码 {event.sha}，按真实改动算出来是 {new_level.value} 级",
+        actions.items,
+        level=new_level,
+        # 新提交让旧结论、批准、否决、旧审核席位全部作废
+        latest_sha=event.sha,
+        approved_sha=None,
+        reviews=(),
+        designated_reviewers=(),
+        ci_green=False,
+        pr_opened=True,
+        returned_from_review=False,
+        note=event.reason or "",
+    )
+
+
+def _on_new_submission(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """审核、验收、待合并期间来了新提交。
+
+    更新提交编号、作废旧审核结论和批准、重新算级别，然后回到验收
+    （升成 D 级且方案没批准时，先回到方案批准）。
+    """
+    if event.sha is None or event.attempt is None or event.changes is None:
+        return _ignore(task, "新提交缺少提交编号、尝试次数或真实改动，按无效回执处理")
+    if event.attempt < task.attempt:
+        return _ignore(task, f"收到的是第 {event.attempt} 次尝试的回执，比当前的还早，忽略")
+    if task.status is TaskStatus.AWAITING_MERGE and any(
+        action.kind is ActionKind.MERGE for action in task.actions
+    ):
+        return _ignore(task, "合并已经开始，新提交先记下，等核对合并结果后再决定")
+
+    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    rule = policy.rule_for(new_level)
+    plan_approved = (
+        task.approved_plan_version is not None and task.approved_plan_version == task.plan_version
+    )
+    actions = _Actions(task, task.state_version + 1)
+    invalidated: dict[str, object] = {
+        "level": new_level,
+        "latest_sha": event.sha,
+        "approved_sha": None,
+        "reviews": (),
+        # 旧审核席位也一起作废：过期的席位不能当成本次的审核证据
+        "designated_reviewers": (),
+        "ci_green": False,
+        "pr_opened": True,
+        "returned_from_review": False,
+        "attempt": max(task.attempt, event.attempt),
+        "note": event.reason or "",
+    }
+    if rule.requires_plan_approval and not plan_approved:
+        entry = escalation_plan(task, event.sha, event.changes, policy)
+        actions.add(ActionKind.NOTIFY, detail="新提交升成 D 级，要先批准方案")
+        return _transition(
+            task,
+            TaskStatus.AWAITING_PLAN_APPROVAL,
+            f"新提交 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
+            actions.items,
+            plan_version=entry.version,
+            plan_history=task.plan_history + (entry,),
+            **invalidated,
+        )
+    actions.add(ActionKind.NOTIFY, detail=f"收到新提交 {event.sha}，旧结论全部作废，重新验收")
+    return _transition(
+        task,
+        TaskStatus.AWAITING_ACCEPTANCE,
+        f"新提交 {event.sha}（{new_level.value} 级），旧审核结论和批准全部作废",
+        actions.items,
+        **invalidated,
+    )
+
+
+def _on_refused_to_fix(task: TaskRecord, event: Event) -> Decision:
+    """6. 处理中 → 待你介入：写手拒绝修改，取消仲裁。"""
+    if task.status is not TaskStatus.WORKING:
+        return _ignore(task, "只有在处理中的任务才会拒绝修改")
+    if not task.returned_from_review:
+        return _ignore(task, "上一轮不是被审核退回的，拒绝修改不生效")
+    reason = event.reason or "写手没有写理由"
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.NOTIFY, detail="写手拒绝修改，等你决定")
+    # 备注里按短键列出待回应的意见，方便你在手机上先看个大概
+    pending = "；".join(f"{finding.short_key} {finding.text}" for finding in task.open_findings)
+    return _transition(
+        task,
+        TaskStatus.NEEDS_INTERVENTION,
+        f"写手拒绝修改：{reason}",
+        actions.items,
+        note=f"{reason}｜待回应意见：{pending}" if pending else reason,
+        returned_from_review=False,
+    )
+
+
+def _on_quota_exhausted(
+    task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnapshot
+) -> Decision:
+    """7. 处理中 → 待处理：额度用完，把这一家标记为用完，下次换一家。"""
+    if task.status is TaskStatus.AWAITING_AI_REVIEW:
+        return _on_reviewer_unavailable(task, event, policy, quota)
+    if task.status is not TaskStatus.WORKING:
+        return _ignore(task, "只有在处理中或待 AI 审核时才会报额度用完")
+    provider = event.provider or task.writer or policy.default_writer
+    progress = event.reason or "没有写进度说明"
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(
+        ActionKind.SET_QUOTA_EXHAUSTED,
+        detail=f"{provider} 额度用完（额度是估计值）",
+        provider=provider,
+    )
+    actions.add(ActionKind.STOP_AGENT, detail=f"结束 {provider} 的进程", provider=provider)
+    actions.add(ActionKind.NOTIFY, detail=f"{provider} 额度用完，已退回待处理")
+    return _transition(
+        task,
+        TaskStatus.PENDING,
+        f"{provider} 额度用完，换一家接着做；进度：{progress}",
+        actions.items,
+        note=f"额度是估计值。{progress}",
+        returned_from_review=False,
+    )
+
+
+def _on_reviewer_unavailable(
+    task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnapshot
+) -> Decision:
+    """第 16 条：审核途中审核者失效，按当前额度和参与历史重新检查审核者家数。"""
+    gone = event.provider or "某一方"
+    rule = policy.rule_for(task.level)
+    remaining = tuple(
+        seat
+        for seat in eligible_reviewers(task, policy, quota, extra_excluded=(gone,))
+        if seat in task.designated_reviewers
+    )
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(
+        ActionKind.SET_QUOTA_EXHAUSTED,
+        detail=f"{gone} 额度用完（额度是估计值）",
+        provider=gone,
+    )
+    if len(remaining) < rule.min_reviewers:
+        actions.add(ActionKind.NOTIFY, detail=f"{gone} 用不了，凑不齐合格的审核者")
+        return _transition(
+            task,
+            TaskStatus.NEEDS_INTERVENTION,
+            f"R03 {gone} 用不了，凑不齐 {rule.min_reviewers} 家审核者",
+            actions.items,
+            error_code="R03",
+            designated_reviewers=remaining,
+            note=task.note or f"审核者 {gone} 失效",
+        )
+    actions.add(ActionKind.NOTIFY, detail=f"{gone} 用不了，剩下的 {len(remaining)} 家继续审")
+    return _transition(
+        task,
+        TaskStatus.AWAITING_AI_REVIEW,
+        f"{gone} 用不了，剩下的 {len(remaining)} 家审核者继续审",
+        actions.items,
+        designated_reviewers=remaining,
+    )
+
+
+# ---------------------------------------------------------------- 第 8–11 条
+
+
+def _on_incident(task: TaskRecord, event: Event) -> Decision:
+    """8. 各种进行中的状态 → 异常：记下出问题前的状态和没确认的动作。"""
+    if task.status not in {
+        TaskStatus.WORKING,
+        TaskStatus.AWAITING_ACCEPTANCE,
+        TaskStatus.AWAITING_AI_REVIEW,
+        TaskStatus.AWAITING_MERGE,
+    }:
+        return _ignore(task, f"任务在 {task.status.value}，这里不该有意外事件")
+    unconfirmed = [action.action_id for action in task.actions if action.status.is_unconfirmed]
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.STOP_AGENT, detail="结束可能还在跑的进程")
+    actions.add(ActionKind.NOTIFY, detail="任务出现异常，等你处理")
+    return _transition(
+        task,
+        TaskStatus.ERROR,
+        f"意外：{event.reason or event.error_code or '未说明'}",
+        actions.items,
+        status_before_error=task.status,
+        error_code=event.error_code or "E01",
+        note=f"还没确认完成的动作：{', '.join(unconfirmed) if unconfirmed else '无'}",
+    )
+
+
+def _on_ci_green(task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnapshot) -> Decision:
+    """9 / 9b. 待验收 → 待AI审核（多 Agent 模式），或者 → 待你审核（单 Agent 模式）。"""
+    if task.status is not TaskStatus.AWAITING_ACCEPTANCE:
+        return _ignore(task, "只有在待验收的任务才会收到 CI 结果")
+    if task.latest_sha is None or event.sha != task.latest_sha:
+        return _ignore(task, "CI 的提交编号和回执里的不一致")
+    actions = _Actions(task, task.state_version + 1)
+
+    if task.run_mode is RunMode.SINGLE_AGENT:
+        actions.add(ActionKind.NOTIFY, detail="CI 绿，等你看")
+        return _transition(
+            task,
+            TaskStatus.AWAITING_YOUR_REVIEW,
+            "CI 绿；单 Agent 模式下所有等级都由你审",
+            actions.items,
+            ci_green=True,
+            note="这次没有 AI 审核",
+        )
+
+    rule = policy.rule_for(task.level)
+    if not rule.requires_ai_review:
+        return _merge(
+            replace(task, ci_green=True),
+            policy,
+            f"CI 绿，{task.level.value} 级不需要 AI 审核",
+            actions,
+            approved_sha=task.latest_sha,
+        )
+
+    reviewers = _select_reviewers(task, policy, quota)
+    if not reviewers:
+        available = eligible_reviewers(task, policy, quota)
+        names = "、".join(available) or "无"
+        actions.add(ActionKind.NOTIFY, detail="凑不齐合格的审核者")
+        return _transition(
+            task,
+            TaskStatus.NEEDS_INTERVENTION,
+            f"R03 凑不齐合格的审核者（当前只有 {len(available)} 家：{names}）",
+            actions.items,
+            ci_green=True,
+            error_code="R03",
+            designated_reviewers=available,
+        )
+    for reviewer in reviewers:
+        actions.add(
+            ActionKind.REQUEST_REVIEW,
+            detail=f"请 {reviewer} 审核提交 {task.latest_sha}",
+            provider=reviewer,
+        )
+    return _transition(
+        task,
+        TaskStatus.AWAITING_AI_REVIEW,
+        f"CI 绿，交给 {len(reviewers)} 家审核（{'、'.join(reviewers)}）",
+        actions.items,
+        ci_green=True,
+        designated_reviewers=reviewers,
+        reviews=(),
+    )
+
+
+def _on_ci_red(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """10 / 11. 待验收 → 待处理（带原因），失败达到上限 → 待你介入（R01）。"""
+    if task.latest_sha is None or event.sha != task.latest_sha:
+        return _ignore(task, "CI 结果没有带当前提交编号，或者编号对不上，忽略")
+    merge_started = task.status is TaskStatus.AWAITING_MERGE and any(
+        action.kind is ActionKind.MERGE for action in task.actions
+    )
+    can_return_to_work = (
+        task.status
+        in {
+            TaskStatus.AWAITING_ACCEPTANCE,
+            TaskStatus.AWAITING_AI_REVIEW,
+            TaskStatus.AWAITING_YOUR_REVIEW,
+            TaskStatus.AWAITING_MERGE,
+        }
+        and not merge_started
+    )
+    if not can_return_to_work:
+        if not task.ci_green:
+            return _ignore(task, "本提交已经没有有效绿灯证据")
+        actions = _Actions(task, task.state_version + 1)
+        actions.add(ActionKind.NOTIFY, detail="同一提交 CI 已变红，撤销绿灯、审核和批准证据")
+        # 合并已发出时不能假装撤回成功；其他人工状态也只撤证据，不替用户接管。
+        return _transition(
+            task,
+            task.status,
+            "同一提交 CI 变红，所有放行证据已撤销",
+            actions.items,
+            ci_green=False,
+            approved_sha=None,
+            reviews=(),
+            designated_reviewers=(),
+        )
+    failures = task.accept_failures + 1
+    limit = policy.thresholds.max_accept_failures
+    reason = event.reason or "CI 没有给出原因"
+    actions = _Actions(task, task.state_version + 1)
+
+    if failures >= limit:
+        actions.add(ActionKind.NOTIFY, detail=f"验收失败 {failures} 次，达到上限")
+        return _transition(
+            task,
+            TaskStatus.NEEDS_INTERVENTION,
+            f"R01 验收失败达到 {failures} 次：{reason}",
+            actions.items,
+            accept_failures=failures,
+            ci_green=False,
+            approved_sha=None,
+            reviews=(),
+            designated_reviewers=(),
+            error_code="R01",
+            note=reason,
+            returned_from_review=False,
+        )
+
+    actions.add(ActionKind.NOTIFY, detail=f"CI 红（第 {failures} 次），退回修改")
+    return _transition(
+        task,
+        TaskStatus.PENDING,
+        f"CI 红，第 {failures} 次：{reason}",
+        actions.items,
+        accept_failures=failures,
+        ci_green=False,
+        approved_sha=None,
+        reviews=(),
+        designated_reviewers=(),
+        note=reason,
+        returned_from_review=False,
+    )
+
+
+# ---------------------------------------------------------------- 第 12–16 条
+
+
+def _on_review(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """12–16. 收审核结论：全过就合并（D 级则等你），有人不通过就退回或找你。"""
+    if task.status is not TaskStatus.AWAITING_AI_REVIEW:
+        return _ignore(task, "只有在待 AI 审核的任务才会收审核结论")
+    review = event.review
+    if review is None:
+        return _ignore(task, "审核事件没有带结论")
+    if review.provider in task.providers_involved:
+        return _ignore(task, f"{review.provider} 写过这次代码，不能当审核者")
+    if review.provider not in task.designated_reviewers:
+        return _ignore(task, f"{review.provider} 不是这次指定的审核者")
+    if review.sha != task.latest_sha:
+        return _ignore(task, "审核结论针对的不是当前提交编号，作废")
+    if review.standard_version != task.standard_version:
+        return _ignore(task, "审核结论用的是旧的审核标准版本，作废")
+    if review.verdict is Verdict.FAIL and not usable_findings(review.findings):
+        return _ignore(
+            task,
+            "不通过的结论必须带至少一条有编号、有正文的意见，否则拒收",
+        )
+
+    if any(existing.provider == review.provider for existing in _current_reviews(task)):
+        return _ignore(task, f"{review.provider} 已经出过结论，同一提供方不能算两家")
+
+    recorded = replace(
+        task,
+        reviews=task.reviews + (review,),
+        review_history=task.review_history + (review,),
+    )
+    by_provider = _reviews_by_provider(_current_reviews(recorded))
+    rule = policy.rule_for(task.level)
+    actions = _Actions(task, task.state_version + 1)
+
+    failing = tuple(item for item in by_provider.values() if item.verdict is Verdict.FAIL)
+    failing_names = "；".join(item.reviewer for item in failing)
+    if failing:
+        # 反对意见要留着：退回修改只清"通过资格"，不删待回应的问题
+        recorded = replace(
+            recorded,
+            open_findings=_merge_findings(task.open_findings, open_findings_from(failing)),
+        )
+        if task.writer_is_human:
+            # 14b：写手是你，带 AI 的反对意见交给你选择
+            actions.add(ActionKind.NOTIFY, detail="AI 不通过你自己写的代码，等你决定")
+            return _transition(
+                recorded,
+                TaskStatus.NEEDS_INTERVENTION,
+                f"{len(failing)} 家审核不通过（写手是你）：{failing_names}",
+                actions.items,
+                note="待回应意见："
+                + "；".join(
+                    f"{finding.short_key} {finding.text}" for finding in recorded.open_findings
+                ),
+            )
+        revisions = task.revision_count(task.standard_version) + 1
+        if revisions >= policy.thresholds.max_revisions:
+            # 15：修改次数达到上限（R02）
+            actions.add(ActionKind.NOTIFY, detail=f"审核不通过已经 {revisions} 次，等你决定")
+            return _transition(
+                recorded,
+                TaskStatus.NEEDS_INTERVENTION,
+                f"R02 审核不通过，修改次数达到 {revisions} 次：{failing_names}",
+                actions.items,
+                revision_counts=task.bumped_revision(),
+                error_code="R02",
+            )
+        # 14：退回修改，之前的审核结论全部作废
+        actions.add(ActionKind.NOTIFY, detail="审核不通过，退回修改")
+        return _transition(
+            recorded,
+            TaskStatus.PENDING,
+            f"审核不通过（第 {revisions} 次修改）：{failing_names}",
+            actions.items,
+            revision_counts=task.bumped_revision(),
+            reviews=(),
+            returned_from_review=True,
+        )
+
+    designated = set(task.designated_reviewers)
+    passing = {
+        provider: item
+        for provider, item in by_provider.items()
+        if item.verdict is Verdict.PASS and provider in designated
+    }
+    enough_seats = len(designated) >= rule.min_reviewers
+    complete = enough_seats and designated <= set(passing) and len(passing) >= rule.min_reviewers
+    if complete:
+        if rule.requires_human_merge:
+            # 13：D 级，审核都过了，等你审
+            actions.add(ActionKind.NOTIFY, detail="AI 审核全过，D 级等你看完整 diff")
+            return _transition(
+                recorded,
+                TaskStatus.AWAITING_YOUR_REVIEW,
+                "所有指定的审核者都通过，D 级等你看",
+                actions.items,
+                open_findings=(),
+            )
+        # 12：全过就合并（dry-run），守卫会再核对一次 CI 和提交编号
+        passed_round = replace(recorded, open_findings=())
+        return _merge(
+            passed_round,
+            policy,
+            f"所有指定的审核者都通过，准备合并 {task.latest_sha}",
+            actions,
+            passed_round,
+            approved_sha=task.latest_sha,
+        )
+
+    # 还有提供方没出结论，状态不变，只把这条结论记下来
+    return _transition(recorded, TaskStatus.AWAITING_AI_REVIEW, "还要等其他提供方的结论", [])
+
+
+# ---------------------------------------------------------------- 第 17–25 条
+
+
+def _on_your_approval(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """17. 待你审核 → 待合并：CI 绿，绑定当前提交编号。"""
+    if task.status is not TaskStatus.AWAITING_YOUR_REVIEW:
+        return _ignore(task, "只有待你审核的任务才会由你批准")
+    if event.sha is None or event.sha != task.latest_sha:
+        return _ignore(task, "你批准时要带上你看到的那个提交编号，和当前不一致就不生效")
+    actions = _Actions(task, task.state_version + 1)
+    approved_sha = task.latest_sha
+    if approved_sha is None:
+        return _ignore(task, "任务没有提交编号，不能批准")
+    return _merge(
+        task,
+        policy,
+        f"你批准了提交 {approved_sha}",
+        actions,
+        human=True,
+        approved_sha=approved_sha,
+        note=event.reason or task.note,
+    )
+
+
+def _on_your_rejection(task: TaskRecord, event: Event) -> Decision:
+    """18. 待你审核 → 待处理：带原因。"""
+    if task.status is not TaskStatus.AWAITING_YOUR_REVIEW:
+        return _ignore(task, "只有待你审核的任务才会由你打回")
+    reason = event.reason or "你没有写原因"
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.NOTIFY, detail="你打回了，退回修改")
+    return _transition(
+        task,
+        TaskStatus.PENDING,
+        f"你打回了提交 {task.latest_sha}：{reason}",
+        actions.items,
+        reviews=(),
+        approved_sha=None,
+        note=reason,
+    )
+
+
+def _on_merged(task: TaskRecord, event: Event) -> Decision:
+    """19. 待合并 → 已合并：提交编号和审核时一致。"""
+    if task.status is not TaskStatus.AWAITING_MERGE:
+        return _ignore(task, "只有待合并的任务才会收到合并成功")
+    approved = task.approved_sha or task.latest_sha
+    if approved is None or event.sha is None:
+        return _ignore(task, "合并成功必须带核对过的提交编号")
+    if event.sha != approved:
+        return _ignore(task, f"合并的提交编号 {event.sha} 和审核时的 {approved} 不一致")
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.NOTIFY, detail="任务已合并")
+    return _transition(task, TaskStatus.MERGED, f"提交 {approved} 已合并", actions.items)
+
+
+def _on_intervention_approved(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """20. 待你介入 → 待合并：CI 必须是绿的，否决 AI 意见要写理由。"""
+    if task.status is not TaskStatus.NEEDS_INTERVENTION:
+        return _ignore(task, "只有待你介入的任务才会人工审核通过")
+    if task.latest_sha is None:
+        return _ignore(task, "任务没有提交编号，不能批准")
+    if event.sha is None or event.sha != task.latest_sha:
+        return _ignore(task, "人工审核通过要绑定当前提交编号，和当前不一致就不生效")
+    missing = _missing_veto_reasons(task, event)
+    if missing:
+        return _ignore(
+            task,
+            f"否决 AI 的审核意见要对每一条写理由，还缺：{'、'.join(missing)}",
+        )
+    actions = _Actions(task, task.state_version + 1)
+    return _merge(
+        task,
+        policy,
+        f"你人工审核通过了提交 {task.latest_sha}",
+        actions,
+        human=True,
+        approved_sha=task.latest_sha,
+        note=event.reason or task.note,
+    )
+
+
+def _on_rework(task: TaskRecord, event: Event) -> Decision:
+    """21. 待你介入 → 待处理：换一个 Agent 重做，带你的说明。"""
+    if task.status is not TaskStatus.NEEDS_INTERVENTION:
+        return _ignore(task, "只有待你介入的任务才会换一个 Agent 重做")
+    reason = event.reason or "你没有写说明"
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.NOTIFY, detail="换一个 Agent 重做")
+    return _transition(
+        task,
+        TaskStatus.PENDING,
+        f"你要求换一个 Agent 重做：{reason}",
+        actions.items,
+        reviews=(),
+        approved_sha=None,
+        note=reason,
+        returned_from_review=False,
+    )
+
+
+def _on_standard_changed(
+    task: TaskRecord, event: Event, policy: Policy, quota: QuotaSnapshot
+) -> Decision:
+    """22. 待你介入 → 待AI审核：换新的审核标准版本，计数清零但保留历史。"""
+    if task.status is not TaskStatus.NEEDS_INTERVENTION:
+        return _ignore(task, "只有待你介入的任务才会改审核标准")
+    if event.standard_version is None or event.standard_version <= task.standard_version:
+        return _ignore(task, "改审核标准要带一个比当前更大的标准版本号")
+
+    changed = replace(task, standard_version=event.standard_version)
+    reviewers = _select_reviewers(changed, policy, quota)
+    actions = _Actions(task, task.state_version + 1)
+    if not reviewers:
+        actions.add(ActionKind.NOTIFY, detail="换了标准，但还是凑不齐合格的审核者")
+        return _transition(
+            changed,
+            TaskStatus.NEEDS_INTERVENTION,
+            "R03 改完标准还是凑不齐合格的审核者",
+            actions.items,
+            error_code="R03",
+        )
+    for reviewer in reviewers:
+        actions.add(
+            ActionKind.REQUEST_REVIEW,
+            detail=f"请 {reviewer} 用第 {event.standard_version} 版标准重新审",
+            provider=reviewer,
+        )
+    return _transition(
+        changed,
+        TaskStatus.AWAITING_AI_REVIEW,
+        f"换成第 {event.standard_version} 版审核标准，重新审",
+        actions.items,
+        reviews=(),
+        designated_reviewers=reviewers,
+    )
+
+
+def _on_take_over(task: TaskRecord) -> Decision:
+    """23. 待你介入 → 你处理中：你自己接手，相当于上锁。"""
+    if task.status is not TaskStatus.NEEDS_INTERVENTION:
+        return _ignore(task, "只有待你介入的任务才会被你接手")
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.NOTIFY, detail="你自己接手了，系统不再催你")
+    return _transition(task, TaskStatus.YOU_WORKING, "你自己接手了", actions.items)
+
+
+def _on_you_submitted_code(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """24. 你处理中 → 待验收：你提交代码，按真实改动重算等级，注明有哪些 AI 参与过。
+
+    人工提交和 Agent 提交是同一套逻辑：同一份真实改动、同样的作废规则、
+    同样的 D 级方案门槛。区别只有"写手是你"和"要补记参与过的提供方"。
+    """
+    if task.status is not TaskStatus.YOU_WORKING:
+        return _ignore(task, "只有你处理中才会由你提交代码")
+    if event.sha is None or event.changes is None:
+        return _ignore(task, "你提交代码时要带提交编号和真实改动，否则按无效提交处理")
+
+    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    rule = policy.rule_for(new_level)
+    plan_approved = (
+        task.approved_plan_version is not None and task.approved_plan_version == task.plan_version
+    )
+    involved_providers = task.providers_involved | set(event.providers)
+    involved = "、".join(sorted(involved_providers)) or "无"
+    actions = _Actions(task, task.state_version + 1)
+
+    shared: dict[str, object] = {
+        "level": new_level,
+        "writer": HUMAN_WRITER,
+        "writer_is_human": True,
+        "providers_involved": frozenset(involved_providers),
+        "latest_sha": event.sha,
+        "approved_sha": None,
+        "reviews": (),
+        "designated_reviewers": (),
+        "ci_green": False,
+        "pr_opened": True,
+        "note": f"参与过的 AI：{involved}",
+        "returned_from_review": False,
+    }
+    if rule.requires_plan_approval and not plan_approved:
+        entry = escalation_plan(task, event.sha, event.changes, policy)
+        actions.add(ActionKind.NOTIFY, detail="你这次改动升成 D 级，要先批准方案")
+        return _transition(
+            task,
+            TaskStatus.AWAITING_PLAN_APPROVAL,
+            f"你提交的 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
+            actions.items,
+            plan_version=entry.version,
+            plan_history=task.plan_history + (entry,),
+            **shared,
+        )
+    actions.add(ActionKind.NOTIFY, detail=f"你提交了 {event.sha}，等 CI")
+    return _transition(
+        task,
+        TaskStatus.AWAITING_ACCEPTANCE,
+        f"你提交了代码 {event.sha}（{new_level.value} 级），参与过的 AI：{involved}",
+        actions.items,
+        **shared,
+    )
+
+
+def _on_abandon(task: TaskRecord, event: Event) -> Decision:
+    """25. 待你介入 → 失败：放弃。"""
+    if task.status is not TaskStatus.NEEDS_INTERVENTION:
+        return _ignore(task, "只有待你介入的任务才会被放弃")
+    reason = event.reason or "你决定放弃"
+    actions = _Actions(task, task.state_version + 1)
+    actions.add(ActionKind.NOTIFY, detail="任务已放弃")
+    return _transition(
+        task, TaskStatus.FAILED, f"你放弃了任务：{reason}", actions.items, note=reason
+    )
+
+
+# ---------------------------------------------------------------- 第 26–27 条
+
+
+def _on_retry(task: TaskRecord, event: Event, policy: Policy) -> Decision:
+    """26. 异常 → 核对后的状态：外壳先去外部核对，再决定回到哪里。"""
+    if task.status is not TaskStatus.ERROR:
+        return _ignore(task, "只有异常的任务才会重试")
+    check = event.check_result
+    if check is None:
+        return _ignore(task, "重试前必须先去外部核对，并带上核对结果")
+    actions = _Actions(task, task.state_version + 1)
+
+    match check:
+        case CheckResult.MERGE_SUCCEEDED:
+            merged_sha = event.sha or task.approved_sha or task.latest_sha
+            # 之前有没有经过本系统的合并放行：批准的必须就是这次合并的提交
+            released_by_us = task.approved_sha is not None and task.approved_sha == merged_sha
+            actions.add(ActionKind.NOTIFY, detail="核对后确认合并已经成功")
+            if released_by_us:
+                return _transition(
+                    task,
+                    TaskStatus.MERGED,
+                    f"核对后确认合并其实已经成功（提交 {merged_sha}，系统内有你的批准）",
+                    actions.items,
+                    status_before_error=None,
+                    error_code=None,
+                )
+            # 外部事实优先，但要在记录里说清：这次合并没有经过本系统的审核放行
+            marker = (
+                f"由 GitHub 事实确认，未经本系统审核放行（合并提交 {merged_sha}，"
+                f"本系统的批准：{'无' if task.approved_sha is None else task.approved_sha}）"
+            )
+            actions.add(ActionKind.NOTIFY, detail=f"注意：{marker}")
+            return _transition(
+                task,
+                TaskStatus.MERGED,
+                f"核对后确认合并其实已经成功；{marker}",
+                actions.items,
+                status_before_error=None,
+                error_code=None,
+                merge_confirmed_externally=True,
+                note=_append_note(task.note, marker),
+            )
+        case CheckResult.PR_CLOSED:
+            actions.add(ActionKind.NOTIFY, detail="核对后确认 PR 已被关闭，回到待处理")
+            return _transition(
+                task,
+                TaskStatus.PENDING,
+                "核对后确认 PR 已被关闭，回到待处理（这个 PR 的证据全部作废）",
+                actions.items,
+                status_before_error=None,
+                error_code=None,
+                **_forget_pr_evidence(),
+            )
+        case CheckResult.NOT_CONFIRMED:
+            before = task.status_before_error
+            if before is not None and before.is_terminal:
+                before = None
+            # 出问题前是"处理中"：进程已经没了，回到待处理等重新派活，
+            # 不能假装还在处理中（否则没有人会再启动 Agent，任务会一直挂着）。
+            target = TaskStatus.PENDING if before in (None, TaskStatus.WORKING) else before
+            actions.add(ActionKind.NOTIFY, detail=f"核对后确认没有动作完成，回到{target.value}")
+            if target is TaskStatus.AWAITING_AI_REVIEW:
+                # 审核进程没了：把还没出结论的审核者重新请求一遍
+                missing = _reviewers_without_conclusion(task)
+                for reviewer in missing:
+                    actions.add(
+                        ActionKind.REQUEST_REVIEW,
+                        detail=f"重新请 {reviewer} 审核提交 {task.latest_sha}",
+                        provider=reviewer,
+                    )
+            if target is TaskStatus.AWAITING_MERGE:
+                # 合并请求没被确认：重新发一个合并动作（动作编号跟着新的版本号走，
+                # 和上一次不同）。仍受合并守卫约束：批准的必须是当前提交、CI 必须绿。
+                # 重试的是既有授权，不是新证据，所以不再核对审核席位（human=True）。
+                blockers = merge_blocker(task, policy, human=True)
+                if blockers:
+                    message = "；".join(blockers)
+                    actions.add(ActionKind.NOTIFY, detail=f"不能重新合并：{message}")
+                    return _transition(
+                        task,
+                        TaskStatus.AWAITING_MERGE,
+                        f"核对后确认合并没有完成，但暂时不能重发合并：{message}",
+                        actions.items,
+                        status_before_error=None,
+                        error_code=None,
+                    )
+                actions.add(
+                    ActionKind.MERGE,
+                    detail=f"核对后确认没有合并成功，重新请求合并 {task.approved_sha}",
+                )
+                return _transition(
+                    task,
+                    TaskStatus.AWAITING_MERGE,
+                    "核对后确认合并没有完成，已重新发出合并请求",
+                    actions.items,
+                    status_before_error=None,
+                    error_code=None,
+                )
+            return _transition(
+                task,
+                target,
+                f"核对后确认没有动作完成，回到{target.value}",
+                actions.items,
+                status_before_error=None,
+                error_code=None,
+            )
+        case _:  # pragma: no cover
+            assert_never(check)
+
+
+def usable_findings(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
+    """可追踪的审核意见：编号和正文都不能是空的。"""
+    return tuple(finding for finding in findings if finding.id.strip() and finding.text.strip())
+
+
+def finding_key(review: Review, finding: Finding) -> str:
+    """意见的复合键：提供方 + **完整**提交编号 + 标准版本 + 本地编号。
+
+    提交编号必须用完整的：前 8 位相同的不同提交也各有各的意见，
+    截断会把新提交的反对意见吞掉。缩写只出现在展示用的 short_key 里。
+    """
+    return f"{review.provider}:{finding.id.strip()}@{review.sha}:v{review.standard_version}"
+
+
+def open_findings_from(recorded: tuple[Review, ...]) -> tuple[OpenFinding, ...]:
+    """把不通过结论里的意见变成"待回应项"，带上来源上下文。"""
+    opened: list[OpenFinding] = []
+    for review in recorded:
+        if review.verdict is not Verdict.FAIL:
+            continue
+        for finding in usable_findings(review.findings):
+            opened.append(
+                OpenFinding(
+                    key=finding_key(review, finding),
+                    provider=review.provider,
+                    sha=review.sha,
+                    standard_version=review.standard_version,
+                    local_id=finding.id.strip(),
+                    text=finding.text.strip(),
+                )
+            )
+    return tuple(opened)
+
+
+def _merge_findings(
+    existing: tuple[OpenFinding, ...], incoming: tuple[OpenFinding, ...]
+) -> tuple[OpenFinding, ...]:
+    """按复合键合并：不同来源的同号意见互不覆盖。"""
+    merged = list(existing)
+    known = {finding.key for finding in existing}
+    for finding in incoming:
+        if finding.key not in known:
+            merged.append(finding)
+            known.add(finding.key)
+    return tuple(merged)
+
+
+def _missing_veto_reasons(task: TaskRecord, event: Event) -> tuple[str, ...]:
+    """人工否决时，每条待回应意见都必须有一条非空理由。"""
+    answers = {
+        item.finding_id: item.reason.strip() for item in event.veto_reasons if item.reason.strip()
+    }
+    if task.open_findings:
+        return tuple(finding.key for finding in task.open_findings if not answers.get(finding.key))
+    # 兼容旧记录：历史上如果有"没带具体意见的不通过"，不能当成没有反对意见
+    unnumbered = [
+        item
+        for item in task.review_history
+        if item.verdict is Verdict.FAIL and not usable_findings(item.findings)
+    ]
+    if unnumbered and not answers and not (event.reason or "").strip():
+        return tuple(f"{item.provider}（没有写具体意见）" for item in unnumbered)
+    failing = [item for item in _current_reviews(task) if item.verdict is Verdict.FAIL]
+    if failing and not answers and not (event.reason or "").strip():
+        return tuple(item.provider for item in failing)
+    return ()
+
+
+def _reviewers_without_conclusion(task: TaskRecord) -> tuple[str, ...]:
+    """还没给出当前提交编号结论的审核者（重试时要重新发审核请求）。"""
+    answered = {review.provider for review in _current_reviews(task)}
+    return tuple(seat for seat in task.designated_reviewers if seat not in answered)
+
+
+# 终止清理时可以核对的动作类型：取消时外壳发出的那几条清理动作
+CLEANUP_ACTION_KINDS = frozenset(
+    {ActionKind.CLOSE_PR, ActionKind.STOP_AGENT, ActionKind.PUSH_BRANCH}
+)
+
+
+def _on_cleanup_checked(task: TaskRecord, event: Event) -> Decision:
+    """终点任务的清理核对：只改动作状态，不动状态机。
+
+    为什么这不违反"终点不可逆"：状态机的终点是"没有出边"，这里的状态没有变，
+    也不会有任何后续转换；变的只是"已经发出的动作到底完成了没有"这条事实。
+    状态版本号照样 +1，因为任务记录的每一次变化都要留一版（重放要对得上）。
+    ``CLEANUP_CHECKED`` 也只能落在这个窄口上：其他事件碰到终点任务一律丢弃。
+    """
+    outcome = event.check_result
+    if outcome is not CheckResult.PR_CLOSED and outcome is not CheckResult.NOT_CONFIRMED:
+        return _ignore(task, "清理核对只接受「外部已确认」或「无法确认」两种结果")
+    wanted = tuple(dict.fromkeys(event.action_ids))
+    if not wanted:
+        return _ignore(task, "清理核对要带上要核对的动作编号")
+
+    known = {action.action_id: action for action in task.actions}
+    registered = set(task.cleanup_action_ids)
+    targets: list[Action] = []
+    for action_id in wanted:
+        action = known.get(action_id)
+        if action is None:
+            return _ignore(task, f"任务里没有动作 {action_id}")
+        if action.kind not in CLEANUP_ACTION_KINDS:
+            return _ignore(task, f"{action.kind.value}不是清理动作，清理核对只能核对清理动作")
+        if action_id not in registered:
+            return _ignore(
+                task,
+                f"动作 {action_id} 不是进入终点时登记的清理动作，来源不可核验，不能这样核对",
+            )
+        targets.append(action)
+
+    new_status = ActionStatus.DONE if outcome is CheckResult.PR_CLOSED else ActionStatus.ABANDONED
+    # 只允许把"未完成"收尾一次：已收尾的，同结果幂等忽略、相反结果整批拒绝
+    for action in targets:
+        if action.status is ActionStatus.SENT or action.status is ActionStatus.UNKNOWN:
+            continue
+        if action.status is new_status:
+            continue
+        return _ignore(
+            task,
+            f"动作 {action.action_id} 已经收尾为{action.status.value}，"
+            f"不能用相反结果{new_status.value}覆盖；要更正请另走更正入口",
+        )
+    open_ids = {
+        action.action_id
+        for action in targets
+        if action.status is ActionStatus.SENT or action.status is ActionStatus.UNKNOWN
+    }
+    if not open_ids:
+        return _ignore(task, f"这些清理动作已经是{new_status.value}，不用再核对")
+
+    patched = tuple(
+        replace(action, status=new_status) if action.action_id in open_ids else action
+        for action in task.actions
+    )
+    names = "、".join(f"{action.kind.value}({action.action_id})" for action in targets)
+    if outcome is CheckResult.PR_CLOSED:
+        reason = f"清理核对：{names} 外部已确认完成"
+        note = _append_note(task.note, f"清理已核对：{names} 已确认完成")
+    else:
+        reason = f"清理核对：{names} 无法确认，已放弃"
+        note = _append_note(task.note, f"清理未完成：{names} 已放弃（外部无法确认）")
+    decision = _transition(
+        replace(task, actions=patched),
+        task.status,
+        reason,
+        [],
+        cleanup_checked=True,
+        note=note,
+    )
+    # 这些动作早就发出去了，这里只把状态写回去；外壳不能重新执行它们
+    return replace(
+        decision,
+        action_updates=[
+            ActionUpdate(action_id=action_id, status=new_status) for action_id in wanted
+        ],
+    )
+
+
+def _on_cancel(task: TaskRecord) -> Decision:
+    """27. 除"待合并且合并已经开始"以外的任何非终点状态 → 已取消。"""
+    merge_started = any(action.kind is ActionKind.MERGE for action in task.actions)
+    if task.status is TaskStatus.AWAITING_MERGE and merge_started:
+        return _ignore(task, "合并已经开始，不能取消；想撤回只能走回滚")
+
+    actions = _Actions(task, task.state_version + 1)
+    match task.status:
+        case TaskStatus.PENDING | TaskStatus.AWAITING_PLAN_APPROVAL:
+            # 只改状态，没有东西需要清理
+            pass
+        case TaskStatus.WORKING | TaskStatus.ERROR:
+            actions.add(ActionKind.STOP_AGENT, detail="杀掉 Agent 进程")
+            actions.add(ActionKind.PUSH_BRANCH, detail="保留分支作为副本")
+        case (
+            TaskStatus.AWAITING_ACCEPTANCE
+            | TaskStatus.AWAITING_AI_REVIEW
+            | TaskStatus.AWAITING_YOUR_REVIEW
+            | TaskStatus.NEEDS_INTERVENTION
+            | TaskStatus.YOU_WORKING
+            | TaskStatus.AWAITING_MERGE
+        ):
+            actions.add(ActionKind.STOP_AGENT, detail="停掉正在运行的审核进程")
+        case TaskStatus.MERGED | TaskStatus.CANCELLED | TaskStatus.FAILED:
+            # 终点状态在上面已经拦过了，这里只是让 pyright 能查漏
+            return _ignore(task, "任务已经结束，不能取消")
+        case _:  # pragma: no cover
+            assert_never(task.status)
+    if task.pr_opened:
+        actions.add(ActionKind.CLOSE_PR, detail="关闭 PR，保留分支")
+
+    cleanup_ids = tuple(
+        action.action_id for action in actions.items if action.kind in CLEANUP_ACTION_KINDS
+    )
+    return _transition(
+        task,
+        TaskStatus.CANCELLED,
+        f"你在{task.status.value}时取消了任务",
+        actions.items,
+        reviews=(),
+        approved_sha=None,
+        returned_from_review=False,
+        cleanup_action_ids=cleanup_ids,
+    )
