@@ -59,6 +59,13 @@ from tests.core.helpers import NOW
 DEEP = os.getenv("TANDEM_INVARIANTS_DEEP") == "1"
 TRACE_SETTINGS = settings(max_examples=250 if DEEP else 30, deadline=None)
 ALL_CHECKS = ("atomic", "once", "replay", "version")
+
+
+def oid(n: int) -> str:
+    """40 位十六进制的提交编号：内核在入口只认完整 OID（见 core/identity.py）。"""
+    return f"{n:040x}"
+
+
 SEAMS = (
     "_insert_event",
     "_write_task",
@@ -366,16 +373,19 @@ def next_event(task: TaskRecord, choice: int, kind: EventKind, serial: int) -> E
     provider = next(
         (p for p in task.designated_reviewers if p not in {r.provider for r in task.reviews}), "r1"
     )
-    sha = task.latest_sha or f"sha-{serial}"
+    # 提交类事件必须带一个新的完整 OID；其余事件沿用当前提交编号（可以是 None）。
+    sha = task.latest_sha
     plan = task.plan()
-    if selected is EventKind.PLAN_APPROVED and plan is not None:
-        sha = plan.sha or sha
+    if selected is EventKind.PLAN_APPROVED and plan is not None and plan.sha:
+        sha = plan.sha
     if selected in (
         EventKind.PLAN_SUBMITTED,
         EventKind.CODE_SUBMITTED,
         EventKind.YOU_SUBMITTED_CODE,
     ):
-        sha = f"sha-{serial}"
+        sha = oid(serial + 1)
+    # 事件里带了审核结论时，结论的提交编号也必须是完整 OID，否则整条事件被入口拒收。
+    review_sha = sha or task.latest_sha or oid(0)
     ev = Event(
         selected,
         "t",
@@ -388,20 +398,22 @@ def next_event(task: TaskRecord, choice: int, kind: EventKind, serial: int) -> E
         reason=f"step-{serial}",
         standard_version=task.standard_version + 1,
         check_result=CheckResult.NOT_CONFIRMED,
-        review=Review(provider, provider, Verdict.PASS, sha, task.standard_version),
+        review=Review(provider, provider, Verdict.PASS, review_sha, task.standard_version),
         veto_reasons=tuple(VetoReason(f.key, "Reviewed explicitly") for f in task.open_findings),
     )
     if choice == 2:
         return replace(ev, state_version=task.state_version + 1)
     if choice == 3:
+        # 合法但过期的提交编号：入口放行，由处理函数按"编号对不上"拒收。
+        stale = oid(9000 + serial)
         return replace(
             ev,
-            sha="stale-sha",
+            sha=stale,
             review=Review(
                 "impersonated-reviewer",
                 "w",
                 Verdict.FAIL,
-                "stale-sha",
+                stale,
                 0,
                 findings=(Finding("F1", "Please fix"),),
             ),

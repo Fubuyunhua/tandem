@@ -28,6 +28,7 @@ from tandem.core.model import (
     Decision,
     Event,
     EventKind,
+    FileChange,
     Finding,
     Level,
     OpenFinding,
@@ -47,6 +48,16 @@ from tests.core.helpers import NOW
 DEEP = os.getenv("TANDEM_INVARIANTS_DEEP") == "1"
 TRACE_SETTINGS = settings(max_examples=1000 if DEEP else 80, deadline=None)
 PROVIDERS = ("writer", "r1", "r2", "r3")
+
+
+def oid(n: int) -> str:
+    """40 位十六进制的提交编号。
+
+    内核只认完整 OID：缩写、分支名、任意字符串都会在入口被拒收
+    （见 src/tandem/core/identity.py 和 _dispatch 的格式闸门）。
+    """
+    return f"{n:040x}"
+
 
 TERMINAL_STATUSES = (TaskStatus.MERGED, TaskStatus.CANCELLED, TaskStatus.FAILED)
 TERMINAL_CLEANUP_FIELDS = frozenset(
@@ -82,7 +93,9 @@ def event(task: TaskRecord, kind: EventKind, **fields: object) -> Event:
 
 
 def passing(task: TaskRecord, provider: str) -> Review:
-    return Review(provider, provider, Verdict.PASS, task.latest_sha or "s0", task.standard_version)
+    return Review(
+        provider, provider, Verdict.PASS, task.latest_sha or oid(0), task.standard_version
+    )
 
 
 def check_ci(before: TaskRecord, decision: Decision, green_sha: str | None) -> None:
@@ -100,6 +113,11 @@ def check_separation(task: TaskRecord) -> None:
 
 def check_review_count(task: TaskRecord, policy: Policy, human: bool) -> None:
     if task.status is not TaskStatus.AWAITING_MERGE or human:
+        return
+    if not task.ci_green:
+        # 新内核规则（红队修复）：同一提交先绿后红时，放行证据会被撤销，
+        # 但状态可以留在待合并（合并已经发出，不能假装撤回）。这种记录没有
+        # "现在就能放行"的证据，不该按待放行去要求审核结论。
         return
     if task.run_mode is RunMode.SINGLE_AGENT or task.level is Level.D:
         return
@@ -269,12 +287,20 @@ def advance(task: TaskRecord) -> Event:
     if task.level is Level.A:
         changes = ChangeSet()
     if task.level is Level.B:
-        changes = ChangeSet(paths=("docs/a.md",))
+        changes = ChangeSet(
+            paths=("docs/a.md",),
+            file_changes=(FileChange("docs/a.md", "100644", "100644"),),
+        )
+    # 只有提交类事件需要新编号；其余事件要么沿用当前编号，要么根本不需要编号。
+    sha: str | None = task.latest_sha
+    if kind in (EventKind.CODE_SUBMITTED, EventKind.YOU_SUBMITTED_CODE):
+        sha = oid(task.state_version + 1)
+    elif kind is EventKind.PLAN_APPROVED:
+        sha = current_plan_sha(task)
     return event(
         task,
         kind,
-        sha=(current_plan_sha(task) if kind is EventKind.PLAN_APPROVED else task.latest_sha)
-        or "s0",
+        sha=sha,
         plan="Generated proposal",
         attempt=task.attempt,
         changes=changes,
@@ -400,7 +426,7 @@ def test_d_assignment_requests_plan_but_code_stays_gated() -> None:
     check_d(task, decision, None)
 
 
-@pytest.mark.parametrize("sha", ["s0", "stale", None])
+@pytest.mark.parametrize("sha", [oid(1), "stale", None])
 def test_d_intervention_approval_requires_current_sha(sha: str | None) -> None:
     policy = make_policy()
     task = walk(
@@ -457,9 +483,9 @@ def test_regression_new_plan_sha_invalidates_old_ci() -> None:
     task = core.decide(task, event(task, EventKind.ASSIGN), policy, QuotaSnapshot(), NOW).task
     assert task.status is TaskStatus.WORKING and task.ci_green
     decision = core.decide(
-        task, event(task, EventKind.PLAN_SUBMITTED, sha="new-plan"), policy, QuotaSnapshot(), NOW
+        task, event(task, EventKind.PLAN_SUBMITTED, sha=oid(77)), policy, QuotaSnapshot(), NOW
     )
-    assert decision.task.latest_sha == "new-plan"
+    assert decision.task.latest_sha == oid(77)
     check_fresh(task, decision)
 
 
@@ -514,7 +540,7 @@ def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invarian
         ev = event(
             task,
             EventKind.CODE_SUBMITTED,
-            sha="new",
+            sha=oid(4242),
             attempt=task.attempt,
             changes=ChangeSet(paths=("app.py",)),
         )
@@ -608,7 +634,7 @@ def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invarian
         witness()
 
 
-def terminal_record(status: TaskStatus, version: int = 10, sha: str = "current") -> TaskRecord:
+def terminal_record(status: TaskStatus, version: int = 10, sha: str = oid(10)) -> TaskRecord:
     # Populate evidence/history so a cleanup implementation that clears them is
     # detected even when it preserves the terminal status and increments version.
     base = walk(
@@ -665,7 +691,7 @@ def terminal_record(status: TaskStatus, version: int = 10, sha: str = "current")
 @given(
     status=st.sampled_from(TERMINAL_STATUSES),
     version=st.integers(0, 100),
-    sha=st.text(min_size=1, max_size=20),
+    sha=st.builds(oid, st.integers(0, 10**9)),
     outcome=st.sampled_from([CheckResult.PR_CLOSED, CheckResult.NOT_CONFIRMED]),
 )
 def test_every_event_obeys_terminal_cleanup_contract(status, version, sha, outcome) -> None:
@@ -741,10 +767,11 @@ def test_terminal_cleanup_checks_targets_and_guards(
 @TRACE_SETTINGS
 @given(
     required=st.integers(2, 3),
-    old=st.text(min_size=1, max_size=15),
-    suffix=st.text(min_size=1, max_size=15),
+    old_number=st.integers(0, 10**9),
+    suffix=st.integers(1, 10**6),
 )
-def test_new_commit_requires_all_reviewers_again(required, old, suffix) -> None:
+def test_new_commit_requires_all_reviewers_again(required, old_number, suffix) -> None:
+    old = oid(old_number)
     policy = make_policy(required=required)
     task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED], policy)
     task = core.decide(
@@ -767,7 +794,7 @@ def test_new_commit_requires_all_reviewers_again(required, old, suffix) -> None:
     task = core.decide(
         task, event(task, EventKind.REVIEW, review=first), policy, QuotaSnapshot(), NOW
     ).task
-    new = old + suffix
+    new = oid(old_number + suffix)
     decision = core.decide(
         task,
         event(
@@ -842,7 +869,7 @@ def test_d_review_route_mutant_cannot_skip_human(monkeypatch: pytest.MonkeyPatch
         check_d(task, decision, None)
 
 
-@pytest.mark.parametrize("sha", ["stale", None])
+@pytest.mark.parametrize("sha", [oid(1234), None])
 def test_d_intervention_sha_guard_mutant_is_caught(
     monkeypatch: pytest.MonkeyPatch,
     sha: str | None,
@@ -920,11 +947,12 @@ def test_unapproved_d_code_receipts_cannot_advance(mode, attempt, sha) -> None:
 
 @TRACE_SETTINGS
 @given(
-    first_sha=st.text(alphabet="0123456789abcdef", min_size=1, max_size=20),
-    suffix=st.text(alphabet="0123456789abcdef", min_size=1, max_size=20),
+    first_number=st.integers(0, 10**9),
+    offset=st.integers(1, 10**6),
     submitted=st.sampled_from([EventKind.PLAN_SUBMITTED, EventKind.CODE_SUBMITTED]),
 )
-def test_plan_approval_is_bound_to_current_plan_sha(first_sha, suffix, submitted) -> None:
+def test_plan_approval_is_bound_to_current_plan_sha(first_number, offset, submitted) -> None:
+    first_sha = oid(first_number)
     policy = make_policy()
     task = walk(Level.D, [EventKind.ASSIGN])
     task = core.decide(
@@ -938,7 +966,7 @@ def test_plan_approval_is_bound_to_current_plan_sha(first_sha, suffix, submitted
         task, event(task, EventKind.PLAN_REJECTED), policy, QuotaSnapshot(), NOW
     ).task
     task = core.decide(task, event(task, EventKind.ASSIGN), policy, QuotaSnapshot(), NOW).task
-    current_sha = first_sha + suffix
+    current_sha = oid(first_number + offset)
     task = core.decide(
         task,
         event(
@@ -965,7 +993,7 @@ def test_plan_approval_is_bound_to_current_plan_sha(first_sha, suffix, submitted
         assert decision.changed == (sha == current_sha)
 
 
-@pytest.mark.parametrize("sha", [None, "old-plan"])
+@pytest.mark.parametrize("sha", [None, oid(88)])
 def test_plan_sha_guard_mutant_is_caught(monkeypatch: pytest.MonkeyPatch, sha: str | None) -> None:
     policy = make_policy()
     task = walk(Level.D, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED])
@@ -973,6 +1001,11 @@ def test_plan_sha_guard_mutant_is_caught(monkeypatch: pytest.MonkeyPatch, sha: s
     baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
     check_plan_approval(task, ev, baseline)
     assert not baseline.changed
+    if sha is None:
+        # 新内核在入口就拒收"方案类事件没带提交编号"，根本到不了处理函数；
+        # 这里显式把这条规则钉住，下面的变异体只对合法但错误的编号有意义。
+        assert "OID" in baseline.reason
+        return
     original = core._on_plan_approved
 
     def ignore_plan_sha(task, ev):
@@ -989,10 +1022,10 @@ def test_approval_generator_uses_plan_sha_instead_of_latest_code_sha() -> None:
     policy = make_policy()
     task = walk(Level.D, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED])
     # A snapshot can retain a plan separately from the current code commit.
-    task = replace(task, latest_sha="different-code")
+    task = replace(task, latest_sha=oid(99))
     ev = advance(task)
     assert ev.kind is EventKind.PLAN_APPROVED
-    assert ev.sha == "s0" and ev.sha != task.latest_sha
+    assert ev.sha == current_plan_sha(task) and ev.sha != task.latest_sha
     decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
     assert decision.changed
     check_plan_approval(task, ev, decision)
