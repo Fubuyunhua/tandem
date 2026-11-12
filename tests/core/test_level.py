@@ -265,3 +265,37 @@ def test_totals_still_count_as_a_drop_when_no_per_file_detail(policy: Policy) ->
     """兼容旧数据：只有合计数字时，合计减少照旧算命中底线。"""
     changes = ChangeSet(paths=("tests/test_app.py",), assertions_before=5, assertions_after=4)
     assert compute_level(changes, policy) is Level.D
+
+
+# ------------------------------------------------- K7：任务等级只升不降
+
+
+def test_level_never_goes_down() -> None:
+    """等级只升不降：取（当前任务等级，本次算出的等级）里更严格的那个。"""
+    from tandem.core.level import keep_stricter
+
+    assert keep_stricter(Level.D, Level.C) is Level.D
+    assert keep_stricter(Level.C, Level.D) is Level.D
+    assert keep_stricter(Level.B, Level.A) is Level.B
+    assert keep_stricter(Level.A, Level.B) is Level.B
+    assert keep_stricter(Level.C, Level.C) is Level.C
+    assert keep_stricter(Level.A, Level.A) is Level.A
+    for left in Level:
+        for right in Level:
+            kept = keep_stricter(left, right)
+            assert kept.rank == max(left.rank, right.rank)
+
+
+def test_document_only_commit_cannot_downgrade_a_d_task() -> None:
+    """D 级方案批准后提交纯文档改动：仍算 D（旧实现会重算成 B/C）。"""
+    from tandem.core.level import keep_stricter
+    from tandem.core.model import FileChange
+
+    policy = load_policy()
+    docs = ChangeSet(
+        paths=("docs/note.md",),
+        file_changes=(FileChange("docs/note.md", "000000", "100644"),),
+    )
+    computed = compute_level(docs, policy, Level.B)
+    assert computed is Level.B  # 单看这次改动确实是 B
+    assert keep_stricter(Level.D, computed) is Level.D

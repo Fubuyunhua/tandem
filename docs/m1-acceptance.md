@@ -179,17 +179,17 @@ uv run --offline --no-sync tandem cancel --db $limit --task-id m1-limit
 预期：run=**2**，显示达到最大轮数；仍待处理，attempt=1，不能循环到“成功”。cancel=0。默认最大轮数为 10。
 
 <a id="case-f"></a>
-### F. 模拟证据降级：派活前阻止
+### F. 等级只升不降：只碰普通文件也保持 D
 
 ```powershell
 uv run --offline --no-sync tandem submit --db $drop --task-id m1-drop --mode multi_agent --paths src/tandem/core/model.py
 uv run --offline --no-sync tandem run --db $drop --changes src/x.py
+uv run --offline --no-sync tandem approve --db $drop --task-id m1-drop --sha <方案 SHA>
+uv run --offline --no-sync tandem run --db $drop --changes docs/x.md --until-idle
 uv run --offline --no-sync tandem show m1-drop --db $drop
-uv run --offline --no-sync tandem run --db $drop
-uv run --offline --no-sync tandem cancel --db $drop --task-id m1-drop
 ```
 
-预期：第一次 run=1，醒目提示 D→C 被阻止；仍为 D、待处理、attempt=0，没有派活事件。缺少 --changes 的 run=2、参数错误。CLI 有显式 `--allow-level-drop`，本路线不使用；它是模拟层防误操作措施，**不代表你已决定全局采用“等级只升不降”**。
+预期：第一次 run=1，停在"待你批准方案"；批准后第二次 run 用 `--changes docs/x.md`（单看这次改动只算 C），任务等级**保持 D**，走到"待AI审核 → 待你审核"停下，不会自动合并；`show` 的原因里写着"本次改动算出 C 级，但任务已是 D 级，保持 D 级（等级只升不降）"。缺少 `--changes` 的 run=2；`--allow-level-drop` 已被删除，传了就是参数错误（run=2）。
 
 <a id="case-g"></a>
 ### G. 加练：拒绝修改后，按完整意见键逐项回应

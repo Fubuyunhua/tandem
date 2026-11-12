@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import assert_never
 
 from tandem.core.identity import is_commit_oid
-from tandem.core.level import bottom_line_reasons, compute_level
+from tandem.core.level import bottom_line_reasons, compute_level, keep_stricter
 from tandem.core.model import (
     Action,
     ActionKind,
@@ -513,6 +513,16 @@ NEW_SUBMISSION_STATES = frozenset(
 )
 
 
+def _level_reason(task: TaskRecord, computed: Level, kept: Level) -> str:
+    """等级说明：只升不降时要能看懂"算出 X、任务已是 Y、保持 Y"（K7）。"""
+    if kept is computed:
+        return f"按真实改动算出来是 {computed.value} 级"
+    return (
+        f"本次改动算出 {computed.value} 级，但任务已是 {task.level.value} 级，"
+        f"保持 {kept.value} 级（等级只升不降）"
+    )
+
+
 def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decision:
     """5 / 5b. 处理中 → 待验收，或者重新算级别后升成 D 级 → 待你批准方案。"""
     if task.status is not TaskStatus.WORKING:
@@ -526,8 +536,10 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
             task, f"回执带的是第 {event.attempt} 次尝试，和当前第 {task.attempt} 次对不上"
         )
 
-    # 按真实改动重新算级别（每次都重算，不沿用上一次的结果）
-    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    # 按真实改动重新算级别，再和任务当前等级取更严格的（K7：只升不降）
+    computed_level = compute_level(event.changes, policy, event.model_suggestion)
+    new_level = keep_stricter(task.level, computed_level)
+    level_note = _level_reason(task, computed_level, new_level)
     rule = policy.rule_for(new_level)
     plan_pending = rule.requires_plan_approval and task.approved_plan_version != task.plan_version
     actions = _Actions(task, task.state_version + 1)
@@ -539,7 +551,7 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         return _transition(
             task,
             TaskStatus.AWAITING_PLAN_APPROVAL,
-            f"按真实改动重新算出来是 {new_level.value} 级，方案还没批准",
+            f"{level_note}，方案还没批准",
             actions.items,
             level=new_level,
             plan_version=entry.version,
@@ -556,7 +568,7 @@ def _on_code_submitted(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     return _transition(
         task,
         TaskStatus.AWAITING_ACCEPTANCE,
-        f"交回代码 {event.sha}，按真实改动算出来是 {new_level.value} 级",
+        f"交回代码 {event.sha}，{level_note}",
         actions.items,
         level=new_level,
         # 新提交让旧结论、批准、否决、旧审核席位全部作废
@@ -586,7 +598,9 @@ def _on_new_submission(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     ):
         return _ignore(task, "合并已经开始，新提交先记下，等核对合并结果后再决定")
 
-    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    computed_level = compute_level(event.changes, policy, event.model_suggestion)
+    new_level = keep_stricter(task.level, computed_level)
+    level_note = _level_reason(task, computed_level, new_level)
     rule = policy.rule_for(new_level)
     plan_approved = (
         task.approved_plan_version is not None and task.approved_plan_version == task.plan_version
@@ -611,7 +625,7 @@ def _on_new_submission(task: TaskRecord, event: Event, policy: Policy) -> Decisi
         return _transition(
             task,
             TaskStatus.AWAITING_PLAN_APPROVAL,
-            f"新提交 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
+            f"新提交 {event.sha}：{level_note}，方案还没批准",
             actions.items,
             plan_version=entry.version,
             plan_history=task.plan_history + (entry,),
@@ -621,7 +635,7 @@ def _on_new_submission(task: TaskRecord, event: Event, policy: Policy) -> Decisi
     return _transition(
         task,
         TaskStatus.AWAITING_ACCEPTANCE,
-        f"新提交 {event.sha}（{new_level.value} 级），旧审核结论和批准全部作废",
+        f"新提交 {event.sha}（{level_note}），旧审核结论和批准全部作废",
         actions.items,
         **invalidated,
     )
@@ -1145,7 +1159,9 @@ def _on_you_submitted_code(task: TaskRecord, event: Event, policy: Policy) -> De
     if event.sha is None or event.changes is None:
         return _ignore(task, "你提交代码时要带提交编号和真实改动，否则按无效提交处理")
 
-    new_level = compute_level(event.changes, policy, event.model_suggestion)
+    computed_level = compute_level(event.changes, policy, event.model_suggestion)
+    new_level = keep_stricter(task.level, computed_level)
+    level_note = _level_reason(task, computed_level, new_level)
     rule = policy.rule_for(new_level)
     plan_approved = (
         task.approved_plan_version is not None and task.approved_plan_version == task.plan_version
@@ -1174,7 +1190,7 @@ def _on_you_submitted_code(task: TaskRecord, event: Event, policy: Policy) -> De
         return _transition(
             task,
             TaskStatus.AWAITING_PLAN_APPROVAL,
-            f"你提交的 {event.sha} 按真实改动算出来是 {new_level.value} 级，方案还没批准",
+            f"你提交的 {event.sha}：{level_note}，方案还没批准",
             actions.items,
             plan_version=entry.version,
             plan_history=task.plan_history + (entry,),
@@ -1184,7 +1200,7 @@ def _on_you_submitted_code(task: TaskRecord, event: Event, policy: Policy) -> De
     return _transition(
         task,
         TaskStatus.AWAITING_ACCEPTANCE,
-        f"你提交了代码 {event.sha}（{new_level.value} 级），参与过的 AI：{involved}",
+        f"你提交了代码 {event.sha}（{level_note}），参与过的 AI：{involved}",
         actions.items,
         **shared,
     )

@@ -163,6 +163,21 @@ def all_paths_relaxable(changes: ChangeSet, policy: Policy) -> bool:
     )
 
 
+def keep_stricter(current: Level, computed: Level) -> Level:
+    """任务等级只升不降（K7）。
+
+    取"任务当前等级"和"本次改动算出的等级"里更严格的那个。三个重算入口
+    （交回代码、审核期间的新提交、你提交代码）都必须经过这里，不要在各自
+    的实现里各写一遍比较。
+
+    为什么只升不降：D 级的方案批准、你的审核这类人工关口是按任务等级给出的；
+    如果后续一次"看起来只改了普通文件"的提交把任务降回 C，那些关口就会
+    在没有人看见的情况下消失（ADR-0001 的"宁可多报"）。代价是等级一旦升高
+    就不再回落，要降级必须走显式的人工政策变更。
+    """
+    return current.stricter(computed)
+
+
 def base_level(changes: ChangeSet, policy: Policy) -> Level:
     """只看规则的基础级别。"""
     if hits_bottom_line(changes, policy):

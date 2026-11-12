@@ -7,7 +7,6 @@ import sys
 from dataclasses import dataclass
 from hashlib import sha256
 
-from tandem.core.level import compute_level
 from tandem.core.model import (
     ActionKind,
     ActionStatus,
@@ -48,7 +47,6 @@ class LocalRun:
     agents: dict[str, FakeAgent]
     agent_script: str = "ok"
     review: str = "pass"
-    allow_level_drop: bool = False
 
     def _event(self, task: TaskRecord, kind: EventKind, **fields: object) -> Event:
         return Event(
@@ -88,18 +86,7 @@ class LocalRun:
         return render_receipt("DONE：模拟写手交回代码", payload)
 
     def _assign(self, task: TaskRecord) -> TaskRecord:
-        # 在派活、产生回执和保存事件前核对，拒绝降级时任务完全不变。
-        changes = self.runner.diff_source.collect(task.base_sha, "simulation").changes
-        new_level = compute_level(changes, self.runner.policy)
-        if new_level.rank < task.level.rank:
-            print(
-                f"【等级下降{'已允许' if self.allow_level_drop else '已阻止'}】"
-                f"{task.task_id}：{task.level.value} → {new_level.value}。"
-                "模拟证据不能证明这次真的只改了低风险文件；可能减少审核或人工关口。"
-            )
-            if not self.allow_level_drop:
-                print("  已停止此任务；确认后必须显式传入 --allow-level-drop 才能继续。")
-                return task
+        # 等级由内核按真实改动重算，并且只升不降（K7）；外壳不再需要拦截降级。
         provider = self.runner.policy.default_writer
         agent = self.agents[provider]
         # 派活同步完成；被内核拒绝派活时，不把未使用的回执留给别的任务。
@@ -218,10 +205,7 @@ class LocalRun:
             else:
                 print("  CI 尚未通过，不能批准；本轮未提供介入后的重做命令。")
         elif task.status is TaskStatus.PENDING:
-            print(
-                "  检查等级下降提示或写手额度，"
-                "调整 --changes / --agent-script / --review 后再 run。"
-            )
+            print("  检查写手额度或改动证据，调整 --changes / --agent-script / --review 后再 run。")
         elif task.status is TaskStatus.AWAITING_ACCEPTANCE:
             print(
                 "  等待当前提交的 CI；核对提交编号后再 run 生成模拟 CI，真实 CI 请到 GitHub 核对。"
