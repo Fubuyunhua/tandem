@@ -296,6 +296,23 @@ def check_approval_route(before: TaskRecord, ev: Event, decision: Decision) -> N
         )
 
 
+def check_approval_sha(before: TaskRecord, ev: Event, decision: Decision) -> None:
+    """P3：批准必须绑定当前提交编号才能进入待合并（r4 问题 3）。
+
+    内核里 _on_your_approval / _on_intervention_approved 都要求
+    ``event.sha == task.latest_sha``，否则忽略。这条不变量之前没有 oracle：
+    去掉 sha 校验后，C 级任务收到任何编号的批准都会进入待合并，而
+    check_review_count 在"有人工批准"时提前返回，于是全部放行。
+    """
+    if ev.kind not in (EventKind.YOUR_APPROVAL, EventKind.INTERVENTION_APPROVED):
+        return
+    bound = ev.sha is not None and ev.sha == before.latest_sha
+    if decision.changed and decision.task.status is TaskStatus.AWAITING_MERGE:
+        assert bound, "approval_sha: merged on an approval for another commit"
+    elif not bound:
+        assert not decision.changed, "approval_sha: unbound approval changed the record"
+
+
 def check_fresh(before: TaskRecord, decision: Decision) -> None:
     after = decision.task
     if after.latest_sha != before.latest_sha:
@@ -458,6 +475,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
         check_version(before, decision)
         check_d(before, decision, human_sha)
         check_approval_route(before, ev, decision)
+        check_approval_sha(before, ev, decision)
         check_plan_approval(before, ev, decision)
         check_fresh(before, decision)
         task = decision.task
@@ -471,6 +489,27 @@ def walk(level: Level, kinds: list[EventKind], policy: Policy | None = None) -> 
             task, replace(advance(task), kind=kind), selected, QuotaSnapshot(), NOW
         ).task
     return task
+
+
+def test_approval_sha_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3：去掉"批准绑定当前提交编号"的校验后，oracle 必须报错。"""
+    policy = make_policy(RunMode.SINGLE_AGENT)
+    task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED, EventKind.CI_GREEN], policy)
+    assert task.status is TaskStatus.AWAITING_YOUR_REVIEW
+    ev = event(task, EventKind.YOUR_APPROVAL, sha=oid(777))
+    baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert not baseline.changed
+    check_approval_sha(task, ev, baseline)
+    original = core._on_your_approval
+
+    def ignore_approval_sha(task: TaskRecord, ev: Event, policy: Policy) -> Decision:
+        return original(task, replace(ev, sha=task.latest_sha), policy)
+
+    monkeypatch.setattr(core, "_on_your_approval", ignore_approval_sha)
+    decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    with pytest.raises(AssertionError, match="approval_sha"):
+        check_approval_sha(task, ev, decision)
 
 
 def test_approval_route_rejects_approval_from_acceptance(
