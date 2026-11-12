@@ -1,0 +1,372 @@
+"""GitHub 边界：只通过 gh 的登录状态访问，写入必须显式启用。"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import subprocess
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from typing import Protocol, cast
+
+logger = logging.getLogger(__name__)
+
+
+class GitHubError(RuntimeError):
+    """只向外暴露固定错误，不泄露命令输出中的凭据。"""
+
+
+def safe_action_error(error: GitHubError) -> str:
+    """只转发已知固定动作错误；替身或未来后端的任意输出不能进入日志。"""
+    known = {
+        "缺少匹配仓库的 PR 关联",
+        "合并缺少当前提交的批准或 CI 证据",
+        "PR 不存在",
+        "PR 的 head SHA 与预期不一致，拒绝合并",
+        "PR 已关闭，拒绝合并",
+        "CI 尚未全部通过，拒绝合并",
+        "GitHub 未确认合并成功",
+        "合并后的状态尚未确认",
+        "PR 已合并，不能关闭",
+        "关闭后的状态尚未确认",
+        "gh 命令失败",
+        "gh 无法执行或返回了无效数据",
+        "GitHub 返回的数据格式错误",
+        "GitHub 返回的列表格式错误",
+        "GitHub 返回的文本格式错误",
+        "PR 状态格式错误",
+        "编号必须为正整数",
+        "提交编号格式错误",
+    }
+    message = str(error)
+    return message if message in known else "GitHub 返回未知错误，详情已隐藏"
+
+
+class CIState(Enum):
+    GREEN = "green"
+    RED = "red"
+    PENDING = "pending"
+
+
+@dataclass(frozen=True)
+class Issue:
+    number: int
+    title: str = ""
+    body: str = ""
+    labels: tuple[str, ...] = ()
+    state: str = "open"
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    head_sha: str
+    state: str = "open"
+    merged: bool = False
+
+
+class GitHubClient(Protocol):
+    def list_issues(self) -> tuple[Issue, ...]: ...
+    def get_pr(self, number: int) -> PullRequest: ...
+    def get_ci(self, sha: str) -> CIState: ...
+    def merge_pr(self, number: int, expected_sha: str, *, live: bool = False) -> bool: ...
+    def close_pr(self, number: int, *, live: bool = False) -> bool: ...
+    def comment(self, number: int, body: str, *, live: bool = False) -> bool: ...
+
+
+def _number(number: int) -> str:
+    if number <= 0:
+        raise GitHubError("编号必须为正整数")
+    return str(number)
+
+
+def _sha(sha: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+        raise GitHubError("提交编号格式错误")
+    return sha
+
+
+class GitHubWrites:
+    """真假实现共用核对规则；合并/关闭读回确认，评论仅确认 API 接收。"""
+
+    def get_pr(self, number: int) -> PullRequest:
+        raise NotImplementedError
+
+    def get_ci(self, sha: str) -> CIState:
+        raise NotImplementedError
+
+    def _issue_state(self, number: int) -> str:
+        raise NotImplementedError
+
+    def _write(self, resource: str, payload: dict[str, object], method: str) -> object:
+        raise NotImplementedError
+
+    def merge_pr(self, number: int, expected_sha: str, *, live: bool = False) -> bool:
+        resource = f"pulls/{_number(number)}/merge"
+        _sha(expected_sha)
+        pr = self.get_pr(number)
+        if pr.head_sha != expected_sha:
+            raise GitHubError("PR 的 head SHA 与预期不一致，拒绝合并")
+        if pr.merged:
+            return True
+        if pr.state != "open":
+            raise GitHubError("PR 已关闭，拒绝合并")
+        if self.get_ci(expected_sha) is not CIState.GREEN:
+            raise GitHubError("CI 尚未全部通过，拒绝合并")
+        if not live:
+            return False
+        result = _mapping(
+            self._write(resource, {"sha": expected_sha, "merge_method": "squash"}, "PUT")
+        )
+        if result.get("merged") is not True:
+            raise GitHubError("GitHub 未确认合并成功")
+        confirmed = self.get_pr(number)
+        if not confirmed.merged or confirmed.head_sha != expected_sha:
+            raise GitHubError("合并后的状态尚未确认")
+        return True
+
+    def close_pr(self, number: int, *, live: bool = False) -> bool:
+        resource = f"pulls/{_number(number)}"
+        pr = self.get_pr(number)
+        if pr.merged:
+            raise GitHubError("PR 已合并，不能关闭")
+        if pr.state == "closed":
+            return True
+        if not live:
+            return False
+        self._write(resource, {"state": "closed"}, "PATCH")
+        confirmed = self.get_pr(number)
+        if confirmed.state != "closed" or confirmed.merged:
+            raise GitHubError("关闭后的状态尚未确认")
+        return True
+
+    def comment(self, number: int, body: str, *, live: bool = False) -> bool:
+        resource = f"issues/{_number(number)}/comments"
+        self._issue_state(number)
+        if not live:
+            return False
+        self._write(resource, {"body": body}, "POST")
+        return True
+
+
+def _mapping(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise GitHubError("GitHub 返回的数据格式错误")
+    return cast("dict[str, object]", value)
+
+
+def _items(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise GitHubError("GitHub 返回的列表格式错误")
+    return cast("list[object]", value)
+
+
+def _text(value: object) -> str:
+    if not isinstance(value, str):
+        raise GitHubError("GitHub 返回的文本格式错误")
+    return value
+
+
+def _parse_issue(raw: object) -> Issue | None:
+    """逐条解析；PR 在读取 Issue 字段前排除，畸形数据交由调用方记录。"""
+    item = _mapping(raw)
+    if "pull_request" in item:
+        return None
+    number = item.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise GitHubError("Issue 编号格式错误")
+    _number(number)
+    state = _text(item.get("state"))
+    if state not in {"open", "closed"}:
+        raise GitHubError("Issue 状态格式错误")
+    labels = tuple(_text(_mapping(label).get("name")) for label in _items(item.get("labels")))
+    body = item.get("body")
+    return Issue(
+        number, _text(item.get("title")), "" if body is None else _text(body), labels, state
+    )
+
+
+@dataclass
+class GhGitHub(GitHubWrites):
+    """参数列表启动 gh；评论正文通过标准输入的 JSON 传递。"""
+
+    repo: str
+    timeout: float = 30
+    required_checks: tuple[str, ...] = ("check",)
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repo):
+            raise GitHubError("仓库必须为 owner/repo")
+        if (
+            not self.required_checks
+            or any(not name.strip() or name != name.strip() for name in self.required_checks)
+            or len(set(self.required_checks)) != len(self.required_checks)
+        ):
+            raise GitHubError("必需检查名单不能为空、重名或包含空白名称")
+
+    def _api(
+        self,
+        resource: str,
+        *,
+        payload: dict[str, object] | None = None,
+        method: str = "GET",
+        pages: bool = False,
+    ) -> object:
+        args = ["gh", "api", f"repos/{self.repo}/{resource}", "--method", method]
+        if pages:
+            args.extend(["--paginate", "--slurp"])
+        if payload is not None:
+            args.extend(["--input", "-"])
+        try:
+            result = subprocess.run(
+                args,
+                input=None if payload is None else json.dumps(payload),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=self.timeout,
+                check=False,
+                shell=False,
+            )
+            if result.returncode:
+                raise GitHubError("gh 命令失败")
+            return cast(object, json.loads(result.stdout))
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            raise GitHubError("gh 无法执行或返回了无效数据") from None
+
+    def _write(self, resource: str, payload: dict[str, object], method: str) -> object:
+        return self._api(resource, payload=payload, method=method)
+
+    def list_issues(self) -> tuple[Issue, ...]:
+        issues: list[Issue] = []
+        pages = _items(self._api("issues?state=open&labels=agent&per_page=100", pages=True))
+        for page_number, page in enumerate(pages, start=1):
+            for position, raw in enumerate(_items(page), start=1):
+                try:
+                    issue = _parse_issue(raw)
+                except GitHubError:
+                    # 仅记录位置，不把不可信字段或异常文本复制到日志。
+                    logger.warning(
+                        "GitHub 跳过第 %d 页第 %d 条无效 Issue（字段格式错误）",
+                        page_number,
+                        position,
+                    )
+                    continue
+                if issue is not None and issue.state == "open" and "agent" in issue.labels:
+                    issues.append(issue)
+        return tuple(issues)
+
+    def get_pr(self, number: int) -> PullRequest:
+        data = _mapping(self._api(f"pulls/{_number(number)}"))
+        merged = data.get("merged")
+        state = _text(data.get("state"))
+        if not isinstance(merged, bool) or state not in {"open", "closed"}:
+            raise GitHubError("PR 状态格式错误")
+        return PullRequest(
+            number, _sha(_text(_mapping(data.get("head")).get("sha"))), state, merged
+        )
+
+    def _issue_state(self, number: int) -> str:
+        return _text(_mapping(self._api(f"issues/{_number(number)}")).get("state"))
+
+    def get_ci(self, sha: str) -> CIState:
+        """按精确名称收集必需证据；同名的多条有效证据必须全部成功。"""
+        prefix = f"commits/{_sha(sha)}"
+        by_name: dict[str, list[CIState]] = {name: [] for name in self.required_checks}
+        for page in _items(
+            self._api(f"{prefix}/check-runs?per_page=100&filter=latest", pages=True)
+        ):
+            for raw in _items(_mapping(page).get("check_runs")):
+                check = _mapping(raw)
+                name = check.get("name")
+                if not isinstance(name, str) or name not in by_name:
+                    continue
+                if check.get("status") != "completed":
+                    by_name[name].append(CIState.PENDING)
+                elif check.get("conclusion") == "success":
+                    by_name[name].append(CIState.GREEN)
+                else:
+                    # 必需检查被跳过或 neutral 都没有给出成功证据。
+                    by_name[name].append(CIState.RED)
+        # 旧式 status 按 context 只取最新一条；其余检查不能干扰必需名单。
+        seen: set[str] = set()
+        for page in _items(self._api(f"{prefix}/statuses?per_page=100", pages=True)):
+            for raw in _items(page):
+                status = _mapping(raw)
+                context = _text(status.get("context"))
+                if context not in by_name or context in seen:
+                    continue
+                seen.add(context)
+                state = status.get("state")
+                by_name[context].append(
+                    CIState.GREEN
+                    if state == "success"
+                    else CIState.RED
+                    if state in {"error", "failure"}
+                    else CIState.PENDING
+                )
+        # 工作流尚未登记全部必需检查时，不提前结束这一轮验收。
+        if any(not states for states in by_name.values()):
+            return CIState.PENDING
+        conclusions = [state for states in by_name.values() for state in states]
+        if CIState.RED in conclusions:
+            return CIState.RED
+        if CIState.PENDING in conclusions:
+            return CIState.PENDING
+        return CIState.GREEN
+
+
+@dataclass
+class FakeGitHub(GitHubWrites):
+    """内存替身；writes 只记录真正启用的写入，fail 用于模拟故障。"""
+
+    issues: tuple[Issue, ...] = ()
+    prs: dict[int, PullRequest] = field(default_factory=dict[int, PullRequest])
+    checks: dict[str, CIState] = field(default_factory=dict[str, CIState])
+    writes: list[tuple[str, dict[str, object]]] = field(
+        default_factory=list[tuple[str, dict[str, object]]]
+    )
+    fail: bool = False
+
+    def _check(self) -> None:
+        if self.fail:
+            raise GitHubError("gh 命令失败")
+
+    def list_issues(self) -> tuple[Issue, ...]:
+        self._check()
+        return tuple(i for i in self.issues if i.state == "open" and "agent" in i.labels)
+
+    def get_pr(self, number: int) -> PullRequest:
+        self._check()
+        if number not in self.prs:
+            raise GitHubError("PR 不存在")
+        return self.prs[number]
+
+    def get_ci(self, sha: str) -> CIState:
+        self._check()
+        return self.checks.get(sha, CIState.PENDING)
+
+    def _issue_state(self, number: int) -> str:
+        self._check()
+        if number in self.prs:
+            return self.prs[number].state
+        for issue in self.issues:
+            if issue.number == number:
+                return issue.state
+        raise GitHubError("Issue 不存在")
+
+    def _write(self, resource: str, payload: dict[str, object], method: str) -> object:
+        self._check()
+        number = int(resource.split("/")[1])
+        if resource.endswith("/merge"):
+            # 模拟服务端的原子 SHA 条件，覆盖读后、写前出现新提交的竞争。
+            if self.prs[number].head_sha != payload.get("sha"):
+                raise GitHubError("PR 的 head SHA 与预期不一致，拒绝合并")
+            self.writes.append((resource, payload))
+            self.prs[number] = replace(self.prs[number], state="closed", merged=True)
+            return {"merged": True}
+        self.writes.append((resource, payload))
+        if method == "PATCH":
+            self.prs[number] = replace(self.prs[number], state="closed")
+        return {}

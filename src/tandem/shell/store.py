@@ -32,6 +32,16 @@ from tandem.core.model import (
 from tandem.shell import serde
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS github_sources (
+    task_id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    pr_number INTEGER,
+    UNIQUE(repo, issue_number),
+    UNIQUE(repo, pr_number)
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL,
@@ -109,6 +119,18 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass(frozen=True)
+class GitHubSource:
+    """外壳来源数据；标题和正文始终作为不可信数据保存。"""
+
+    task_id: str
+    repo: str
+    issue_number: int
+    title: str
+    body: str
+    pr_number: int | None = None
+
+
 class Store:
     """一个 SQLite 数据库。用完记得 ``close()``，或者用 ``with``。"""
 
@@ -129,6 +151,47 @@ class Store:
 
     def close(self) -> None:
         self._connection.close()
+
+    def github_source(self, task_id: str) -> GitHubSource | None:
+        row = self._connection.execute(
+            "SELECT * FROM github_sources WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return GitHubSource(
+            task_id=str(row["task_id"]),
+            repo=str(row["repo"]),
+            issue_number=int(row["issue_number"]),
+            title=str(row["title"]),
+            body=str(row["body"]),
+            pr_number=None if row["pr_number"] is None else int(row["pr_number"]),
+        )
+
+    def save_github_source(self, source: GitHubSource) -> None:
+        """来源不可换仓库；PR 关联一经建立就不允许静默替换。"""
+        old = self.github_source(source.task_id)
+        if old is not None and (
+            old.repo != source.repo
+            or old.issue_number != source.issue_number
+            or (old.pr_number is not None and old.pr_number != source.pr_number)
+        ):
+            raise ConflictError("GitHub 来源或 PR 关联冲突")
+        try:
+            with self._connection:
+                self._connection.execute(
+                    "INSERT INTO github_sources VALUES (?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(task_id) DO UPDATE SET pr_number = excluded.pr_number",
+                    (
+                        source.task_id,
+                        source.repo,
+                        source.issue_number,
+                        source.title,
+                        source.body,
+                        source.pr_number,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            raise ConflictError("GitHub Issue 或 PR 已关联其他任务，拒绝重复关联") from None
 
     # ------------------------------------------------------------ 事件
 

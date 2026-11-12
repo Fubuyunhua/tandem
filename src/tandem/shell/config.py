@@ -37,6 +37,7 @@ class Config:
     policy: Policy
     providers: tuple[ProviderSpec, ...]
     run_mode: RunMode
+    required_checks: tuple[str, ...] = ("check",)
 
 
 def _mapping(data: object, name: str) -> dict[str, Any]:
@@ -204,7 +205,16 @@ def parse_config(data: object) -> Config:
         thresholds=thresholds,
         level_rules=_level_rules(root.get("levels"), thresholds),
     )
-    return Config(policy=policy, providers=providers, run_mode=run_mode)
+    required_checks = _str_list(root.get("required_checks", ["check"]), "required_checks")
+    if (
+        not required_checks
+        or any(not name.strip() or name != name.strip() for name in required_checks)
+        or len(set(required_checks)) != len(required_checks)
+    ):
+        raise ConfigError("required_checks 必须是非空、不重复且名称无首尾空白的检查列表")
+    return Config(
+        policy=policy, providers=providers, run_mode=run_mode, required_checks=required_checks
+    )
 
 
 def load_config(path: Path | None = None) -> Config:
