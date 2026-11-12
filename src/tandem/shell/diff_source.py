@@ -174,8 +174,19 @@ class GitDiffSource:
     _environment: dict[str, str] | None = field(default=None, repr=False, compare=False)
 
     def resolve_oid(self, ref: str) -> str:
-        value = self._git_bytes("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
-        oid = value.decode("ascii").strip().lower()
+        completed = subprocess.run(
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+            cwd=self.cwd,
+            env=self._environment or _clean_git_environment(),
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace").strip()
+            raise DiffError(
+                f"解析不到提交 {ref}：{detail}；浅克隆或部分克隆里，边界之外的对象可能不在本地"
+            )
+        oid = completed.stdout.decode("ascii", "replace").strip().lower()
         if not is_commit_oid(oid):
             raise DiffError("Git 未返回完整提交 OID")
         return oid
@@ -183,6 +194,10 @@ class GitDiffSource:
     def collect(self, base: str, sha: str) -> CollectedDiff:
         sha = self.resolve_oid(sha)
         base = self.resolve_oid(base)
+        # 共同祖先在**源仓库**里算：浅克隆的边界（.git/shallow）只存在于源仓库，
+        # 隔离仓库里没有它，在那里跑 merge-base 会去读边界之外不存在的父提交。
+        # 隔离仓库因此只做"两个已知提交之间的树/内容比较"，完全不碰祖先关系。
+        merge_base = self._merge_base(base, sha)
         # 只借用对象库；临时 bare 仓库没有用户 diff.*、属性驱动或原仓库配置。
         objects = Path(self._git_bytes("rev-parse", "--git-path", "objects").decode().strip())
         if not objects.is_absolute():
@@ -207,11 +222,10 @@ class GitDiffSource:
             if initialized.returncode:
                 raise DiffError("无法创建隔离的 Git 读取环境")
             env["GIT_OBJECT_DIRECTORY"] = str(objects.resolve())
-            return replace(self, cwd=bare, _environment=env)._collect_oids(base, sha)
+            return replace(self, cwd=bare, _environment=env)._collect_oids(base, merge_base, sha)
 
-    def _collect_oids(self, base: str, sha: str) -> CollectedDiff:
-        # 先求共同祖先，再看"受审分支相对共同祖先"改了什么
-        merge_base = self._merge_base(base, sha)
+    def _collect_oids(self, base: str, merge_base: str, sha: str) -> CollectedDiff:
+        # 受审提交相对共同祖先改了什么（merge_base 已在源仓库里算好，是完整 OID）
         # -z：用 NUL 分隔并且**不做**引号转义，中文、制表符、双引号都能原样拿到
         payload = self._git_bytes(
             "diff",
@@ -306,7 +320,8 @@ class GitDiffSource:
     def _merge_base(self, base: str, sha: str) -> str:
         """两条历史的分叉点。没有共同祖先时不猜"之前"是什么。"""
         merged = subprocess.run(
-            ["git", "merge-base", base, sha],
+            # --no-replace-objects：本地 replace 引用不能改变祖先关系
+            ["git", "--no-replace-objects", "merge-base", base, sha],
             cwd=self.cwd,
             env=self._environment or _clean_git_environment(),
             capture_output=True,
@@ -317,7 +332,8 @@ class GitDiffSource:
         )
         if merged.returncode != 0:
             raise DiffError(
-                f"{base} 和 {sha} 没有共同祖先，算不出'之前'的内容：{merged.stderr.strip()}"
+                f"{base} 和 {sha} 没有共同祖先，算不出'之前'的内容"
+                f"（浅克隆里 base 可能落在边界之外）：{merged.stderr.strip()}"
             )
         return merged.stdout.strip()
 

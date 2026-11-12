@@ -84,3 +84,43 @@ def test_deleted_document_remains_bottom_line_d(tmp_path: Path) -> None:
     changes = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD").changes
     assert changes.file_changes[0].after_mode == "000000"
     assert compute_level(changes, load_policy(), Level.B) is Level.D
+
+
+def _shallow_clone(tmp_path: Path, depth: int = 2) -> Path:
+    """用 file:// 做一个浅克隆，模拟 CI 里的默认检出方式。"""
+    origin = _make_repo(tmp_path)
+    for index in range(3):
+        _commit_file(origin, f"app{index}.py", f"x={index}\n", f"commit {index}")
+    target = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--depth", str(depth), f"file://{origin}", str(target)],
+        check=True,
+        capture_output=True,
+    )
+    _git(target, "config", "user.email", "test@example.com")
+    _git(target, "config", "user.name", "test")
+    return target
+
+
+def test_shallow_clone_still_collects_the_last_two_commits(tmp_path: Path) -> None:
+    """浅克隆里相邻两个提交本来就够算 merge-base，采集不能因为找不到更早的父提交就失败。"""
+    root = _shallow_clone(tmp_path)
+    assert (root / ".git" / "shallow").exists()
+
+    collected = GitDiffSource(cwd=root).collect("HEAD~1", "HEAD")
+
+    assert collected.changes.paths, "浅克隆里也应该读到真实改动"
+    assert "app2.py" in collected.changes.paths
+
+
+def test_shallow_clone_reports_a_clear_error_when_base_is_outside_the_boundary(
+    tmp_path: Path,
+) -> None:
+    """base 落在浅克隆边界之外时，要明确报 DiffError，而不是静默算出空改动。"""
+    root = _shallow_clone(tmp_path)
+
+    with pytest.raises(DiffError) as raised:
+        GitDiffSource(cwd=root).collect("HEAD~5", "HEAD")
+
+    message = str(raised.value)
+    assert "HEAD~5" in message or "浅克隆" in message or "对象" in message
