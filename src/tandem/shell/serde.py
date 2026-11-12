@@ -20,6 +20,7 @@ from tandem.core.model import (
     CheckResult,
     Event,
     EventKind,
+    FileChange,
     Finding,
     Level,
     OpenFinding,
@@ -29,6 +30,7 @@ from tandem.core.model import (
     RunMode,
     TaskRecord,
     TaskStatus,
+    TestWeakening,
     Verdict,
     VetoReason,
 )
@@ -115,6 +117,22 @@ def changes_to_dict(changes: ChangeSet) -> dict[str, object]:
         "assertions_after": changes.assertions_after,
         "assertion_drops": [assertion_drop_to_dict(drop) for drop in changes.assertion_drops],
         "secret_scan_hit": changes.secret_scan_hit,
+        "removed_test_paths": list(changes.removed_test_paths),
+        "test_weakenings": [
+            {"path": item.path, "reason": item.reason, "line": item.line}
+            for item in changes.test_weakenings
+        ],
+        "file_changes": [
+            {
+                "path": item.path,
+                "before_mode": item.before_mode,
+                "after_mode": item.after_mode,
+                "previous_path": item.previous_path,
+                "before_target": item.before_target,
+                "after_target": item.after_target,
+            }
+            for item in changes.file_changes
+        ],
     }
 
 
@@ -142,6 +160,39 @@ def changes_from_dict(data: object) -> ChangeSet:
             for entry in _list(mapping.get("assertion_drops", []), "assertion_drops")
         ),
         secret_scan_hit=_bool(mapping.get("secret_scan_hit", False), "secret_scan_hit"),
+        removed_test_paths=tuple(
+            _str(item, "removed_test_paths[]")
+            for item in _list(mapping.get("removed_test_paths", []), "removed_test_paths")
+        ),
+        test_weakenings=tuple(
+            test_weakening_from_dict(item)
+            for item in _list(mapping.get("test_weakenings", []), "test_weakenings")
+        ),
+        file_changes=tuple(
+            file_change_from_dict(item)
+            for item in _list(mapping.get("file_changes", []), "file_changes")
+        ),
+    )
+
+
+def file_change_from_dict(data: object) -> FileChange:
+    item = _mapping(data, "file_change")
+    return FileChange(
+        path=_str(item.get("path"), "path"),
+        before_mode=_str(item.get("before_mode"), "before_mode"),
+        after_mode=_str(item.get("after_mode"), "after_mode"),
+        previous_path=_optional_str(item, "previous_path"),
+        before_target=_optional_str(item, "before_target"),
+        after_target=_optional_str(item, "after_target"),
+    )
+
+
+def test_weakening_from_dict(data: object) -> TestWeakening:
+    item = _mapping(data, "test_weakening")
+    return TestWeakening(
+        _str(item.get("path"), "path"),
+        _str(item.get("reason"), "reason"),
+        _int(item.get("line"), "line"),
     )
 
 

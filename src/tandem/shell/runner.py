@@ -95,6 +95,7 @@ class Runner:
     def __post_init__(self) -> None:
         # 启动时接上存储，把之前记下的额度估计恢复回来
         self.quota.attach(self.store)
+        self.executor.github_store = self.store
 
     def submit(self, task_id: str, level: Level, *, base_sha: str = "main") -> TaskRecord:
         """建一个新任务。等级由提交时收集到的真实改动算好传进来。"""
@@ -121,8 +122,9 @@ class Runner:
             raise ReceiptError(
                 f"回执里的任务编号是 {receipt.task_id}，和当前任务 {task.task_id} 不一致"
             )
+        sha = self.diff_source.resolve_oid(receipt.sha)
         collected = self.diff_source.collect(
-            base if base is not None else (task.base_sha or "main"), receipt.sha
+            base if base is not None else (task.base_sha or "main"), sha
         )
         reason = collected.describe()
         if receipt.warnings:
@@ -132,7 +134,7 @@ class Runner:
             task_id=task.task_id,
             state_version=task.state_version,
             attempt=receipt.attempt,
-            sha=receipt.sha,
+            sha=sha,
             changes=collected.changes,
             reason=reason,
         )
@@ -179,19 +181,40 @@ class Runner:
                 decision=followup.decision,
                 executed=(*executed, *followup.executed),
             )
+        # 只有已确认的真实合并才生成成功事件，模拟执行不能推进到已合并。
+        if depth < self.max_followups and any(
+            item.action.kind is ActionKind.MERGE
+            and item.status is ActionStatus.DONE
+            and not item.simulated
+            for item in executed
+        ):
+            followup = self.handle(
+                Event(
+                    kind=EventKind.MERGED,
+                    task_id=decision.task.task_id,
+                    state_version=decision.task.state_version,
+                    sha=decision.task.approved_sha,
+                ),
+                depth=depth + 1,
+            )
+            return RunResult(followup.decision, (*executed, *followup.executed))
         return RunResult(decision=decision, executed=tuple(executed))
 
     def _incident_from(self, executed: list[ExecutedAction], now: datetime) -> Event | None:
-        """把"Agent 没跑起来"翻译成一条带错误码的异常事件。"""
+        """把 Agent 或 GitHub 动作失败翻译成带错误码的异常事件。"""
         for outcome in executed:
-            if outcome.action.kind is not ActionKind.START_AGENT:
+            if outcome.action.kind not in {
+                ActionKind.START_AGENT,
+                ActionKind.MERGE,
+                ActionKind.CLOSE_PR,
+            }:
                 continue
             if outcome.status is ActionStatus.UNKNOWN:
                 return Event(
                     kind=EventKind.INCIDENT,
                     task_id=outcome.action.task_id,
                     reason=outcome.message,
-                    error_code="A01",
+                    error_code="A01" if outcome.action.kind is ActionKind.START_AGENT else "G01",
                 )
         return None
 

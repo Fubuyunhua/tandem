@@ -14,6 +14,7 @@ from tandem.core.model import (
     Decision,
     Event,
     EventKind,
+    FileChange,
     Finding,
     Level,
     Policy,
@@ -39,7 +40,10 @@ CODE_CHANGES = ChangeSet(paths=("src/tandem/shell/cli.py",))
 
 # 不通过（FAIL）的结论至少要带一条有编号、有正文的意见，测试里统一用这一条
 SOME_FINDINGS = (Finding(id="F1", text="这里有一个具体问题"),)
-DOC_CHANGES = ChangeSet(paths=("docs/design/note.md",))
+DOC_CHANGES = ChangeSet(
+    paths=("docs/design/note.md",),
+    file_changes=(FileChange("docs/design/note.md", "100644", "100644"),),
+)
 CORE_CHANGES = ChangeSet(paths=("src/tandem/core/model.py",))
 
 

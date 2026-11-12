@@ -28,7 +28,7 @@ dev = [
 testpaths = ["tests"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
 strict = ["src"]
 pythonVersion = "3.13"
 

@@ -1,4 +1,4 @@
-"""调用真实的 Claude CLI：``claude -p <提示词> --output-format json``。
+"""调用真实的 Claude CLI：提示词只走标准输入，不进入命令参数。
 
 带超时和强制结束。测试里不会运行它（会失败时直接抛 AgentError），
 M1 只在前台手动用，`tandem demo` 用的是假 Agent。
@@ -27,17 +27,19 @@ class ClaudeCliAgent:
         return False
 
     def build_command(self, request: AgentRequest) -> list[str]:
-        return [self.executable, "-p", request.prompt, "--output-format", "json"]
+        return [self.executable, "-p", "--output-format", "json"]
 
     def run(self, request: AgentRequest) -> str:
         process = subprocess.Popen(
             self.build_command(request),
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            shell=False,
         )
         try:
-            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+            stdout, stderr = process.communicate(input=request.prompt, timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
             # 超时就强制结束，不然进程会一直挂着
             process.kill()
