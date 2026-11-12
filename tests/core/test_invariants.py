@@ -296,6 +296,24 @@ def check_approval_route(before: TaskRecord, ev: Event, decision: Decision) -> N
         )
 
 
+def check_stale(before: TaskRecord, ev: Event, decision: Decision) -> None:
+    """P4：过期或错位的事件必须被忽略，状态和版本号都不变。
+
+    任务书要求生成器覆盖"过期、错位"事件，生成器一直在造（未来版本号、
+    别的任务编号），但之前没有任何 oracle 断言"这些事件必须被忽略"，
+    所以删掉版本号校验只能靠别的 oracle 偶然撞上。
+    """
+    if ev.task_id != before.task_id:
+        assert not decision.changed and decision.task == before, (
+            "stale: accepted an event for another task"
+        )
+        return
+    if ev.state_version is not None and ev.state_version != before.state_version:
+        assert not decision.changed and decision.task == before, (
+            "stale: accepted an event with a stale version"
+        )
+
+
 def check_approval_sha(before: TaskRecord, ev: Event, decision: Decision) -> None:
     """P3：批准必须绑定当前提交编号才能进入待合并（r4 问题 3）。
 
@@ -476,6 +494,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
         check_d(before, decision, human_sha)
         check_approval_route(before, ev, decision)
         check_approval_sha(before, ev, decision)
+        check_stale(before, ev, decision)
         check_plan_approval(before, ev, decision)
         check_fresh(before, decision)
         task = decision.task
@@ -489,6 +508,33 @@ def walk(level: Level, kinds: list[EventKind], policy: Policy | None = None) -> 
             task, replace(advance(task), kind=kind), selected, QuotaSnapshot(), NOW
         ).task
     return task
+
+
+def test_stale_event_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P4：删掉入口的版本号校验后，"过期事件被忽略"这条必须报错。"""
+    policy = make_policy()
+    task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED, EventKind.CI_GREEN])
+    assert task.status is TaskStatus.AWAITING_AI_REVIEW
+    seat = task.designated_reviewers[0]
+    stale_ev = replace(
+        event(task, EventKind.REVIEW, review=passing(task, seat)),
+        state_version=task.state_version + 1,
+    )
+    baseline = core.decide(task, stale_ev, policy, QuotaSnapshot(), NOW)
+    assert not baseline.changed
+    check_stale(task, stale_ev, baseline)
+    original = core._dispatch
+
+    def ignore_version(
+        task: TaskRecord, ev: Event, policy: Policy, quota: QuotaSnapshot
+    ) -> Decision:
+        return original(task, replace(ev, state_version=None), policy, quota)
+
+    monkeypatch.setattr(core, "_dispatch", ignore_version)
+    decision = core.decide(task, stale_ev, policy, QuotaSnapshot(), NOW)
+    assert decision.changed
+    with pytest.raises(AssertionError, match="stale"):
+        check_stale(task, stale_ev, decision)
 
 
 def test_approval_sha_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
