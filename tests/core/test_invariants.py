@@ -111,7 +111,18 @@ def check_separation(task: TaskRecord) -> None:
             assert review.provider not in task.providers_involved, "separation"
 
 
-def check_review_count(task: TaskRecord, policy: Policy, human: bool) -> None:
+def check_review_count(
+    task: TaskRecord,
+    policy: Policy,
+    human: bool,
+    seats: frozenset[str] | None = None,
+) -> None:
+    """多审核者不变量（P1）：结论必须来自本次**指定的审核席位**，且席位全过。
+
+    ``seats`` 是轨迹在"发出审核请求"那一步记下的席位（输入证据）。不传时退回
+    读记录里的 ``designated_reviewers``：那样能抓住"忽略席位校验"的退化，
+    但抓不住"把未受邀的人塞进席位"的退化，所以轨迹里一律传记下来的席位。
+    """
     if task.status is not TaskStatus.AWAITING_MERGE or human:
         return
     if not task.ci_green:
@@ -121,6 +132,7 @@ def check_review_count(task: TaskRecord, policy: Policy, human: bool) -> None:
         return
     if task.run_mode is RunMode.SINGLE_AGENT or task.level is Level.D:
         return
+    designated = set(task.designated_reviewers) if seats is None else set(seats)
     providers = {
         review.provider
         for review in task.reviews
@@ -129,8 +141,12 @@ def check_review_count(task: TaskRecord, policy: Policy, human: bool) -> None:
         and review.standard_version == task.standard_version
         and review.provider not in task.providers_involved
     }
+    assert providers <= designated, "review_count: pass from outside the designated seats"
     needed = policy.rule_for(task.level).min_reviewers
     assert len(providers) >= needed, "review_count"
+    if needed:
+        # 席位都得出结论，不能"两家够了就合并"而漏掉指定的那一家
+        assert designated <= providers, "review_count: designated seat has no pass"
 
 
 def check_terminal(before: TaskRecord, ev: Event, decision: Decision) -> None:
@@ -318,7 +334,7 @@ def advance(task: TaskRecord) -> Event:
     required=st.integers(2, 3),
     prefix=st.integers(0, 9),
     instructions=st.lists(
-        st.tuples(st.integers(0, 6), st.sampled_from(list(EventKind)), st.integers(0, 7)),
+        st.tuples(st.integers(0, 7), st.sampled_from(list(EventKind)), st.integers(0, 7)),
         min_size=1,
         max_size=200 if DEEP else 40,
     ),
@@ -328,6 +344,9 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
     task = core.create_task("trace", level, policy)
     green_sha: str | None = None
     human_sha: str | None = None
+    # 记下"这一步发出去的审核席位"，作为下一步的输入证据：
+    # 只看输出记录里的席位，抓不住"把未受邀的人塞进席位"的退化。
+    issued_seats: dict[str, frozenset[str]] = {}
     # Guarantee useful progress in every example, then interleave arbitrary events.
     instructions = [(0, EventKind.CREATED, 0)] * prefix + instructions
     for choice, kind, value in instructions:
@@ -371,6 +390,18 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
             quota = QuotaSnapshot(((PROVIDERS[value % 4], QuotaState.EXHAUSTED),))
         elif choice == 6:
             ev = replace(ev, kind=EventKind.PLAN_APPROVED, sha=None)
+        elif choice == 7:
+            # 未受邀的提供方发一条通过结论（既没写过代码，也不在席位里）
+            outsider = next(
+                (
+                    provider
+                    for provider in PROVIDERS
+                    if provider not in task.designated_reviewers
+                    and provider not in task.providers_involved
+                ),
+                "outsider",
+            )
+            ev = event(task, EventKind.REVIEW, review=passing(task, outsider))
         before = task
         decision = check_pure(before, ev, policy, quota)
         if decision.changed and ev.kind is EventKind.CI_GREEN:
@@ -381,12 +412,17 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
         if decision.changed and ev.kind is EventKind.CI_RED:
             green_sha = None
         human_sha = human_approval_sha(before, ev, decision, human_sha)
+        if decision.changed and decision.task.designated_reviewers:
+            issued_seats[decision.task.latest_sha or ""] = frozenset(
+                decision.task.designated_reviewers
+            )
         check_ci(before, decision, green_sha)
         check_separation(decision.task)
         check_review_count(
             decision.task,
             policy,
             human_sha is not None and human_sha == decision.task.latest_sha,
+            seats=issued_seats.get(decision.task.latest_sha or ""),
         )
         check_terminal(before, ev, decision)
         check_version(before, decision)
@@ -404,6 +440,102 @@ def walk(level: Level, kinds: list[EventKind], policy: Policy | None = None) -> 
             task, replace(advance(task), kind=kind), selected, QuotaSnapshot(), NOW
         ).task
     return task
+
+
+def test_review_count_rejects_pass_from_outside_the_seats() -> None:
+    """P1：未受邀的通过结论不能算进家数（席位记录保持原样时也要被抓到）。"""
+    policy = make_policy(required=2)
+    task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED, EventKind.CI_GREEN])
+    seats = frozenset(task.designated_reviewers)
+    assert len(seats) == 2
+    outsider = next(
+        provider
+        for provider in PROVIDERS
+        if provider not in seats and provider not in task.providers_involved
+    )
+    for provider in task.designated_reviewers:
+        task = core.decide(
+            task,
+            event(task, EventKind.REVIEW, review=passing(task, provider)),
+            policy,
+            QuotaSnapshot(),
+            NOW,
+        ).task
+    assert task.status is TaskStatus.AWAITING_MERGE
+    check_review_count(task, policy, False, seats=seats)
+    corrupted = replace(
+        task,
+        reviews=(passing(task, outsider), *(r for r in task.reviews if r.provider != "r1")),
+    )
+    with pytest.raises(AssertionError, match="review_count"):
+        check_review_count(corrupted, policy, False, seats=seats)
+
+
+def test_review_seat_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P1：把内核退化成"不查席位、按家数凑够就合并"，oracle 必须报错。"""
+    policy = make_policy(required=2)
+    task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED, EventKind.CI_GREEN])
+    seats = frozenset(task.designated_reviewers)
+    outsider = next(
+        provider
+        for provider in PROVIDERS
+        if provider not in seats and provider not in task.providers_involved
+    )
+    original = core._on_review
+
+    def seat_blind(task: TaskRecord, ev: Event, policy: Policy) -> Decision:
+        review = ev.review
+        if task.status is not TaskStatus.AWAITING_AI_REVIEW or review is None:
+            return original(task, ev, policy)
+        recorded = replace(
+            task,
+            reviews=task.reviews + (review,),
+            review_history=task.review_history + (review,),
+        )
+        passing_now = {
+            item.provider
+            for item in recorded.current_reviews()
+            if item.verdict is Verdict.PASS and item.provider not in recorded.providers_involved
+        }
+        if len(passing_now) >= policy.rule_for(task.level).min_reviewers:
+            actions = core._Actions(recorded, recorded.state_version + 1)
+            return core._merge(
+                recorded,
+                policy,
+                "变异体：不看席位，家数够就合并",
+                actions,
+                recorded,
+                approved_sha=recorded.latest_sha,
+            )
+        return original(task, ev, policy)
+
+    # 基线：未受邀的结论被内核拒收
+    baseline = core.decide(
+        task,
+        event(task, EventKind.REVIEW, review=passing(task, outsider)),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    )
+    assert not baseline.changed
+    monkeypatch.setattr(core, "_on_review", seat_blind)
+    task = core.decide(
+        task,
+        event(task, EventKind.REVIEW, review=passing(task, sorted(seats)[0])),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    ).task
+    decision = core.decide(
+        task,
+        event(task, EventKind.REVIEW, review=passing(task, outsider)),
+        policy,
+        QuotaSnapshot(),
+        NOW,
+    )
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    with pytest.raises(AssertionError, match="review_count"):
+        check_review_count(decision.task, policy, False, seats=seats)
 
 
 @pytest.mark.parametrize("level", [Level.A, Level.B])
