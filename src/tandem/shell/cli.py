@@ -264,13 +264,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         db, agents=agents, policy=policy, diff_source=FakeDiffSource(changes=changes)
     )
     try:
-        return LocalRun(
-            runner,
-            agents,
-            args.agent_script,
-            args.review,
-            allow_level_drop=args.allow_level_drop,
-        ).run(until_idle=args.until_idle, max_rounds=args.max_rounds)
+        return LocalRun(runner, agents, args.agent_script, args.review).run(
+            until_idle=args.until_idle, max_rounds=args.max_rounds
+        )
     finally:
         store.close()
 
@@ -644,11 +640,6 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=_nonempty_changes,
         help="模拟改动路径，逗号分隔，必填且非空（每轮重算等级）",
-    )
-    run.add_argument(
-        "--allow-level-drop",
-        action="store_true",
-        help="明确允许模拟改动降低任务等级，可能减少审核或人工关口",
     )
     run.add_argument("--review", choices=("pass", "fail"), default="pass", help="模拟 AI 审核结论")
     run.add_argument("--until-idle", action="store_true", help="重复运行直到需要人工处理或无进展")

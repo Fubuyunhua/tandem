@@ -77,7 +77,8 @@ def invoke(
 
 def check_report(repository: Path, expected_level: str, rule: str) -> dict:
     result = invoke(repository, "--base", "HEAD~1", "--head", "HEAD", "--summary", "report.md")
-    assert result.returncode == (3 if expected_level == "D" else 0), result.stderr
+    # K6：D 级只报告，退出码也是 0；needs_manual 仍为 true
+    assert result.returncode == 0, result.stderr
     report = json.loads((repository / "risk-level.json").read_text(encoding="utf-8"))
     assert report["level"] == expected_level
     assert report["needs_manual"] == (expected_level == "D")
@@ -299,10 +300,11 @@ def test_trusted_base_checkout_never_executes_head(repository: Path) -> None:
         encoding="utf-8",
         check=False,
     )
-    assert result.returncode == 3, result.stderr
+    assert result.returncode == 0, result.stderr  # K6：D 级只报告
     assert not (repository / "head-executed").exists()
     report = json.loads((repository / "risk-level.json").read_text(encoding="utf-8"))
     assert report["level"] == "D"
+    assert report["needs_manual"] is True
     assert report["policy_source"] == f"{base}:risk.yml"
     assert git(repository, "rev-parse", "HEAD") == base
     assert (repository / "uv.lock").read_text(encoding="utf-8") == (ROOT / "uv.lock").read_text(
@@ -415,6 +417,23 @@ def test_judge_setup_uv_is_pinned() -> None:
     assert setup == ["astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"]
 
 
+def windows_bash() -> Path | None:
+    """Git for Windows 自带的 Bash。
+
+    `which git` 可能是 `<Git>/cmd/git.exe`，也可能是从 Git Bash 里跑出来的
+    `<Git>/mingw64/bin/git.exe`；往上找三层，每层都试 `<Git>/bin/bash.exe`
+    与 `<Git>/usr/bin/bash.exe`。
+    """
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        return None
+    for root in Path(git_executable).resolve().parents[:3]:
+        for candidate in (root / "bin/bash.exe", root / "usr/bin/bash.exe"):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def run_workflow_fetch(
     repository: Path, number: str, head: str
 ) -> subprocess.CompletedProcess[str]:
@@ -429,10 +448,9 @@ def run_workflow_fetch(
         if "git fetch" in step.get("run", "")
     )
     if os.name == "nt":
-        git_executable = shutil.which("git")
-        assert git_executable is not None
-        bash = Path(git_executable).resolve().parents[1] / "bin/bash.exe"
-        assert bash.is_file(), "测试需要 Git for Windows 自带的 Bash"
+        found = windows_bash()
+        assert found is not None, "测试需要 Git for Windows 自带的 Bash"
+        bash = found
     else:
         executable = shutil.which("bash")
         assert executable is not None
@@ -486,7 +504,7 @@ def test_workflow_fetches_fork_pull_ref_without_checkout(fork_pr: tuple[Path, st
     assert not (repository / "scripts/gate/risk_level.py").exists()
     # 取到的对象可交给可信脚本判断，head 中的恶意脚本仍不执行。
     gate = invoke(repository, "--base", base, "--head", head)
-    assert gate.returncode == 3, gate.stderr
+    assert gate.returncode == 0, gate.stderr  # K6：D 级只报告
     assert not (repository / "head-executed").exists()
 
 
@@ -551,9 +569,44 @@ def test_policy_source_is_latest_base_not_common_ancestor(
     write(repository, "app.py", "value = 2\n")
     head = commit(repository)
     result = invoke(repository, "--base", base, "--head", head)
-    assert result.returncode == (3 if base_protects_app else 0), result.stderr
+    assert result.returncode == 0, result.stderr  # K6：D 级只报告
     report = json.loads((repository / "risk-level.json").read_text(encoding="utf-8"))
     assert report["merge_base"] == ancestor
     assert report["policy_source"] == f"{base}:risk.yml"
     assert report["level"] == ("D" if base_protects_app else "C")
     assert [file["paths"] for file in report["files"]] == [["app.py"]]
+
+
+def test_k6_d_level_reports_but_does_not_fail_the_check(
+    repository: Path,
+) -> None:
+    """K6：D 级退出码 0（检查不红），但报告仍写 needs_manual，摘要标题写"需要人工"。"""
+    write(repository, "src/tandem/core/model.py", "x = 1\n")
+    commit(repository)
+    result = invoke(repository, "--base", "HEAD~1", "--head", "HEAD", "--summary", "report.md")
+    assert result.returncode == 0, result.stderr
+    report = json.loads((repository / "risk-level.json").read_text(encoding="utf-8"))
+    assert report["level"] == "D"
+    assert report["needs_manual"] is True
+    assert "PR 风险等级：D（需要人工）" in result.stdout
+    assert "PR 风险等级：D（需要人工）" in (repository / "report.md").read_text(encoding="utf-8")
+
+
+def test_k6_bad_base_still_fails_the_check(repository: Path) -> None:
+    """K6：取不到提交仍然退出 2，检查仍然失败。"""
+    write(repository, "app.py", "value = 2\n")
+    commit(repository)
+    result = invoke(repository, "--base", "0" * 40, "--head", "HEAD")
+    assert result.returncode == 2, result.stdout
+    assert "等级闸门失败" in result.stderr
+
+
+def test_k6_unreadable_policy_still_fails_the_check(repository: Path) -> None:
+    """K6：读不了 base 的规则仍然退出 2（不会静默按无底线放行）。"""
+    (repository / "risk.yml").unlink()
+    base = commit(repository)
+    write(repository, "app.py", "value = 3\n")
+    head = commit(repository)
+    result = invoke(repository, "--base", base, "--head", head)
+    assert result.returncode == 2, result.stdout
+    assert "等级闸门失败" in result.stderr

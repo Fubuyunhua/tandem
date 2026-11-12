@@ -270,26 +270,29 @@ def test_run_missing_database_does_not_create_it(tmp_path: Path) -> None:
     assert not db.parent.exists()
 
 
-def test_level_drop_needs_explicit_override(
+def test_level_never_drops_after_a_lighter_simulated_change(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """K7：方案批准后只交普通/文档改动，等级仍保持 D，仍要经过"待你审核"。"""
     db = tmp_path / "tasks.sqlite3"
     core = "src/tandem/core/model.py"
     _submit(db, mode="multi_agent", path=core)
-    assert _run(db, "--changes", core) == 1
+    assert _run(db, "--changes", core) == 1  # 停在"待你批准方案"
     _approve(db, _task(db))
-    original = _task(db)
-    with Store(db) as store:
-        before = store.list_events()
-    assert _run(db, "--until-idle") == 1
-    assert _task(db) == original
-    with Store(db) as store:
-        assert store.list_events() == before
-    assert "【等级下降已阻止】t1：D → C" in capsys.readouterr().out
-    assert _run(db, "--allow-level-drop", "--until-idle") == 0
-    assert _task(db).status is TaskStatus.MERGED
-    assert _task(db).level.value == "C"
-    assert "【等级下降已允许】" in capsys.readouterr().out
+    assert _task(db).status is TaskStatus.PENDING
+
+    # 后续只改文档：内核会"算出 C、保持 D"，不能降级后自动合并
+    assert _run(db, "--changes", "docs/x.md", "--until-idle") == 1
+    task = _task(db)
+    assert task.level.value == "D"
+    assert task.status is TaskStatus.AWAITING_YOUR_REVIEW
+    output = capsys.readouterr().out
+    assert "保持 D 级" in output
+    assert "等级下降" not in output
+
+    # 显式的降级开关已经删掉，参数不再被接受
+    with pytest.raises(SystemExit):
+        _run(db, "--allow-level-drop")
 
 
 @pytest.mark.parametrize(
