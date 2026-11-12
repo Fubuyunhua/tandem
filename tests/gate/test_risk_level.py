@@ -429,19 +429,10 @@ def run_workflow_fetch(
         if "git fetch" in step.get("run", "")
     )
     if os.name == "nt":
-        # Git for Windows 的目录布局不唯一：git.exe 可能在 cmd/、bin/ 或
-        # mingw64/bin/ 下，bash.exe 固定在安装根目录的 bin/ 里。先看 PATH，
-        # 再按 git.exe 的位置往上找几层，不要假定只有一种布局。
-        candidates: list[Path] = []
-        on_path = shutil.which("bash")
-        if on_path is not None:
-            candidates.append(Path(on_path))
         git_executable = shutil.which("git")
-        if git_executable is not None:
-            git_path = Path(git_executable).resolve()
-            candidates.extend(parent / "bin/bash.exe" for parent in git_path.parents[:4])
-        bash = next((candidate for candidate in candidates if candidate.is_file()), None)
-        assert bash is not None, "测试需要 Git for Windows 自带的 Bash"
+        assert git_executable is not None
+        bash = Path(git_executable).resolve().parents[1] / "bin/bash.exe"
+        assert bash.is_file(), "测试需要 Git for Windows 自带的 Bash"
     else:
         executable = shutil.which("bash")
         assert executable is not None
