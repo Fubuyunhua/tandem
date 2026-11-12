@@ -22,10 +22,24 @@ from tandem.core.model import AssertionDrop, ChangeSet, FileChange, TestWeakenin
 from tandem.shell.assertions import count_assertions, is_test_path, leaves_test_collection
 from tandem.shell.weakening import new_test_weakenings
 
+# 每次调用 git 都关掉 commit-graph：commit-graph 文件里的父提交信息不经校验就会被
+# 采信，伪造一份就能改变祖先关系（和 grafts 一样的攻击面）。加在命令行上而不是只写
+# 进某个仓库的配置，是为了让源仓库和隔离仓库的每一次调用都受约束。
+_DISABLE_COMMIT_GRAPH = ("-c", "core.commitGraph=false")
+
 
 def _clean_git_environment() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_OPTIONAL_LOCKS="0")
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_OPTIONAL_LOCKS="0",
+        # 让 git 读不到 <GIT_DIR>/info/grafts（transfer 里能写到的本地文件）。
+        # 用空设备而不是"一个不存在的路径"：不存在的路径有可能被重新创建并写入，
+        # 空设备永远读不到 graft 记录。（`--no-replace-objects` 只管 replace 引用，
+        # 管不到 grafts。）
+        GIT_GRAFT_FILE=os.devnull,
+    )
     return env
 
 
@@ -174,8 +188,26 @@ class GitDiffSource:
     _environment: dict[str, str] | None = field(default=None, repr=False, compare=False)
 
     def resolve_oid(self, ref: str) -> str:
-        value = self._git_bytes("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
-        oid = value.decode("ascii").strip().lower()
+        completed = subprocess.run(
+            [
+                "git",
+                *_DISABLE_COMMIT_GRAPH,
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"{ref}^{{commit}}",
+            ],
+            cwd=self.cwd,
+            env=self._environment or _clean_git_environment(),
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace").strip()
+            raise DiffError(
+                f"解析不到提交 {ref}：{detail}；浅克隆或部分克隆里，边界之外的对象可能不在本地"
+            )
+        oid = completed.stdout.decode("ascii", "replace").strip().lower()
         if not is_commit_oid(oid):
             raise DiffError("Git 未返回完整提交 OID")
         return oid
@@ -183,6 +215,10 @@ class GitDiffSource:
     def collect(self, base: str, sha: str) -> CollectedDiff:
         sha = self.resolve_oid(sha)
         base = self.resolve_oid(base)
+        # 共同祖先在**源仓库**里算：浅克隆的边界（.git/shallow）只存在于源仓库，
+        # 隔离仓库里没有它，在那里跑 merge-base 会去读边界之外不存在的父提交。
+        # 隔离仓库因此只做"两个已知提交之间的树/内容比较"，完全不碰祖先关系。
+        merge_base = self._merge_base(base, sha)
         # 只借用对象库；临时 bare 仓库没有用户 diff.*、属性驱动或原仓库配置。
         objects = Path(self._git_bytes("rev-parse", "--git-path", "objects").decode().strip())
         if not objects.is_absolute():
@@ -207,11 +243,10 @@ class GitDiffSource:
             if initialized.returncode:
                 raise DiffError("无法创建隔离的 Git 读取环境")
             env["GIT_OBJECT_DIRECTORY"] = str(objects.resolve())
-            return replace(self, cwd=bare, _environment=env)._collect_oids(base, sha)
+            return replace(self, cwd=bare, _environment=env)._collect_oids(base, merge_base, sha)
 
-    def _collect_oids(self, base: str, sha: str) -> CollectedDiff:
-        # 先求共同祖先，再看"受审分支相对共同祖先"改了什么
-        merge_base = self._merge_base(base, sha)
+    def _collect_oids(self, base: str, merge_base: str, sha: str) -> CollectedDiff:
+        # 受审提交相对共同祖先改了什么（merge_base 已在源仓库里算好，是完整 OID）
         # -z：用 NUL 分隔并且**不做**引号转义，中文、制表符、双引号都能原样拿到
         payload = self._git_bytes(
             "diff",
@@ -305,8 +340,15 @@ class GitDiffSource:
 
     def _merge_base(self, base: str, sha: str) -> str:
         """两条历史的分叉点。没有共同祖先时不猜"之前"是什么。"""
+        # 这里的三个约束缺一不可（S1）：
+        # - --no-replace-objects：本地 replace 引用不能改变祖先关系；
+        # - -c core.commitGraph=false：伪造的 commit-graph 同样能伪造父提交；
+        # - GIT_GRAFT_FILE（见 _clean_git_environment）：.git/info/grafts 能直接
+        #   伪造共同祖先，让 merge-base 变成受审提交、diff 变空。
+        # .git/shallow 也能被改写，但它只能"删掉"祖先边：最坏是算不出共同祖先而
+        # 报错，或者退到更老的祖先（显示更多改动），不会把改动藏起来，故不额外处理。
         merged = subprocess.run(
-            ["git", "merge-base", base, sha],
+            ["git", *_DISABLE_COMMIT_GRAPH, "--no-replace-objects", "merge-base", base, sha],
             cwd=self.cwd,
             env=self._environment or _clean_git_environment(),
             capture_output=True,
@@ -317,7 +359,8 @@ class GitDiffSource:
         )
         if merged.returncode != 0:
             raise DiffError(
-                f"{base} 和 {sha} 没有共同祖先，算不出'之前'的内容：{merged.stderr.strip()}"
+                f"{base} 和 {sha} 没有共同祖先，算不出'之前'的内容"
+                f"（浅克隆里 base 可能落在边界之外）：{merged.stderr.strip()}"
             )
         return merged.stdout.strip()
 
@@ -393,7 +436,7 @@ class GitDiffSource:
 
     def _git_show(self, revision: str, path: str) -> str:
         completed = subprocess.run(
-            ["git", "show", f"{revision}:{path}"],
+            ["git", *_DISABLE_COMMIT_GRAPH, "show", f"{revision}:{path}"],
             cwd=self.cwd,
             env=self._environment or _clean_git_environment(),
             capture_output=True,
@@ -411,7 +454,7 @@ class GitDiffSource:
 
     def _git_bytes(self, *args: str) -> bytes:
         completed = subprocess.run(
-            ["git", *args],
+            ["git", *_DISABLE_COMMIT_GRAPH, *args],
             cwd=self.cwd,
             env=self._environment or _clean_git_environment(),
             capture_output=True,
