@@ -517,19 +517,22 @@ def test_attributes_do_not_hide_assertion_drops(
     if decrease_assertions:
         write(repository, "tests/test_app.py", "def test_app():\n    assert 1\n")
     commit(repository)
+    # .gitattributes 本身在底线里（PR #8），所以不管断言少没少都是 D；
+    # 这里要守住的是：-diff 属性不能把断言减少藏起来。
     report = check_report(
         repository,
-        "D" if decrease_assertions else "C",
+        "D",
         "测试文件 tests/test_app.py 的断言从 2 条减到 1 条"
         if decrease_assertions
-        else "普通仓库改动",
+        else ".gitattributes",
     )
+    assert any(".gitattributes" in reason for reason in report["bottom_lines"])
     if decrease_assertions:
         assert report["assertion_drops"] == [
             {"path": "tests/test_app.py", "before": 2, "after": 1, "previous_path": None}
         ]
     else:
-        assert report["bottom_lines"] == []
+        assert report["assertion_drops"] == []
 
 
 @pytest.mark.parametrize("base_protects_app", [False, True])
