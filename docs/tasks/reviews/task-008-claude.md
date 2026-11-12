@@ -41,3 +41,7 @@ merge-base 变成 S 以后，`diff S..S` 是空的，新增的 `core.py` 不出�
 
 ## 小问题
 - Bash 定位的修复同时出现在 `fix/shallow-diff`（2cb30d1）和 `feat/decisions`（4403cf5）两个分支上，写法略有不同。不用处理，合并时我保留 `fix/shallow-diff` 这一版。
+
+## 第二轮（d87f17e）
+
+S1 已修好：`GIT_GRAFT_FILE` 指向空设备，所有 git 调用都带 `-c core.commitGraph=false`，merge-base 另外带 `--no-replace-objects`。兄弟分支的 grafts 反例在旧实现上采集出空改动，现在仍报出受保护文件并判 D；另有测试检查每次调用的参数和环境。本地 PowerShell：675 passed，ruff、pyright、demo 全过。**通过。**
