@@ -10,6 +10,7 @@ the current plan's SHA, independently of the latest code SHA.
 from __future__ import annotations
 
 import os
+import re
 from copy import deepcopy
 from dataclasses import fields, replace
 
@@ -108,7 +109,9 @@ def check_ci(before: TaskRecord, decision: Decision, green_sha: str | None) -> N
 def check_separation(task: TaskRecord) -> None:
     for review in task.reviews:
         if review.verdict is Verdict.PASS:
-            assert review.provider not in task.providers_involved, "separation"
+            assert review.provider not in task.providers_involved, (
+                "separation: a reviewer also wrote this code"
+            )
 
 
 def check_review_count(
@@ -143,7 +146,7 @@ def check_review_count(
     }
     assert providers <= designated, "review_count: pass from outside the designated seats"
     needed = policy.rule_for(task.level).min_reviewers
-    assert len(providers) >= needed, "review_count"
+    assert len(providers) >= needed, "review_count: not enough reviewers"
     if needed:
         # 席位都得出结论，不能"两家够了就合并"而漏掉指定的那一家
         assert designated <= providers, "review_count: designated seat has no pass"
@@ -204,7 +207,9 @@ def check_terminal(before: TaskRecord, ev: Event, decision: Decision) -> None:
 
 def check_version(before: TaskRecord, decision: Decision) -> None:
     if decision.changed:
-        assert decision.task.state_version == before.state_version + 1, "version"
+        assert decision.task.state_version == before.state_version + 1, (
+            "version: changed record must add exactly one version"
+        )
     else:
         assert decision.task == before, "version: ignored record changed"
         assert not decision.actions, "version: ignored actions"
@@ -829,6 +834,21 @@ def test_regression_new_plan_sha_invalidates_old_ci() -> None:
     check_fresh(task, decision)
 
 
+def test_oracle_messages_are_anchored_to_their_name() -> None:
+    """P6：变异测试按 "<名字>: " 前缀匹配，不能被别的 oracle 的消息顶包。
+
+    旧写法 ``match="d"`` 会匹配任何含字母 d 的消息，例如
+    "pure: different outputs"、"terminal: changed protected field writer"；
+    witness 里一旦再加一条断言，"D 级变异"就可能被无关断言"顶包"通过。
+    """
+    assert re.search(r"^d: ", "d: no current human approval")
+    assert not re.search(r"^d: ", "pure: different outputs")
+    assert not re.search(r"^d: ", "terminal: changed protected field writer")
+    # 旧写法确实会匹配到这两条无关消息（这就是要修掉的风险）
+    assert re.search("d", "pure: different outputs")
+    assert re.search("d", "terminal: changed protected field writer")
+
+
 @pytest.mark.parametrize(
     "invariant",
     [
@@ -970,7 +990,10 @@ def test_oracles_reject_kernel_mutants(monkeypatch: pytest.MonkeyPatch, invarian
             return replace(result, task=replace(result.task, reviews=task.reviews))
 
         monkeypatch.setattr(core, "_on_new_submission", keep_old_reviews)
-    with pytest.raises(AssertionError, match=invariant):
+    # P6：按消息前缀精确匹配。"d" 这种单字母会匹配到任何含 d 的消息
+    # （"pure: different outputs"、"terminal: ..."），一旦 witness 里再加一条
+    # 断言，变异就可能被无关断言"顶包"通过。
+    with pytest.raises(AssertionError, match=f"^{re.escape(invariant)}: "):
         witness()
 
 
@@ -1424,7 +1447,7 @@ def test_terminal_cleanup_cannot_change_protected_fields(
 
     monkeypatch.setattr(core, "_on_cleanup_checked", corrupt_cleanup)
     decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
-    with pytest.raises(AssertionError, match="terminal"):
+    with pytest.raises(AssertionError, match="^terminal: "):
         check_terminal(task, ev, decision)
 
 
@@ -1496,7 +1519,7 @@ def test_terminal_cleanup_bookkeeping_mutants_are_caught(
 
     monkeypatch.setattr(core, "_on_cleanup_checked", corrupt_cleanup)
     decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
-    with pytest.raises(AssertionError, match="terminal"):
+    with pytest.raises(AssertionError, match="^terminal: "):
         check_terminal(task, ev, decision)
 
 
@@ -1548,7 +1571,7 @@ def test_terminal_cleanup_rejects_unverifiable_or_finished_targets(
     monkeypatch.setattr(core, "_on_cleanup_checked", bypass_provenance_or_finality)
     decision = core.decide(task, ev, make_policy(), QuotaSnapshot(), NOW)
     assert decision.changed
-    with pytest.raises(AssertionError, match="terminal"):
+    with pytest.raises(AssertionError, match="^terminal: "):
         check_terminal(task, ev, decision)
 
 

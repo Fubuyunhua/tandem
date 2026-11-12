@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -559,7 +560,8 @@ def test_shell_oracles_kill_mutants(
                 )
 
         monkeypatch.setattr(Store, "_write_task", wrong_version_column)
-    with pytest.raises(AssertionError, match=invariant):
+    # P6：按消息前缀精确匹配，避免单字母/短词匹配到无关消息
+    with pytest.raises(AssertionError, match=f"^{re.escape(invariant)}: "):
         witness(tmp_path / "mutant")
 
 
