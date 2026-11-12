@@ -296,6 +296,19 @@ def check_approval_route(before: TaskRecord, ev: Event, decision: Decision) -> N
         )
 
 
+def check_ci_sha(before: TaskRecord, ev: Event, decision: Decision) -> None:
+    """P5：CI 结论必须绑定当前提交编号。
+
+    check_ci 只在"出现 MERGE 动作"时核对绿灯，覆盖面太窄：错误编号的 CI 绿
+    要等到后面审核凑齐、真的去合并时才可能暴露。这条在事件发生时就核对。
+    """
+    if ev.kind not in (EventKind.CI_GREEN, EventKind.CI_RED) or not decision.changed:
+        return
+    assert ev.sha is not None and ev.sha == before.latest_sha, (
+        "ci_sha: CI result applied to another commit"
+    )
+
+
 def check_stale(before: TaskRecord, ev: Event, decision: Decision) -> None:
     """P4：过期或错位的事件必须被忽略，状态和版本号都不变。
 
@@ -348,6 +361,23 @@ def check_pure(before: TaskRecord, ev: Event, policy: Policy, quota: QuotaSnapsh
     assert first == second, "pure: different outputs"
     assert (before, ev, policy, quota, NOW) == snapshot, "pure: mutated input"
     return first
+
+
+def misplaced_kind(task: TaskRecord, fallback: EventKind) -> EventKind:
+    """P5：把"错位事件"换成与当前状态相关的种类。
+
+    以前 choice==3 从 23 种事件里均匀抽，撞到"待验收 + CI_GREEN"的概率约
+    0.4%/步，默认规模下经常一次都撞不到；按状态挑种类以后，同样 80 个例子
+    能打到的组合明显变多。
+    """
+    return {
+        TaskStatus.WORKING: EventKind.CODE_SUBMITTED,
+        TaskStatus.AWAITING_PLAN_APPROVAL: EventKind.PLAN_APPROVED,
+        TaskStatus.AWAITING_ACCEPTANCE: EventKind.CI_GREEN,
+        TaskStatus.AWAITING_AI_REVIEW: EventKind.REVIEW,
+        TaskStatus.AWAITING_YOUR_REVIEW: EventKind.YOUR_APPROVAL,
+        TaskStatus.AWAITING_MERGE: EventKind.MERGED,
+    }.get(task.status, fallback)
 
 
 def advance(task: TaskRecord) -> Event:
@@ -426,7 +456,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
             provider = PROVIDERS[value % len(PROVIDERS)]
             ev = event(
                 task,
-                kind,
+                misplaced_kind(task, kind),
                 sha=f"s{value}",
                 attempt=value - 1,
                 provider=provider,
@@ -495,6 +525,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
         check_approval_route(before, ev, decision)
         check_approval_sha(before, ev, decision)
         check_stale(before, ev, decision)
+        check_ci_sha(before, ev, decision)
         check_plan_approval(before, ev, decision)
         check_fresh(before, decision)
         task = decision.task
@@ -508,6 +539,29 @@ def walk(level: Level, kinds: list[EventKind], policy: Policy | None = None) -> 
             task, replace(advance(task), kind=kind), selected, QuotaSnapshot(), NOW
         ).task
     return task
+
+
+def test_ci_sha_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P5：删掉 _on_ci_green 的编号校验后，新 oracle 必须报错。"""
+    policy = make_policy()
+    task = walk(Level.C, [EventKind.ASSIGN, EventKind.CODE_SUBMITTED])
+    assert task.status is TaskStatus.AWAITING_ACCEPTANCE
+    ev = event(task, EventKind.CI_GREEN, sha=oid(555))
+    baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert not baseline.changed
+    check_ci_sha(task, ev, baseline)
+    original = core._on_ci_green
+
+    def ignore_ci_sha(
+        task: TaskRecord, ev: Event, policy: Policy, quota: QuotaSnapshot
+    ) -> Decision:
+        return original(task, replace(ev, sha=task.latest_sha), policy, quota)
+
+    monkeypatch.setattr(core, "_on_ci_green", ignore_ci_sha)
+    decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert decision.changed
+    with pytest.raises(AssertionError, match="ci_sha"):
+        check_ci_sha(task, ev, decision)
 
 
 def test_stale_event_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
