@@ -100,7 +100,10 @@ def test_reconcile_three_results(
         assert GitHubEvents(runner, github, REPO).reconcile("gh-7") is expected
         assert required(runner.store.load_task("gh-7")).status is status
         assert github.writes == []
-        actual = runner.store.list_actions("gh-7")[0].status
+        # 按编号取：动作表按 created_at 排序，测试里的固定时钟和真实时钟混用时顺序不稳定
+        actual = next(
+            a for a in runner.store.list_actions("gh-7") if a.action_id == "merge-7"
+        ).status
         assert actual is (
             ActionStatus.DONE if expected is CheckResult.MERGE_SUCCEEDED else ActionStatus.UNKNOWN
         )
