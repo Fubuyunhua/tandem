@@ -212,6 +212,11 @@ def check_version(before: TaskRecord, decision: Decision) -> None:
 
 
 def check_d(before: TaskRecord, decision: Decision, human_sha: str | None) -> None:
+    """D 级关卡：方案要批过，合并前要有绑定当前提交的人工批准。
+
+    "必须经过待你审核"这一半由 check_approval_route 做路径检查：只看
+    "有过一次 sha 对得上的人工批准"是近似（从待验收直接批准也能满足）。
+    """
     after = decision.task
     if after.level is not Level.D:
         return
@@ -264,6 +269,31 @@ def check_plan_approval(before: TaskRecord, ev: Event, decision: Decision) -> No
         assert not decision.changed and decision.task == before, "plan_sha: wrong plan approved"
     elif decision.changed:
         assert decision.task.approved_plan_version == before.plan_version, "plan_sha: wrong version"
+
+
+def check_approval_route(before: TaskRecord, ev: Event, decision: Decision) -> None:
+    """P2：改变记录的批准，来源状态必须是对的。
+
+    任务书第 6 条写的是"D 级永远不会不经过『待你审核』就进入『待合并』"。
+    只记"有过一次 sha 对得上的人工批准"不够：从待验收直接批准也能满足它。
+    真正的路径检查是看**批准发生在哪个状态**：
+
+    - YOUR_APPROVAL 只能来自待你审核（第 17 条）；
+    - INTERVENTION_APPROVED 只能来自待你介入（第 20 条）。
+
+    于是 D 级的两条合法路径都被钉住：审核全过 → 待你审核 → 你批准，
+    或者走到待你介入 → 你人工审核通过；"从待验收直接批准"会被这条抓住。
+    """
+    if not decision.changed:
+        return
+    if ev.kind is EventKind.YOUR_APPROVAL:
+        assert before.status is TaskStatus.AWAITING_YOUR_REVIEW, (
+            "approval_route: your approval outside 待你审核"
+        )
+    elif ev.kind is EventKind.INTERVENTION_APPROVED:
+        assert before.status is TaskStatus.NEEDS_INTERVENTION, (
+            "approval_route: intervention approval outside 待你介入"
+        )
 
 
 def check_fresh(before: TaskRecord, decision: Decision) -> None:
@@ -427,6 +457,7 @@ def test_generated_event_sequences(level, mode, required, prefix, instructions) 
         check_terminal(before, ev, decision)
         check_version(before, decision)
         check_d(before, decision, human_sha)
+        check_approval_route(before, ev, decision)
         check_plan_approval(before, ev, decision)
         check_fresh(before, decision)
         task = decision.task
@@ -440,6 +471,44 @@ def walk(level: Level, kinds: list[EventKind], policy: Policy | None = None) -> 
             task, replace(advance(task), kind=kind), selected, QuotaSnapshot(), NOW
         ).task
     return task
+
+
+def test_approval_route_rejects_approval_from_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2：从待验收直接人工批准（跳过待你审核）必须被抓到。"""
+    policy = make_policy()
+    task = walk(
+        Level.D,
+        [
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.PLAN_APPROVED,
+            EventKind.ASSIGN,
+            EventKind.CODE_SUBMITTED,
+            EventKind.CI_GREEN,
+        ],
+    )
+    assert task.status is TaskStatus.AWAITING_AI_REVIEW
+    ev = event(task, EventKind.INTERVENTION_APPROVED, sha=task.latest_sha)
+    # 基线：待验收/AI 审核期间的人工批准被内核拒收
+    baseline = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert not baseline.changed
+    check_approval_route(task, ev, baseline)
+    original = core._on_intervention_approved
+
+    def accept_from_anywhere(task: TaskRecord, ev: Event, policy: Policy) -> Decision:
+        # 退化：把"待AI审核"直接当成"待你介入"，等于跳过待你审核
+        if task.status is TaskStatus.AWAITING_AI_REVIEW:
+            task = replace(task, status=TaskStatus.NEEDS_INTERVENTION)
+        return original(task, ev, policy)
+
+    monkeypatch.setattr(core, "_on_intervention_approved", accept_from_anywhere)
+    decision = core.decide(task, ev, policy, QuotaSnapshot(), NOW)
+    assert decision.task.status is TaskStatus.AWAITING_MERGE
+    check_d(task, decision, human_approval_sha(task, ev, decision))
+    with pytest.raises(AssertionError, match="approval_route"):
+        check_approval_route(task, ev, decision)
 
 
 def test_review_count_rejects_pass_from_outside_the_seats() -> None:
