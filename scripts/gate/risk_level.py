@@ -17,12 +17,15 @@ from tandem.core.model import ChangeSet, Level, Policy
 from tandem.shell.config import ConfigError, parse_config
 from tandem.shell.diff_source import DiffError, GitDiffSource
 
-MANUAL_EXIT_CODE = 3
+# K6（用户 2026-11-12 拍板）：D 级只报告、不让检查失败。
+# 人工关口由内核的"待你审核"保证；把 D 设成红叉会让 D 级 PR 永远不能合并。
+MANUAL_EXIT_CODE = 0
 ERROR_EXIT_CODE = 2
 LIMITATIONS = (
     "工作流使用 pull_request_target，从 base 运行裁判代码和依赖；"
     "head 仅作为 Git 数据读取，risk.yml 固定读取 base 提交。"
-    "分支保护和 D 级必须人工批准仍需配置；D 级退出码保持 3，批准后变绿机制待用户决定。"
+    "分支保护和 D 级必须人工批准仍需配置；D 级只报告（退出码 0、needs_manual=true、"
+    '摘要写明需要人工），人工关口由内核的"待你审核"保证。'
     "密钥扫描尚未接入，结果标明未扫描。"
 )
 
@@ -138,7 +141,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"退出码：A/B/C=0；D={MANUAL_EXIT_CODE}（需要人工）；错误=2。{LIMITATIONS}",
+        epilog=(
+            f"退出码：A/B/C/D=0（D 只报告，needs_manual=true）；"
+            f"输入/采集/输出错误={ERROR_EXIT_CODE}。{LIMITATIONS}"
+        ),
     )
     parser.add_argument("--base", help="基线提交；默认取 PR base.sha")
     parser.add_argument("--head", help="待审提交；默认取 PR head.sha")
