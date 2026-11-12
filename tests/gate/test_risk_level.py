@@ -415,6 +415,23 @@ def test_judge_setup_uv_is_pinned() -> None:
     assert setup == ["astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"]
 
 
+def windows_bash() -> Path | None:
+    """Git for Windows 自带的 Bash。
+
+    `which git` 可能是 `<Git>/cmd/git.exe`，也可能是从 Git Bash 里跑出来的
+    `<Git>/mingw64/bin/git.exe`；往上找三层，每层都试 `<Git>/bin/bash.exe`
+    与 `<Git>/usr/bin/bash.exe`。
+    """
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        return None
+    for root in Path(git_executable).resolve().parents[:3]:
+        for candidate in (root / "bin/bash.exe", root / "usr/bin/bash.exe"):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def run_workflow_fetch(
     repository: Path, number: str, head: str
 ) -> subprocess.CompletedProcess[str]:
@@ -429,10 +446,9 @@ def run_workflow_fetch(
         if "git fetch" in step.get("run", "")
     )
     if os.name == "nt":
-        git_executable = shutil.which("git")
-        assert git_executable is not None
-        bash = Path(git_executable).resolve().parents[1] / "bin/bash.exe"
-        assert bash.is_file(), "测试需要 Git for Windows 自带的 Bash"
+        found = windows_bash()
+        assert found is not None, "测试需要 Git for Windows 自带的 Bash"
+        bash = found
     else:
         executable = shutil.which("bash")
         assert executable is not None
